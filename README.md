@@ -1,4 +1,4 @@
-# Pyangdantic: Generate a Pydantic-based IDE-friendly RESTCONF SDK for your network devices directly from YANG modules
+# YANG2SDK: Generate a Pydantic-based IDE-friendly RESTCONF SDK for your network devices directly from YANG modules
 
 This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF SDK interface to your device.
 
