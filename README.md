@@ -1,4 +1,8 @@
-# YANG2SDK: Generate a Pydantic-based IDE-friendly RESTCONF SDK for your network devices directly from YANG modules
+# yang2sdk
+
+Generate a Pydantic-based IDE-friendly SDK for your network devices directly from YANG modules.
+
+## Overview
 
 This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF SDK interface to your device.
 
@@ -8,7 +12,7 @@ Then you can do stuff like this to update the description of a port:
 from device_name import RestconfClient as DeviceNameClient
 
 client = DeviceNameClient(
-    management_ip="192.168.123.42",
+    management_ip="192.168.137.42",
     port=443,
     username="user",
     password="pass",
@@ -23,13 +27,13 @@ port131 = uri.retrieve(content='config', depth=2)
 
     # The retrieved config (JSON) is loaded into the corresponding Pydantic model that you can modify.
     # As soon as you type `port1.` the IDE will show you all possible fields.
-port131.service_label = "test123"
+port131.service_label = "test137"
 
-port131.admin_status = "daun" 
+port131.admin_status = "dowm" 
     # Here the code fails immediately, raising the following error:
     # pydantic_core._pydantic_core.ValidationError: 1 validation error for PortItem
     # admin_status
-    #   Input should be 'up' or 'down'  [type=enum, input_value='daun', input_type=str]
+    #   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
 
     # Update the device config
 uri.update(port131)
@@ -44,24 +48,17 @@ uri.update(port131)
 You need [`uv`](https://github.com/astral-sh/uv).
 
 ```bash
-git clone https://thisrepo
-cd pyangdantic
+git clone https://github.com/ConsortiumGARR/yang2sdk.git
+cd yang2sdk
 uv sync --locked
+cp .env.example .env
 ```
 
-save a file named `.env` in project's root with the following variables:
-```.env
-DEVICE_NAME = 'device_name'
-DEVICE_IP = 'ip'
-DEVICE_USER = 'username'
-DEVICE_PASS = 'password'
-RESTCONF_PORT = 443 # default 443 or vendor specific
-NETCONF_PORT = 830  # default 830 or vendor specific
-```
+Modify and save `.env` with your device's information.
 
 ### Model Extraction
 
-Get the YANG models from the vendor or use the following to pull what the device is running.
+Get the YANG models from the vendor or use the following to try pulling what the network device is running.
 
 ```bash
 uv run utils/yang_downloader.py
@@ -69,21 +66,21 @@ uv run utils/yang_downloader.py
 
 ### YANG Tree inspection and modules identification
 
-Identify the root modules you want to convert. This can help:
+Identify the *root* modules you want to convert. This can help:
 
 ```bash
 uv run pyang -p temp/yang_modules/device_name/ -f tree temp/yang_modules/device_name/* > temp/yang_tree/device_name.txt
 ```
 
-### Schema Transformation
+### Compile to SDK
 
-Convert all the modules of interest. For example, if root modules are in file1.yang and file2.yang:
+Convert all the modules of interest. For example, if the root modules are in file1.yang and file2.yang:
 
 ```bash
 uv run pyang -V \
     --plugindir utils/pyang_plugins/ \
-    -f pydantic \
-    --pydantic-output-dir  temp/restconf_clients/device_name/ \
+    -f restconf \
+    --sdk-output-dir  temp/restconf_clients/device_name/ \
     --path temp/yang_modules/device_name/ \
     temp/yang_modules/device_name/file1.yang temp/yang_modules/device_name/file2.yang
 ```
@@ -102,15 +99,14 @@ uv run utils/try_client.py
 
 ## Comparison with Alternatives
 
-The primary alternative is [pydantify](https://github.com/pydantify/pydantify). While both tools aim to bridge the gap between YANG and Pydantic, they are different.
+The primary alternatives are [pydantify](https://github.com/pydantify/pydantify) and [pyangbind](https://github.com/robshakir/pyangbind). They both address the data modeling but do not facilitate the actual network operations.
 
-### Pydantify
-Pydantify is a sophisticated, multi-stage pipeline:
+**yang2sdk** directly targets the real-world needs of network automation engineers by generating the Pydantic v2 models as well as the code for actual network operations.
+The goal is to make the development of network automation faster, easier, and safer leveraging IDE autocomplete, type hinting, static type checking and Pydantic's runtime validation.
+The core of this project is the [pyang](https://github.com/mbj4668/pyang) plugin that walks the raw `pyang` Abstract Syntax Tree (AST) and uses direct string concatenation to generate Python code.
+
+**pydantify** converts YANG modules into Pydantic models using a more sophisticated pipeline:
 `YANG Abstract Syntax Tree (AST)` -> `Internal Object-Oriented AST` -> `Dynamic In-Memory Pydantic Models` -> `JSON Schema` -> `datamodel-code-generator` -> `Pydantic Models`.
+It does not provide the code for network operations.
 
-**Pros:** modular, well-architected codebase, intermediate formats (JSON Schema).
-
-### Pyangdantic
-This project instead ignores the "clean code" manual in favor of direct results. It walks the raw `pyang` AST and uses direct string concatenation to generate code. By skipping intermediate JSON Schemas, it avoids the quirks and limitations of third-party code generators and possible metadata loss.
-
-**Pros:** This is an opinionated SDK generator. It builds the Pydantic v2 models and the boilerplate for URI navigation, CRUD operations, and configuration templating. If you want to change the generated code, you have to change the code that generates it.
+**pyangbind** dynamically generates Python classes at runtime and does not provide the code for network operations.

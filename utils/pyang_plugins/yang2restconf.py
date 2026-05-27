@@ -21,32 +21,32 @@ from pyang import plugin, statements
 
 def pyang_plugin_init():
     """Register the plugin"""
-    plugin.register_plugin(PyangdanticPlugin())
+    plugin.register_plugin(Yang2Restconf())
 
 
-class PyangdanticPlugin(plugin.PyangPlugin):
+class Yang2Restconf(plugin.PyangPlugin):
     """Main plugin class for YANG to Pydantic conversion"""
 
     def __init__(self):
-        plugin.PyangPlugin.__init__(self, "pyangdantic")
+        plugin.PyangPlugin.__init__(self, "yang2restconf")
         self.multiple_modules = True
 
     def add_output_format(self, fmts):
         """Register the output format"""
-        fmts["pydantic"] = self
+        fmts["restconf"] = self
 
     def add_opts(self, optparser):
         """Add plugin-specific options"""
         optlist = [
             optparse.make_option(
-                "--pydantic-output-dir",
-                dest="pydantic_output_dir",
+                "--sdk-output-dir",
+                dest="sdk_output_dir",
                 default="./generated_sdk",
                 help="Output directory for generated Pydantic client and models (default: ./generated_sdk)",
             ),
             optparse.make_option(
-                "--pydantic-config-only",
-                dest="pydantic_config_only",
+                "--sdk-config-only",
+                dest="sdk_config_only",
                 action="store_true",
                 help="Only generate models for config true nodes",
             ),
@@ -61,8 +61,8 @@ class PyangdanticPlugin(plugin.PyangPlugin):
     def emit(self, ctx, modules, fd):
         """Main emission function - generates Pydantic models"""
         # Directory structure setup
-        output_dir = ctx.opts.pydantic_output_dir
-        config_only = ctx.opts.pydantic_config_only
+        output_dir = ctx.opts.sdk_output_dir
+        config_only = ctx.opts.sdk_config_only
 
         models_dir = os.path.join(output_dir, "data_models")
         navigators_dir = os.path.join(output_dir, "data_navigators")
