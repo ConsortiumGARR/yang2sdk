@@ -1,0 +1,73 @@
+"""Auto-generated Pydantic models from YANG schemas"""
+from typing import Annotated, Any, TypeVar
+from pydantic import BaseModel, Field, field_validator, ConfigDict, AfterValidator, BeforeValidator, PlainSerializer
+from enum import Enum
+from decimal import Decimal
+import re
+from ._base import YangBaseModel
+
+# RFC 7951: 64-bit numbers MUST be represented as JSON strings.
+def format_at_least_two_places(v: Decimal) -> str:
+    v = v.normalize()
+    if v.as_tuple().exponent > -2:
+        return format(v.quantize(Decimal("0.01")), "f")
+    return format(v, "f")
+
+Decimal64 = Annotated[Decimal, PlainSerializer(format_at_least_two_places, return_type=str)]
+Uint64 = Annotated[int, PlainSerializer(lambda v: str(v), return_type=str)]
+Int64 = Annotated[int, PlainSerializer(lambda v: str(v), return_type=str)]
+
+def check_pattern(pattern: str, v: str) -> str:
+    if isinstance(v, str) and not re.match(pattern, v):
+        raise ValueError(f'Value does not match pattern: {pattern}')
+    return v
+
+T = TypeVar("T")
+def restconf_list_validator(v: Any) -> Any:
+    if isinstance(v, dict) and not v:
+        return []
+    return v
+
+RestconfList = Annotated[list[T], BeforeValidator(restconf_list_validator)]
+
+{% for enum in module.enums %}
+class {{ enum.name }}(str, Enum):
+    """{{ enum.description }}"""
+    {% for val in enum.values %}
+    {% if val.description %}
+    # {{ val.description }}
+    {% endif %}
+    {{ val.py_name }} = "{{ val.value }}"
+    {% endfor %}
+{% endfor %}
+
+{% for model in module.models %}
+class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBaseModel{% endif %}):
+    """{{ model.description }}"""
+    {% if not model.fields and not model.is_rpc_envelope %}
+    pass
+    {% else %}
+    {% for field in model.fields %}
+    {% for comment in field.comments %}
+    # {{ comment }}
+    {% endfor %}
+    {% for use in field.uses %}
+    # Uses: {{ use }}
+    {% endfor %}
+    {{ field.name }}: {{ field.type_str }}{% if field.assignment %} = {{ field.assignment }}{% endif %}
+    {% endfor %}
+    {% if model.is_rpc_envelope %}
+    {% if model.rpc_input_cls %}
+    input: {{ model.rpc_input_cls }}
+    {% endif %}
+    {% if model.rpc_output_cls %}
+    output: {{ model.rpc_output_cls }} | None = Field(default=None)
+    {% endif %}
+    {% if not model.rpc_input_cls and not model.rpc_output_cls %}
+    pass
+    {% endif %}
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
+    {% endif %}
+    {% endif %}
+
+{% endfor %}

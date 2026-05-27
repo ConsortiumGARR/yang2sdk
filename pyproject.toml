@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "dotenv>=0.9.9",
     "gitingest>=0.3.1",
+    "jinja2>=3.1.6",
     "ncclient>=0.7.0",
     "pyang>=2.7.1",
     "pydantic>=2.12.5",

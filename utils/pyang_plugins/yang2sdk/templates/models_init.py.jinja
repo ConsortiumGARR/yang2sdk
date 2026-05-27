@@ -1,0 +1,31 @@
+from __future__ import annotations
+"""Auto-generated Pydantic models from YANG schemas"""
+from typing import TYPE_CHECKING, Any
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+{% for mod_name in module_names %}
+    from . import {{ mod_name }}
+{% endfor %}
+
+class Data(BaseModel):
+    """Aggregate root data nodes (config and state)."""
+    {% if not data_props %}
+    pass
+    {% else %}
+    {% for prop in data_props %}
+    {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
+    {% endfor %}
+    {% endif %}
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
+
+class Operations(BaseModel):
+    """Aggregate RPC operations."""
+    {% if not rpc_props %}
+    pass
+    {% else %}
+    {% for prop in rpc_props %}
+    {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
+    {% endfor %}
+    {% endif %}
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
