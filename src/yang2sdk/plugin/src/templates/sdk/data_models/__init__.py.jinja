@@ -10,6 +10,9 @@ if TYPE_CHECKING:
 
 class Data(BaseModel):
     """Aggregate root data nodes (config and state)."""
+
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
+    
     {% if not data_props %}
     pass
     {% else %}
@@ -17,10 +20,12 @@ class Data(BaseModel):
     {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
     {% endfor %}
     {% endif %}
-    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
 
 class Operations(BaseModel):
     """Aggregate RPC operations."""
+    
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
+    
     {% if not rpc_props %}
     pass
     {% else %}
@@ -28,4 +33,3 @@ class Operations(BaseModel):
     {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
     {% endfor %}
     {% endif %}
-    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)

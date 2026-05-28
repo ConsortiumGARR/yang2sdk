@@ -1,11 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "yang2sdk"
 version = "0.1.0"
-description = ""
+description = "Generate a Pydantic-based IDE-friendly SDK from YANG modules."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "dotenv>=0.9.9",
+    "python-dotenv>=1.0.1",
     "gitingest>=0.3.1",
     "jinja2>=3.1.6",
     "ncclient>=0.7.0",
@@ -14,7 +18,15 @@ dependencies = [
     "requests>=2.32.5",
 ]
 
+[project.scripts]
+yang-downloader = "yang2sdk.cli.downloader:main"
+tester = "yang2sdk.cli.tester:main"
+yang2restconf = "yang2sdk.cli.compiler:restconf"
+
 [dependency-groups]
 dev = [
-    "ruff>=0.15.0",
+    "ruff>=0.1.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yang2sdk"]

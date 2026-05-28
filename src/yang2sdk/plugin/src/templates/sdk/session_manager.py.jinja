@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import logging
+import os
+import socket
+from typing import Any
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3 import PoolManager
+
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
+
+
+class TCPKeepAliveAdapter(HTTPAdapter):
+    def __init__(self, idle=60, interval=60, count=6, **kwargs):
+        self._idle = idle
+        self._interval = interval
+        self._count = count
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["socket_options"] = self._socket_options()
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["socket_options"] = self._socket_options()
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    def _socket_options(self):
+        options = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ]
+
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            options.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, self._idle))
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, self._interval))
+        if hasattr(socket, "TCP_KEEPCNT"):
+            options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, self._count))
+
+        return options
+
+
+class RestconfClient:
+    """Restconf API client."""
+
+    def __init__(
+        self,
+        loopback_ip: str | None = None,
+        management_ip: str | None = None,
+        port: int = 8443,
+        username: str | None = None,
+        password: str | None = None,
+        verify: bool = True,
+    ):
+        self.url = None
+        self.fallback_url = None
+
+        self.urls = []
+        if loopback_ip:
+            self.urls.append(f"https://{loopback_ip}:{port}/restconf")
+        if management_ip:
+            self.urls.append(f"https://{management_ip}:{port}/restconf")
+
+        if not self.urls:
+            raise ValueError("Either loopback_ip or management_ip must be provided")
+
+        self._session = requests.Session()
+
+        adapter = TCPKeepAliveAdapter(idle=60, interval=60, count=6)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
+        self._session.verify = verify  # Warning: production risk if False
+        self._session.trust_env = verify  # Disable env vars if TLS verification is off
+        self._session.headers.update({"Content-Type": "application/yang-data+json"})
+
+        user = username or os.environ.get("DEVICE_USERNAME")
+        pw = password or os.environ.get("DEVICE_PASSWORD")
+        if not user or not pw:
+            raise UserWarning("Authentication credentials missing.")
+        self._session.auth = (user, pw)
+
+        from .data_navigators import Data, Operations
+
+        self.data = Data(self, "/data", "")
+        self.operations = Operations(self, "/operations", "")
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict:
+        """Make authenticated API request."""
+        errors = []
+
+        for base_url in self.urls:
+            url = base_url + path
+            try:
+                msg = f"Request: {method} {url} {kwargs}"
+                log.info(msg)
+                response = self._session.request(method, url, timeout=(10, 2400), **kwargs)
+
+                msg = f"Response ({response.status_code}): {response.text}"
+                log.info(msg)
+                response.raise_for_status()
+                return response.json() if response.text.strip() else {}
+
+            except (requests.ConnectionError, requests.Timeout) as e:
+                msg = f"Failed to connect to {base_url}: {e}"
+                log.exception(msg)
+                errors.append(e)
+                continue  # Try the next URL in self.urls
+
+            except requests.HTTPError as e:
+                # Capture the response body for debugging before crashing
+                status = e.response.status_code
+                text = e.response.text
+                msg = f"HTTP {status} Error: {text}"
+                log.exception(msg)
+                raise requests.HTTPError(msg, response=e.response) from e
+
+        # If we get here, all URLs failed
+        msg = f"All connection attempts to {self.urls} have failed."
+        raise ExceptionGroup(msg, errors)

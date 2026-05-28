@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from ..session_manager import RestconfClient
+
+
+def _get_max_depth(data: Any, current_depth: int = 1) -> int:
+    """Calculates max depth, treating lists of primitives as leaf values."""
+    if isinstance(data, dict) and data:
+        return max((_get_max_depth(v, current_depth + 1) for v in data.values()), default=current_depth)
+
+    if isinstance(data, list) and data:
+        # Check if the list contains complex structures (dicts or nested lists)
+        if any(isinstance(item, (dict, list)) for item in data):
+            return max((_get_max_depth(item, current_depth + 1) for item in data), default=current_depth)
+        # If it's a list of primitives (leaf-list), don't increment depth
+        return current_depth
+
+    return current_depth
+
+
+def _prune_at_max_depth(data: Any, target_depth: int, current_depth: int = 1) -> Any:
+    """Deletes empty dicts only if they are located at the target_depth."""
+    if isinstance(data, dict):
+        # If we reached target depth and it's an empty dict, this is a candidate for deletion
+        # However, the parent call handles the deletion. Here we filter children.
+        return {
+            k: _prune_at_max_depth(v, target_depth, current_depth + 1)
+            for k, v in data.items()
+            if not (isinstance(v, dict) and not v and current_depth + 1 == target_depth)
+        }
+    if isinstance(data, list):
+        return [
+            _prune_at_max_depth(item, target_depth, current_depth + 1)
+            for item in data
+            if not (isinstance(item, (dict, list)) and not item and current_depth + 1 == target_depth)
+        ]
+    return data
+
+
+class TemplateRegistry:
+    _registry: dict[str, Callable] = {}
+
+    @classmethod
+    def register(cls, node_class_name: str, func: Callable):
+        def decorator(func: Callable):
+            cls._registry[node_class_name] = func
+            return func
+        return decorator
+
+    @classmethod
+    def get(cls, node_class_name: str) -> Callable | None:
+        return cls._registry.get(node_class_name)
+
+
+class Node:
+    __slots__ = ("_client", "_name", "_path")
+
+    def __init__(self, client: RestconfClient, path: str, name: str):
+        self._client = client
+        self._path = path
+        self._name = name
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+
+        resp = self._client._request("GET", self._path, params=params)
+
+        payload = None
+
+        # Handle if the response is a dictionary
+        if isinstance(resp, dict):
+            # Check for exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                payload = inner
+
+            # Check for namespaced key match (e.g. ietf-hardware:slot-item)
+            else:
+                # Find any key that ends with ":name"
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    payload = inner
+                else:
+                    # Fallback: Assume the response itself is the object (unwrapped)
+                    payload = resp
+
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        if depth != "unbounded":
+            observed_max = _get_max_depth(payload)
+            payload = _prune_at_max_depth(payload, observed_max)
+
+        return payload
+
+    def _update(self, **kwargs: Any) -> None:
+        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
+        data = {self._name: kwargs}
+        return self._client._request("PATCH", self._path, json=data)
+
+    def _replace(self, **kwargs: Any) -> None:
+        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
+        data = {self._name: kwargs}
+        return self._client._request("PUT", self._path, json=data)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)
+
+    def from_template(self, **kwargs: Any) -> dict[str, Any]:
+        """Call user template if registered."""
+        node_name = self.__class__.__name__
+        func = TemplateRegistry.get(node_name)
+        if not func:
+            msg = f"No template registered for {node_name}. You can register one using @TemplateRegistry.register('{node_name}')"
+            raise NotImplementedError(msg)
+        return func(**kwargs)
+
+
+class ItemNode:
+    __slots__ = ("_client", "_name", "_path")
+
+    def __init__(self, client: RestconfClient, path: str, name: str):
+        self._client = client
+        self._path = path
+        self._name = name
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+        resp = self._client._request("GET", self._path, params=params)
+
+        payload = None
+
+        # Handle if the response is a list (e.g., direct list return)
+        if isinstance(resp, list):
+            if not resp:
+                raise ValueError(f"Received empty list from API for {self._name}")
+            payload = resp[0]
+
+        # Handle if the response is a dictionary
+        elif isinstance(resp, dict):
+            # Check for exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                if isinstance(inner, list):
+                    if not inner:
+                        raise ValueError(f"Received empty list inside key '{self._name}'")
+                    payload = inner[0]
+                else:
+                    # Handle case where it returns a single object instead of a list
+                    payload = inner
+
+            # Check for namespaced key match (e.g. ietf-hardware:slot-item)
+            else:
+                # Find any key that ends with ":name"
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    if isinstance(inner, list):
+                        if not inner:
+                            raise ValueError(f"Received empty list inside key '{found_keys[0]}'")
+                        payload = inner[0]
+                    else:
+                        payload = inner
+                else:
+                    # Fallback: Assume the response itself is the object (unwrapped)
+                    payload = resp
+
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        if depth != "unbounded":
+            observed_max = _get_max_depth(payload)
+            payload = _prune_at_max_depth(payload, observed_max)
+
+        return payload
+
+    def _update(self, **kwargs: Any) -> None:
+        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
+        data = {self._name: [kwargs]}
+        return self._client._request("PATCH", self._path, json=data)
+
+    def _replace(self, **kwargs: Any) -> None:
+        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
+        data = {self._name: [kwargs]}
+        return self._client._request("PUT", self._path, json=data)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)
+
+    def from_template(self, **kwargs: Any) -> dict[str, Any]:
+        """Call user template if registered."""
+        node_name = self.__class__.__name__
+        func = TemplateRegistry.get(node_name)
+        if not func:
+            msg = f"No template registered for {node_name}. You can register one using @TemplateRegistry.register('{node_name}')"
+            raise NotImplementedError(msg)
+        return func(**kwargs)
+
+
+TNode = TypeVar("TNode", bound=ItemNode)
+
+
+class ListNode(Generic[TNode]):
+    __slots__ = ("_client", "_item_cls", "_name", "_path")
+
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        item_cls: type[TNode],
+    ):
+        self._client = client
+        self._path = path
+        self._name = name
+        self._item_cls = item_cls
+
+    def __call__(self, *keys: str | int) -> TNode:
+        """
+        Supports composite keys.
+        Usage: client.data.interfaces('eth0')
+        or client.data.routes('1.1.1.1', 'vrf-A')
+        """
+        if not keys:
+            raise ValueError("Keys must be provided")
+
+        encoded_keys = ",".join(quote(str(k), safe="") for k in keys)
+
+        new_path = f"{self._path}={encoded_keys}"
+
+        return self._item_cls(self._client, new_path, self._name)
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+        resp = self._client._request("GET", self._path, params=params)
+
+        data_list = []
+
+        # 1. Handle Root List
+        if isinstance(resp, list):
+            data_list = resp
+
+        # 2. Handle Dictionary
+        elif isinstance(resp, dict):
+            # 2a. Exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                if isinstance(inner, list):
+                    data_list = inner
+                elif isinstance(inner, dict):
+                    data_list = [inner]
+                elif inner is None:
+                    data_list = []
+                else:
+                    # Fallback for primitives or unknown types, though unlikely for a list node
+                    # We might want to raise, but let's try to treat as single item or error?
+                    # Raising is safer.
+                    raise ValueError(f"Unexpected value type for '{self._name}': {type(inner)}")
+
+            # 2b. Namespaced key match
+            else:
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    if isinstance(inner, list):
+                        data_list = inner
+                    elif isinstance(inner, dict):
+                        data_list = [inner]
+                    elif inner is None:
+                        data_list = []
+                else:
+                    # 2c. No wrapper found. Assume response is a single item (unwrapped)
+                    # For a list retrieval, this is the "list of 1 item" case where the list wrapper is missing.
+                    data_list = [resp]
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        if depth != "unbounded":
+            observed_max = _get_max_depth(data_list)
+            data_list = _prune_at_max_depth(data_list, observed_max)
+
+        return data_list
+
+    def _create(self, data_list: list[dict[str, Any]]) -> None:
+        envelope = {self._name: data_list}
+        url = self._path.removesuffix(f"/{self._name}")
+        self._client._request("POST", url, json=envelope)
+
+    def _replace(self, data_list: list[dict[str, Any]]) -> None:
+        envelope = {self._name: data_list}
+        url = self._path.removesuffix(f"/{self._name}")
+        return self._client._request("PUT", url, json=envelope)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)
+
+    def from_template(self, **kwargs: Any) -> dict[str, Any]:
+        """Call user template if registered."""
+        node_name = self.__class__.__name__
+        func = TemplateRegistry.get(node_name)
+        if not func:
+            msg = f"No template registered for {node_name}. You can register one using @TemplateRegistry.register('{node_name}')"
+            raise NotImplementedError(msg)
+        return func(**kwargs)

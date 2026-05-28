@@ -2,4 +2,5 @@ LICENSE
 uv.lock
 .gitingestignore
 .gitignore
+canonicalize_ast.py
 **/.gitkeep

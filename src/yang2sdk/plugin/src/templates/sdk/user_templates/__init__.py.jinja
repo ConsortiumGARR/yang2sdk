@@ -1,0 +1,46 @@
+"""
+Custom configuration templates are defined in this directory. 
+
+To maintain consistency, the directory structure here should mirror `data_navigators/`. 
+Templates are invoked using the `.from_template()` method of the corresponding 
+navigator node.
+
+Example:
+If `../data_navigators/ne.py` contains `RoutingProtocolListNode`, implement the 
+template logic in `../templates/ne.py` as follows:
+
+```python
+@TemplateRegistry.register("RoutingProtocolListNode")
+def build_routing_config(
+    *,
+    ospf_router_id: str | None,
+    is_ospf_asbr: bool | None,
+    another_config_variable: str | None
+) -> list[ne.RoutingProtocolItem]:
+    from ..data_models.ne import RoutingProtocolItem
+
+    # Transform input variables into valid Pydantic model instances.
+    # The return type must match the navigator's .retrieve() method 
+    # to support direct create, update, or replace operations.
+    return [RoutingProtocolItem(...)]
+```
+
+Once registered, you can generate configuration by calling 
+`node.from_template(...)` on any instance of the associated node.
+"""
+
+import importlib
+import pkgutil
+from pathlib import Path
+
+# Automatically import all modules in the current directory.
+# This triggers the @TemplateRegistry.register decorators in each file.
+for loader, module_name, is_pkg in pkgutil.iter_modules(__path__):
+    if module_name != "__init__":
+        importlib.import_module(f".{module_name}", package=__name__)
+
+# Clean up namespace so only the modules/registry remain if desired
+del pkgutil, importlib, Path
+for _var in ('loader', 'module_name', 'is_pkg'):
+    if _var in dir():
+        del _var

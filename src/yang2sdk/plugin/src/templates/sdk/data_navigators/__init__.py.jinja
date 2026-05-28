@@ -8,13 +8,15 @@ if TYPE_CHECKING:
 {% endfor %}
 
 class Data(Node):
-    \"\"\"Navigator for data nodes.\"\"\"
+    """Navigator for data nodes."""
     {% for prop in data_props %}
+    
     @property
-    def {{ prop.module }}_{{ prop.field }}(self) -> {{ prop.module }}.{% if prop.node_type == 'list' %}{{ prop.cls }}ListNode{% else %}{{ prop.cls }}Node{% endif %}:
+    def {{ prop.module }}_{{ prop.field }}(self) -> {{ prop.module }}.{% if prop.node_type == 'list' %}{% if prop.cls.endswith('Item') %}{{ prop.cls[:-4] }}{% else %}{{ prop.cls }}{% endif %}ListNode{% else %}{{ prop.cls }}Node{% endif %}:
         {% if prop.node_type == 'list' %}
-        from .{{ prop.module }} import {{ prop.cls }}ListNode, {{ prop.cls }}ItemNode
-        return {{ prop.cls }}ListNode(self._client, f"{self._path}/{{ prop.alias }}", "{{ prop.alias }}", {{ prop.cls }}ItemNode)
+        {% set base_cls = prop.cls[:-4] if prop.cls.endswith('Item') else prop.cls %}
+        from .{{ prop.module }} import {{ base_cls }}ListNode, {{ prop.cls }}Node
+        return {{ base_cls }}ListNode(self._client, f"{self._path}/{{ prop.alias }}", "{{ prop.alias }}", {{ prop.cls }}Node)
         {% else %}
         from .{{ prop.module }} import {{ prop.cls }}Node
         return {{ prop.cls }}Node(self._client, f"{self._path}/{{ prop.alias }}", "{{ prop.alias }}")
@@ -22,8 +24,9 @@ class Data(Node):
     {% endfor %}
 
 class Operations(Node):
-    \"\"\"Navigator for RPC operations.\"\"\"
+    """Navigator for RPC operations."""
     {% for prop in rpc_props %}
+    
     @property
     def {{ prop.module }}_{{ prop.field }}(self) -> {{ prop.module }}.{{ prop.cls }}Node:
         from .{{ prop.module }} import {{ prop.cls }}Node

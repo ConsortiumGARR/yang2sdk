@@ -24,7 +24,7 @@ class {{ node.class_name }}Node(Node):
         elif isinstance(data, str):
             data = {{ node.class_name }}.model_validate_json(data)
         if data is None:
-            raise ValueError("No data provided for update.")
+            raise ValueError('No data provided for update. Provide a dict, string, or kwargs.')
         payload = data.model_dump(content="config", exclude_unset=True)
         return self._update(**payload)
 
@@ -37,18 +37,16 @@ class {{ node.class_name }}Node(Node):
         elif isinstance(data, str):
             data = {{ node.class_name }}.model_validate_json(data)
         if data is None:
-            raise ValueError("No data provided for replace.")
+            raise ValueError('No data provided for replace. Provide a dict, string, or kwargs.')
         payload = data.model_dump(content="config", exclude_unset=True)
         return self._replace(**payload)
-
     {% for prop in node.properties %}
+    
     @property
     def {{ prop.name }}(self) -> {{ prop.type_hint }}:
         {% if prop.item_cls %}
-        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}, {{ prop.item_cls }}
         return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }})
         {% else %}
-        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}
         return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}")
         {% endif %}
     {% endfor %}
@@ -71,7 +69,7 @@ class {{ node.item_class_name }}Node(ItemNode):
         elif isinstance(data, str):
             data = {{ node.item_class_name }}.model_validate_json(data)
         if data is None:
-            raise ValueError("No data provided for update.")
+            raise ValueError('No data provided for update. Provide a dict, string, or kwargs.')
         payload = data.model_dump(content="config", exclude_unset=True)
         return self._update(**payload)
 
@@ -84,7 +82,7 @@ class {{ node.item_class_name }}Node(ItemNode):
         elif isinstance(data, str):
             data = {{ node.item_class_name }}.model_validate_json(data)
         if data is None:
-            raise ValueError("No data provided for replace.")
+            raise ValueError('No data provided for replace. Provide a dict, string, or kwargs.')
         payload = data.model_dump(content="config", exclude_unset=True)
         return self._replace(**payload)
 
@@ -92,10 +90,8 @@ class {{ node.item_class_name }}Node(ItemNode):
     @property
     def {{ prop.name }}(self) -> {{ prop.type_hint }}:
         {% if prop.item_cls %}
-        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}, {{ prop.item_cls }}
         return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }})
         {% else %}
-        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}
         return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}")
         {% endif %}
     {% endfor %}
@@ -125,6 +121,7 @@ class {{ node.class_name }}Node(Node):
         from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}{% if node.has_input %}, {{ node.class_name }}Input{% endif %}{% if node.has_output %}, {{ node.class_name }}Output{% endif %}
         {% endif %}
         {% if node.has_input %}
+        
         if input_data is None and kwargs:
             input_data = {k.replace("_", "-"): v for k, v in kwargs.items()}
         if isinstance(input_data, dict):

@@ -1,9 +1,11 @@
 """Auto-generated Pydantic models from YANG schemas"""
-from typing import Annotated, Any, TypeVar
+
+from typing import Annotated, Any, Literal, TypeVar
 from pydantic import BaseModel, Field, field_validator, ConfigDict, AfterValidator, BeforeValidator, PlainSerializer
 from enum import Enum
 from decimal import Decimal
 import re
+
 from ._base import YangBaseModel
 
 # RFC 7951: 64-bit numbers MUST be represented as JSON strings.
@@ -24,6 +26,10 @@ def check_pattern(pattern: str, v: str) -> str:
 
 T = TypeVar("T")
 def restconf_list_validator(v: Any) -> Any:
+    """
+    RESTCONF quirk: Truncated lists (via depth) often return {} instead of [].
+    Also handles 'None' or missing data if needed.
+    """
     if isinstance(v, dict) and not v:
         return []
     return v
@@ -32,15 +38,19 @@ RestconfList = Annotated[list[T], BeforeValidator(restconf_list_validator)]
 
 {% for enum in module.enums %}
 class {{ enum.name }}(str, Enum):
-    """{{ enum.description }}"""
+    """{{ enum.description }}.
+
     {% for val in enum.values %}
-    {% if val.description %}
-    # {{ val.description }}
-    {% endif %}
+    * {{ val.value }}{% if val.description %}: {{ val.description }}{% endif %}
+
+    {% endfor %}
+    """
+
+    {% for val in enum.values %}
     {{ val.py_name }} = "{{ val.value }}"
     {% endfor %}
-{% endfor %}
 
+{% endfor %}
 {% for model in module.models %}
 class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBaseModel{% endif %}):
     """{{ model.description }}"""
@@ -48,13 +58,11 @@ class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBase
     pass
     {% else %}
     {% for field in model.fields %}
-    {% for comment in field.comments %}
-    # {{ comment }}
-    {% endfor %}
     {% for use in field.uses %}
     # Uses: {{ use }}
     {% endfor %}
     {{ field.name }}: {{ field.type_str }}{% if field.assignment %} = {{ field.assignment }}{% endif %}
+    
     {% endfor %}
     {% if model.is_rpc_envelope %}
     {% if model.rpc_input_cls %}
@@ -69,5 +77,6 @@ class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBase
     model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
     {% endif %}
     {% endif %}
+
 
 {% endfor %}

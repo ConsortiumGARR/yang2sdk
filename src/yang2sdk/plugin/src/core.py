@@ -9,22 +9,17 @@ Converts YANG modules to Pydantic v2 Python classes with proper handling of:
 - RFC 7951 JSON encoding compliance
 """
 
-from pathlib import Path
-from jinja2 import FileSystemLoader
-import hashlib
-import keyword
 import optparse
 import os
-import re
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from pathlib import Path
 
-from jinja2 import DictLoader, Environment
-from pyang import plugin, statements
+from jinja2 import Environment, FileSystemLoader
+from pyang import plugin
 
-from .ir import IRBuilder
+from yang2sdk.plugin.src.ir import IRBuilder
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+
 
 def pyang_plugin_init():
     """Register the plugin"""
@@ -43,8 +38,18 @@ class Yang2Restconf(plugin.PyangPlugin):
 
     def add_opts(self, optparser):
         optlist = [
-            optparse.make_option("--sdk-output-dir", dest="sdk_output_dir", default="./generated_sdk", help="Output directory"),
-            optparse.make_option("--sdk-config-only", dest="sdk_config_only", action="store_true", help="Only config true nodes"),
+            optparse.make_option(
+                "--sdk-output-dir",
+                dest="sdk_output_dir",
+                default="./generated_sdk",
+                help="Output directory",
+            ),
+            optparse.make_option(
+                "--sdk-config-only",
+                dest="sdk_config_only",
+                action="store_true",
+                help="Only config true nodes",
+            ),
         ]
         g = optparser.add_option_group("Pydantic output specific options")
         g.add_options(optlist)
@@ -64,7 +69,9 @@ class Yang2Restconf(plugin.PyangPlugin):
         for d in [models_dir, navigators_dir, templates_dir]:
             os.makedirs(d, exist_ok=True)
 
-        env = Environment(loader=FileSystemLoader(TEMPLATES_DIR), trim_blocks=True, lstrip_blocks=True)
+        env = Environment(
+            loader=FileSystemLoader(TEMPLATES_DIR), trim_blocks=True, lstrip_blocks=True
+        )
         ir_modules = []
 
         # 1. Parse AST to IR
@@ -75,13 +82,19 @@ class Yang2Restconf(plugin.PyangPlugin):
 
         # 2. Render IR with Jinja2
         for ir_mod in ir_modules:
-            model_out = env.get_template("models.py.jinja").render(module=ir_mod)
+            model_out = env.get_template("sdk/data_models/models.py.jinja").render(
+                module=ir_mod
+            )
             with open(os.path.join(models_dir, f"{ir_mod.py_name}.py"), "w") as f:
                 f.write(model_out)
 
             if ir_mod.nav_nodes:
-                nav_out = env.get_template("navigators.py.jinja").render(module=ir_mod)
-                with open(os.path.join(navigators_dir, f"{ir_mod.py_name}.py"), "w") as f:
+                nav_out = env.get_template(
+                    "sdk/data_navigators/navigators.py.jinja"
+                ).render(module=ir_mod)
+                with open(
+                    os.path.join(navigators_dir, f"{ir_mod.py_name}.py"), "w"
+                ) as f:
                     f.write(nav_out)
 
         # Global rendering
@@ -94,18 +107,38 @@ class Yang2Restconf(plugin.PyangPlugin):
             all_rpc_props.extend(mod.root_rpc_props)
 
         with open(os.path.join(models_dir, "__init__.py"), "w") as f:
-            f.write(env.get_template("models_init.py.jinja").render(
-                module_names=module_names, data_props=all_data_props, rpc_props=all_rpc_props))
+            f.write(
+                env.get_template("sdk/data_models/__init__.py.jinja").render(
+                    module_names=module_names,
+                    data_props=all_data_props,
+                    rpc_props=all_rpc_props,
+                )
+            )
 
         with open(os.path.join(navigators_dir, "__init__.py"), "w") as f:
-            f.write(env.get_template("navigators_init.py.jinja").render(
-                module_names=module_names, data_props=all_data_props, rpc_props=all_rpc_props))
+            f.write(
+                env.get_template("sdk/data_navigators/__init__.py.jinja").render(
+                    module_names=module_names,
+                    data_props=all_data_props,
+                    rpc_props=all_rpc_props,
+                )
+            )
 
         # Static Scaffold files
-        self._write_static_files(output_dir, models_dir, navigators_dir, templates_dir)
+        self._write_static_files(env, output_dir)
         fd.write(f"Generated SDK in: {output_dir}\n")
 
-    def _write_static_files(self, out_dir, mod_dir, nav_dir, tmpl_dir):
-        # Implementation of session_manager.py, _base.py, etc... (Abbreviated to keep constraints, but identical payload)
-        # Note: You can maintain your huge static strings here or move them into TEMPLATES.
-        pass
+    def _write_static_files(self, env: Environment, out_dir: str):
+        """Render and write the static scaffolding files from their templates."""
+        static_files = {
+            "__init__.py": "sdk/__init__.py.jinja",
+            "session_manager.py": "sdk/session_manager.py.jinja",
+            "data_models/_base.py": "sdk/data_models/_base.py.jinja",
+            "data_navigators/_base.py": "sdk/data_navigators/_base.py.jinja",
+            "user_templates/__init__.py": "sdk/user_templates/__init__.py.jinja",
+        }
+
+        for target_path, template_path in static_files.items():
+            full_path = os.path.join(out_dir, target_path)
+            with open(full_path, "w") as f:
+                f.write(env.get_template(template_path).render())

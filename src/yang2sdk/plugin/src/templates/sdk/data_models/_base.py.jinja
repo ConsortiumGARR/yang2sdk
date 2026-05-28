@@ -1,0 +1,71 @@
+from typing import Any, Literal
+from collections import defaultdict
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+class YangBaseModel(BaseModel):
+    """Base for all YANG-derived models.
+    Add exclude fields based on json_schema_extra['is_config'] and content required.
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        defer_build=True,
+        validate_default=True
+    )
+
+    @model_validator(mode='after')
+    def _enforce_yang_choices(self) -> 'YangBaseModel':
+        provided_fields = self.model_fields_set
+        if not provided_fields:
+            return self
+            
+        active_cases = defaultdict(set)
+        
+        for field_name in provided_fields:
+            field_info = self.model_fields.get(field_name)
+            if not field_info or not field_info.json_schema_extra:
+                continue
+                
+            choice_mapping = field_info.json_schema_extra.get('choice_mapping')
+            if choice_mapping:
+                for choice_name, case_name in choice_mapping.items():
+                    active_cases[choice_name].add(case_name)
+                    
+        for choice_name, cases in active_cases.items():
+            if len(cases) > 1:
+                raise ValueError(
+                    f"YANG Schema Violation: choice '{choice_name}' cases are mutually exclusive. "
+                    f"Found nodes from multiple cases: {list(cases)}"
+                )
+        return self
+
+    def model_dump(self, *, content: Literal["config", "all", "nonconfig"] = "all", **kwargs: Any) -> dict[str, Any]:
+        # Force JSON mode to ensure 64-bit numbers become strings and Enums become values
+        kwargs.setdefault("mode", "json")
+        kwargs.setdefault("by_alias", True)
+        
+        if content == "all":
+            return super().model_dump(**kwargs)
+
+        cls = type(self)
+        exclude: set[str] = set()
+        for field_name, field_info in cls.model_fields.items():
+            is_config = field_info.json_schema_extra.get("is_config", True)
+            if content == "config" and not is_config:
+                exclude.add(field_name)
+            if content == "nonconfig" and is_config:
+                exclude.add(field_name)
+
+
+        # Merge with any exclude the caller already passed
+        user_exclude = kwargs.get("exclude")
+        if user_exclude:
+            if isinstance(user_exclude, (set, list, tuple)):
+                exclude |= set(user_exclude)
+            else: # dict-style exclude not implemented yet
+                raise NotImplementedError
+
+        kwargs["exclude"] = exclude if exclude else None
+        return super().model_dump(**kwargs)

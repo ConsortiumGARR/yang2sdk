@@ -61,7 +61,7 @@ Modify and save `.env` with your device's information.
 Get the YANG models from the vendor or use the following to try pulling what the network device is running.
 
 ```bash
-uv run utils/yang_downloader.py
+uv run yang_downloader
 ```
 
 ### YANG Tree inspection and modules identification
@@ -77,12 +77,7 @@ uv run pyang -p temp/yang_modules/device_name/ -f tree temp/yang_modules/device_
 Convert all the modules of interest. For example, if the root modules are in file1.yang and file2.yang:
 
 ```bash
-uv run pyang -V \
-    --plugindir utils/pyang_plugins/ \
-    -f restconf \
-    --sdk-output-dir  temp/restconf_clients/device_name/ \
-    --path temp/yang_modules/device_name/ \
-    temp/yang_modules/device_name/file1.yang temp/yang_modules/device_name/file2.yang
+uv run yang2restconf temp/yang_modules/device_name/file1.yang temp/yang_modules/device_name/file2.yang 
 ```
 
 ### Acquisition of one instance of the model and models validation
@@ -94,8 +89,12 @@ Fetch the actual read-write configuration in JSON with RESTCONF using the genera
 > A large config can hit 100% CPU and trigger a watchdog reboot or OOM kill. Use lab equipment.
 
 ```bash
-uv run utils/try_client.py
+uv run tester
 ```
+
+### Usage
+
+Copy-paste the entire directory `temp/restconf_clients/device_name` into your own project and start automating!
 
 ## Comparison with Alternatives
 
@@ -103,7 +102,7 @@ The primary alternatives are [pydantify](https://github.com/pydantify/pydantify)
 
 **yang2sdk** directly targets the real-world needs of network automation engineers by generating the Pydantic v2 models as well as the code for actual network operations.
 The goal is to make the development of network automation faster, easier, and safer leveraging IDE autocomplete, type hinting, static type checking and Pydantic's runtime validation.
-The core of this project is the [pyang](https://github.com/mbj4668/pyang) plugin that walks the raw `pyang` Abstract Syntax Tree (AST) and uses direct string concatenation to generate Python code.
+The core of this project is the [pyang](https://github.com/mbj4668/pyang) plugin that walks the raw `pyang` Abstract Syntax Tree (AST), builds an Intermediate Representation and uses Jinja to generate Python code.
 
 **pydantify** converts YANG modules into Pydantic models using a more sophisticated pipeline:
 `YANG Abstract Syntax Tree (AST)` -> `Internal Object-Oriented AST` -> `Dynamic In-Memory Pydantic Models` -> `JSON Schema` -> `datamodel-code-generator` -> `Pydantic Models`.
