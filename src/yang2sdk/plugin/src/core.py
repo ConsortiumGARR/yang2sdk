@@ -64,9 +64,8 @@ class Yang2Restconf(plugin.PyangPlugin):
 
         models_dir = os.path.join(output_dir, "data_models")
         navigators_dir = os.path.join(output_dir, "data_navigators")
-        templates_dir = os.path.join(output_dir, "user_templates")
 
-        for d in [models_dir, navigators_dir, templates_dir]:
+        for d in [models_dir, navigators_dir]:
             os.makedirs(d, exist_ok=True)
 
         env = Environment(
@@ -135,7 +134,6 @@ class Yang2Restconf(plugin.PyangPlugin):
             "session_manager.py": "sdk/session_manager.py.jinja",
             "data_models/_base.py": "sdk/data_models/_base.py.jinja",
             "data_navigators/_base.py": "sdk/data_navigators/_base.py.jinja",
-            "user_templates/__init__.py": "sdk/user_templates/__init__.py.jinja",
         }
 
         for target_path, template_path in static_files.items():

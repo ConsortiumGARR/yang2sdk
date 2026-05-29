@@ -96,6 +96,48 @@ uv run tester
 
 Copy-paste the entire directory `temp/restconf_clients/device_name` into your own project and start automating!
 
+#### Scaling to Production (Multi-Vendor / Multi-Version)
+
+When managing real networks, it is inevitable to deal with multiple device models, vendors, and OS versions. An option is to structure the automation around a **Hardware Abstraction Layer (HAL)** and concrete **adapters**. 
+- **HAL:** Exposes generic, vendor-agnostic entities and functions (e.g., `update_port_description(port, description)`).
+- **adapters:** Implements the HAL interfaces using the specific `yang2sdk` clients for a given device and OS version.
+
+For example:
+```
+multi_vendor_automation_project/
+├── pyproject.toml
+├── main.py
+├── hal/                      <-- Hardware Abstraction Layer (the abstract contracts)
+│   ├── __init__.py
+│   ├── node.py               <-- e.g. Protocols and match-case routing to load the correct adapter
+│   ├── port.py
+│   ├── l2services.py
+│   ├── l3services.py
+|   └── adapters/
+│       ├── __init__.py
+|       └── device_name/
+|           └── release_version/
+│               ├── __init__.py
+│               ├── node.py
+│               ├── port.py
+│               ├── l2services.py
+│               └── l3services.py
+└── clients/                   <-- generated clients can live inside your project or added as a package
+    ├── __init__.py             
+    └── device_name/
+        └── release_version/
+            ├── __init__.py
+            ├── session_manager.py
+            ├── data_models/
+            │   ├── __init__.py
+            │   ├── _base.py
+            │   └── models.py
+            └── data_navigators/
+                ├── __init__.py
+                ├── _base.py
+                └── navigators.py
+```
+
 ## Comparison with Alternatives
 
 The primary alternatives are [pydantify](https://github.com/pydantify/pydantify) and [pyangbind](https://github.com/robshakir/pyangbind). They both address the data modeling but do not facilitate the actual network operations.
