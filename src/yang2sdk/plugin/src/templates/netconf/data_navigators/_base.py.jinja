@@ -1,0 +1,239 @@
+from typing import Annotated, Any, Generic, TypeVar
+from lxml import etree
+from pydantic import BaseModel
+from ..session_manager import NetconfClient
+
+def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max_depth: int, current_depth: int = 1):
+    """Recursively prunes the XML tree, completely removing complex nodes at the depth boundary.
+    
+    This ensures that Pydantic-XML deserializes them as None instead of instantiating 
+    empty submodels and triggering ValidationErrors.
+    """
+    if model_cls is None:
+        return
+    if hasattr(model_cls, "model_rebuild"):
+        from ..data_models._base import rebuild_model_and_dependencies
+        rebuild_model_and_dependencies(model_cls)
+    if not hasattr(model_cls, "model_fields"):
+        return
+
+    from typing import get_args, get_origin, Union, Annotated
+    import types
+    from pydantic import BaseModel
+
+    def extract_base_model(annot):
+        if annot is None: return None
+        origin = get_origin(annot)
+        if origin in (Union, types.UnionType):
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif origin is list or origin is Annotated:
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
+        return None
+
+    # Iterate over the model's fields to detect and handle nested complex structures
+    for field_name, field_info in list(model_cls.model_fields.items()):
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag", field_name)
+        ns = extra.get("ns")
+
+        child_cls = extract_base_model(field_info.annotation)
+        is_complex = child_cls is not None and child_cls != model_cls
+
+        # Find any matching children in the XML tree (namespace-aware)
+        child_nodes = []
+        for child in list(element):
+            localname = etree.QName(child).localname
+            namespace = etree.QName(child).namespace
+            if localname == tag and (not ns or namespace == ns):
+                child_nodes.append(child)
+
+        for child_node in child_nodes:
+            if is_complex and current_depth >= max_depth:
+                # Completely remove the node at boundary depth so it deserializes as None
+                element.remove(child_node)
+            elif is_complex:
+                # Recurse down
+                prune_xml_tree_to_depth(child_node, child_cls, max_depth, current_depth + 1)
+
+
+def add_model_fields_to_filter(parent_elem: etree._Element, model_cls: type, current_depth: int, max_depth: int | str, content: str, fields: list[str] | None):
+    """Recursively builds a NETCONF subtree filter.
+    
+    If an element is a complex container/list and we have hit the target depth,
+    it is omitted from the filter payload entirely to prevent RFC 6241 Selection Node expansion.
+    """
+    if model_cls is None:
+        return
+    if hasattr(model_cls, "model_rebuild"):
+        from ..data_models._base import rebuild_model_and_dependencies
+        rebuild_model_and_dependencies(model_cls)
+    if not hasattr(model_cls, "model_fields"): return
+    if isinstance(max_depth, int) and current_depth > max_depth: return
+
+    for field_name, field_info in model_cls.model_fields.items():
+        extra = field_info.json_schema_extra or {}
+        is_config = extra.get("is_config", True)
+        is_key = extra.get("is_key", False)
+        tag = extra.get("tag", field_name)
+        ns = extra.get("ns")
+
+        if not is_key:
+            if content == "config" and not is_config: continue
+            if content == "nonconfig" and is_config: continue
+
+        if current_depth == 1 and fields is not None:
+            if field_name not in fields and tag not in fields: continue
+
+        from typing import get_args, get_origin, Union, Annotated
+        import types
+        from pydantic import BaseModel
+
+        def extract_base_model(annot):
+            if annot is None: return None
+            origin = get_origin(annot)
+            if origin in (Union, types.UnionType):
+                for arg in get_args(annot):
+                    if res := extract_base_model(arg): return res
+            elif origin is list or origin is Annotated:
+                for arg in get_args(annot):
+                    if res := extract_base_model(arg): return res
+            elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
+            return None
+
+        child_cls = extract_base_model(field_info.annotation)
+        is_complex = child_cls is not None and child_cls != model_cls
+
+        # Strict Filter Rule: Omit complex sibling containers entirely when at or past depth limit
+        if is_complex and isinstance(max_depth, int) and current_depth >= max_depth:
+            continue
+
+        child_elem = etree.Element("{" + ns + "}" + tag, nsmap={None: ns}) if ns else etree.Element(tag)
+        parent_elem.append(child_elem)
+
+        if child_cls and child_cls != model_cls:
+            add_model_fields_to_filter(child_elem, child_cls, current_depth + 1, max_depth, content, fields=None)
+
+def build_filter_tree(path_tuples: list[tuple[str, str, dict[str, Any]]], model_cls: type | None = None, content: str = "all", depth: int | str = "unbounded", fields: list[str] | None = None) -> etree._Element:
+    root = current = None
+    for ns, tag, keys in path_tuples:
+        elem = etree.Element("{" + ns + "}" + tag, nsmap={None: ns})
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k)
+            key_elem.text = str(v)
+            elem.append(key_elem)
+            
+        if root is None: root = current = elem
+        else:
+            current.append(elem)
+            current = elem
+
+    if model_cls is not None and current is not None:
+        has_fields = fields is not None and len(fields) > 0
+        depth_limit = int(depth) if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()) else "unbounded"
+        if has_fields or depth_limit != "unbounded" or content in ("config", "nonconfig"):
+            depth_limit = depth_limit - 1 # ensure same behavior of RESTCONF depth param
+            add_model_fields_to_filter(current, model_cls, 1, depth_limit, content, fields)
+            
+    return root
+
+def find_xml_node(root_element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element | None:
+    current = root_element
+    for ns, tag, keys in path_tuples:
+        found = None
+        for child in current:
+            if etree.QName(child).localname == tag and (not ns or etree.QName(child).namespace == ns):
+                match = True
+                for k, v in keys.items():
+                    key_child = child.find("./{" + ns + "}" + k)
+                    if key_child is None:
+                        key_child = child.find(f"./{k}")
+                    if key_child is None or key_child.text != str(v):
+                        match = False
+                        break
+                if match:
+                    found = child
+                    break
+        if found is None:
+            return None
+        current = found
+    return current
+
+def find_xml_nodes(root_element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> list[etree._Element]:
+    if not path_tuples:
+        return []
+    parent = find_xml_node(root_element, path_tuples[:-1]) if len(path_tuples) > 1 else root_element
+    if parent is None:
+        return []
+    
+    last_ns, last_tag, last_keys = path_tuples[-1]
+    results = []
+    for child in parent:
+        if etree.QName(child).localname == last_tag and (not last_ns or etree.QName(child).namespace == last_ns):
+            match = True
+            for k, v in last_keys.items():
+                key_child = child.find("./{" + last_ns + "}" + k)
+                if key_child is None:
+                    key_child = child.find(f"./{k}")
+                if key_child is None or key_child.text != str(v):
+                    match = False
+                    break
+            if match:
+                results.append(child)
+    return results
+
+def wrap_in_parent_hierarchy(element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element:
+    current = element
+    for ns, tag, keys in reversed(path_tuples[:-1]):
+        parent_elem = etree.Element("{" + ns + "}" + tag, nsmap={None: ns})
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k)
+            key_elem.text = str(v)
+            parent_elem.append(key_elem)
+        parent_elem.append(current)
+        current = parent_elem
+    return current
+
+def wrap_list_in_parent_hierarchy(elements: list[etree._Element], path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element:
+    if not path_tuples or len(path_tuples) < 2:
+        root = etree.Element("config", nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        root.extend(elements)
+        return root
+        
+    parent_ns, parent_tag, parent_keys = path_tuples[-2]
+    parent_elem = etree.Element("{" + parent_ns + "}" + parent_tag, nsmap={None: parent_ns})
+    for k, v in parent_keys.items():
+        key_elem = etree.Element("{" + parent_ns + "}" + k)
+        key_elem.text = str(v)
+        parent_elem.append(key_elem)
+        
+    for elem in elements: parent_elem.append(elem)
+        
+    current = parent_elem
+    for ns, tag, keys in reversed(path_tuples[:-2]):
+        anc_elem = etree.Element("{" + ns + "}" + tag, nsmap={None: ns})
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k)
+            key_elem.text = str(v)
+            anc_elem.append(key_elem)
+        anc_elem.append(current)
+        current = anc_elem
+        
+    return current
+
+class Node:
+    def __init__(self, client: NetconfClient, path: list[tuple[str, str, dict]] = None):
+        self._client = client
+        self._path = path or []
+
+class ItemNode(Node): pass
+TNode = TypeVar("TNode", bound=ItemNode)
+
+class ListNode(Node, Generic[TNode]):
+    def __init__(self, client: NetconfClient, item_cls: type[TNode], path: list = None):
+        super().__init__(client, path)
+        self._item_cls = item_cls
+
+    def __call__(self, *keys: Any) -> TNode: raise NotImplementedError("Implemented by generated subclasses")

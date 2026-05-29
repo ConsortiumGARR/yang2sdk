@@ -16,12 +16,14 @@ dependencies = [
     "pyang>=2.7.1",
     "pydantic>=2.12.5",
     "requests>=2.32.5",
+    "pydantic-xml>=2.21.0",
 ]
 
 [project.scripts]
 yang-downloader = "yang2sdk.cli.downloader:main"
 tester = "yang2sdk.cli.tester:main"
 yang2restconf = "yang2sdk.cli.compiler:restconf"
+yang2netconf = "yang2sdk.cli.compiler:netconf"
 
 [dependency-groups]
 dev = [
@@ -30,3 +32,7 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yang2sdk"]
+
+[tool.pyright]
+include = ["src", "temp"]
+extraPaths = ["temp"]

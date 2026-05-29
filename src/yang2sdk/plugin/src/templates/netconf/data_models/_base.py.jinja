@@ -1,0 +1,98 @@
+from typing import Annotated, Any, Literal, Self
+from pydantic import ConfigDict, BaseModel
+from pydantic_xml import BaseXmlModel, attr
+from lxml import etree
+from decimal import Decimal
+import re
+
+NETCONF_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+class NetconfXmlModel(BaseXmlModel):
+    """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml."""
+    
+    @classmethod
+    def from_xml(cls, source: str | bytes, *args: Any, **kwargs: Any) -> Self:
+        rebuild_model_and_dependencies(cls)
+        return super().from_xml(source, *args, **kwargs)
+
+    @classmethod
+    def from_xml_tree(cls, root: etree._Element, *args: Any, **kwargs: Any) -> Self:
+        rebuild_model_and_dependencies(cls)
+        return super().from_xml_tree(root, *args, **kwargs)
+
+    def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
+        rebuild_model_and_dependencies(self.__class__)
+        return super().to_xml(*args, **kwargs)
+
+
+def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] = None) -> None:
+    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers."""
+    if memo is None:
+        memo = set()
+    if cls in memo:
+        return
+    memo.add(cls)
+
+    # Initial resolve to populate annotations and generate initial schema metadata
+    if getattr(cls, "__xml_serializer__", None) is None:
+        cls.model_rebuild()
+
+    from typing import get_args, get_origin, Union, Annotated
+    import types
+
+    def extract_models(annot: Any) -> list[type[NetconfXmlModel]]:
+        if annot is None:
+            return []
+        origin = get_origin(annot)
+        if origin in (Union, types.UnionType):
+            models = []
+            for arg in get_args(annot):
+                models.extend(extract_models(arg))
+            return models
+        elif origin in (list, tuple, set, dict, Annotated):
+            models = []
+            for arg in get_args(annot):
+                models.extend(extract_models(arg))
+            return models
+        elif isinstance(annot, type) and issubclass(annot, NetconfXmlModel):
+            return [annot]
+        return []
+
+    fields = getattr(cls, "model_fields", {})
+    for field_info in fields.values():
+        for nested_cls in extract_models(field_info.annotation):
+            rebuild_model_and_dependencies(nested_cls, memo)
+
+    # Final seal: lock-in serializers once child dependencies are completely built
+    cls.model_rebuild()
+
+class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, defer_build=True, populate_by_name=True)
+    nc_operation: str | None = attr(name="operation", ns="nc", default=None)
+
+    def to_xml_payload(self, **kwargs: Any) -> str | bytes:
+        """Serializes to XML while omitting unset fields and operational-only elements."""
+        cls = type(self)
+        exclude: set[str] = set()
+        
+        for field_name, field_info in cls.model_fields.items():
+            if field_info.json_schema_extra and not field_info.json_schema_extra.get("is_config", True):
+                exclude.add(field_name)
+
+        user_exclude = kwargs.get("exclude")
+        if user_exclude:
+            if isinstance(user_exclude, (set, list, tuple)):
+                exclude |= set(user_exclude)
+
+        kwargs["exclude"] = exclude if exclude else None
+        kwargs.setdefault("exclude_unset", True)
+        kwargs.setdefault("by_alias", True)
+        return self.to_xml(**kwargs)
+
+Decimal64 = Decimal
+Uint64 = int
+Int64 = int
+
+def check_pattern(pattern: str, v: str) -> str:
+    if isinstance(v, str) and not re.match(pattern, v): raise ValueError(f'Value does not match pattern: {pattern}')
+    return v

@@ -1,0 +1,55 @@
+import logging
+from typing import Any
+from ncclient import manager
+from lxml import etree
+import os
+
+log = logging.getLogger(__name__)
+
+class NetconfClient:
+    """Production-ready NETCONF API client wrapping ncclient."""
+
+    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = False, **kwargs):
+        self.host = loopback_ip or management_ip
+        self.port = port
+        self.username = username or os.environ.get("DEVICE_USER")
+        self.password = password or os.environ.get("DEVICE_PASS")
+        
+        if not self.host:
+            raise ValueError("Either loopback_ip or management_ip must be provided")
+
+        log.info(f"Connecting to NETCONF server {self.host}:{self.port}")
+        self._manager = manager.connect(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            hostkey_verify=verify,
+            **kwargs
+        )
+        
+        from .data_navigators import Data, Operations
+        self.data = Data(self, path=[])
+        self.operations = Operations(self, path=[])
+
+    def get_config(self, source: str = "running", filter_xml: str | etree._Element | None = None, with_defaults: str | None = None) -> etree._Element:
+        if isinstance(filter_xml, str): filter_xml = ("subtree", filter_xml)
+        elif isinstance(filter_xml, etree._Element): filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
+        kwargs = {"with_defaults": with_defaults} if with_defaults else {}
+        return self._manager.get_config(source=source, filter=filter_xml, **kwargs).data_ele
+
+    def get(self, filter_xml: str | etree._Element | None = None, with_defaults: str | None = None) -> etree._Element:
+        if isinstance(filter_xml, str): filter_xml = ("subtree", filter_xml)
+        elif isinstance(filter_xml, etree._Element): filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
+        kwargs = {"with_defaults": with_defaults} if with_defaults else {}
+        return self._manager.get(filter=filter_xml, **kwargs).data_ele
+
+    def edit_config(self, config_xml: str | etree._Element, target: str = "candidate", default_operation: str = "merge") -> bool:
+        if isinstance(config_xml, etree._Element): config_xml = etree.tostring(config_xml, encoding="unicode")
+        return self._manager.edit_config(target=target, config=config_xml, default_operation=default_operation).ok
+
+    def commit(self) -> bool:
+        return self._manager.commit().ok
+
+    def rpc(self, rpc_xml: etree._Element) -> etree._Element:
+        return self._manager.dispatch(rpc_xml).data_ele

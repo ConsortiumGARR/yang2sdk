@@ -1,0 +1,35 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+from ._base import Node
+
+if TYPE_CHECKING:
+{% for mod_name in module_names %}
+    from . import {{ mod_name }}
+{% endfor %}
+
+class Data(Node):
+    {% for prop in data_props %}
+    
+    @property
+    def {{ prop.module }}_{{ prop.field }}(self) -> {{ prop.module }}.{% if prop.node_type == 'list' %}{% if prop.cls.endswith('Item') %}{{ prop.cls[:-4] }}{% else %}{{ prop.cls }}{% endif %}ListNode{% else %}{{ prop.cls }}Node{% endif %}:
+        {% if prop.node_type == 'list' %}
+        {% set base_cls = prop.cls[:-4] if prop.cls.endswith('Item') else prop.cls %}
+        from .{{ prop.module }} import {{ base_cls }}ListNode, {{ prop.cls }}Node
+        path = self._path + [('{{ prop.ns }}', '{{ prop.alias.split(":")[1] }}', {})]
+        return {{ base_cls }}ListNode(self._client, {{ prop.cls }}Node, path)
+        {% else %}
+        from .{{ prop.module }} import {{ prop.cls }}Node
+        path = self._path + [('{{ prop.ns }}', '{{ prop.alias.split(":")[1] }}', {})]
+        return {{ prop.cls }}Node(self._client, path)
+        {% endif %}
+    {% endfor %}
+
+class Operations(Node):
+    {% for prop in rpc_props %}
+    
+    @property
+    def {{ prop.module }}_{{ prop.field }}(self) -> {{ prop.module }}.{{ prop.cls }}Node:
+        from .{{ prop.module }} import {{ prop.cls }}Node
+        path = self._path + [('{{ prop.ns }}', '{{ prop.alias.split(":")[1] }}', {})]
+        return {{ prop.cls }}Node(self._client, path)
+    {% endfor %}

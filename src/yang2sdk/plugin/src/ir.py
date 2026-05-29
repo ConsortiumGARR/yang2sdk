@@ -21,6 +21,7 @@ class IRField:
 class IRModel:
     name: str
     description: str
+    yang_name: str = ""
     fields: list[IRField] = field(default_factory=list)
     is_rpc_envelope: bool = False
     rpc_input_cls: Optional[str] = None
@@ -48,6 +49,7 @@ class IRNavProperty:
     nav_cls: str
     path_name: str
     yang_name: str
+    ns: str = ""
     item_cls: Optional[str] = None
 
 
@@ -60,7 +62,9 @@ class IRNavNode:
     path_name: str = ""
     yang_name: str = ""
     pydantic_module: str = ""
-    module_yang_name: str = ""  # MUST BE ADDED FOR RPC NAMESPACES
+    module_yang_name: str = ""
+    ns: str = ""
+    keys: list[str] = field(default_factory=list)
     properties: list[IRNavProperty] = field(default_factory=list)
     has_input: bool = False
     has_output: bool = False
@@ -68,18 +72,19 @@ class IRNavNode:
 
 @dataclass
 class IRParentProperty:
-    # Used for global roots (__init__.py)
     module: str
     cls: str
     alias: str
     field: str
     node_type: str = "container"
+    ns: str = ""
 
 
 @dataclass
 class IRModule:
     name: str
     py_name: str
+    namespace: str = ""
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
     nav_nodes: list[IRNavNode] = field(default_factory=list)
@@ -90,16 +95,27 @@ class IRModule:
 class IRBuilder:
     """Walks the YANG AST and populates the pristine IR dataclasses."""
 
-    def __init__(self, ctx, module, config_only):
+    def __init__(self, ctx, module, config_only, target_format="restconf"):
         self.ctx = ctx
         self.module = module
         self.config_only = config_only
+        self.target_format = target_format
 
         self.groupings = {}
         self.enum_registry = {}
         self.uses_refs = {}
 
-        self.ir = IRModule(name=module.arg, py_name=module.arg.replace("-", "_"))
+        ns = module.search_one("namespace")
+        self.ir = IRModule(
+            name=module.arg,
+            py_name=module.arg.replace("-", "_"),
+            namespace=ns.arg if ns else "urn:unknown",
+        )
+
+    def _get_module_namespace(self, stmt) -> str:
+        mod = getattr(stmt, "i_module", self.module)
+        ns = mod.search_one("namespace")
+        return ns.arg if ns else "urn:unknown"
 
     def _models_are_equivalent(self, m1: IRModel, m2: IRModel) -> bool:
         """Determines if two models are semantically equivalent."""
@@ -191,6 +207,7 @@ class IRBuilder:
                         alias=f"{self.module.arg}:{child.arg}",
                         field=self._to_field_name(child.arg),
                         node_type=child.keyword,
+                        ns=self._get_module_namespace(child),
                     )
                 )
 
@@ -213,6 +230,7 @@ class IRBuilder:
                     alias=f"{self.module.arg}:{rpc.arg}",
                     field=self._to_field_name(rpc.arg),
                     node_type="rpc",
+                    ns=self._get_module_namespace(rpc),
                 )
             )
 
@@ -250,6 +268,12 @@ class IRBuilder:
 
     def _build_nav_node(self, stmt) -> Optional[IRNavNode]:
         cls_name = getattr(stmt, "_pydantic_class_name", self._to_class_name(stmt.arg))
+        ns = self._get_module_namespace(stmt)
+        keys = (
+            stmt.search_one("key").arg.split()
+            if stmt.keyword == "list" and stmt.search_one("key")
+            else []
+        )
 
         node = IRNavNode(
             node_type=stmt.keyword,
@@ -257,7 +281,9 @@ class IRBuilder:
             path_name=stmt.arg,
             yang_name=stmt.arg,
             pydantic_module=self.ir.py_name,
-            module_yang_name=self.module.arg,  # Pass raw YANG namespace for JSON keys
+            module_yang_name=self.module.arg,
+            ns=ns,
+            keys=keys,
             has_input=stmt.search_one("input") is not None
             if stmt.keyword == "rpc"
             else False,
@@ -292,6 +318,7 @@ class IRBuilder:
                         else f"{child_cls[:-4] if child_cls.endswith('Item') else child_cls}ListNode",
                         path_name=child.arg,
                         yang_name=child.arg,
+                        ns=self._get_module_namespace(child),
                         item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
                         if child.keyword == "list"
                         else None,
@@ -314,6 +341,7 @@ class IRBuilder:
 
         model = IRModel(
             name=class_name,
+            yang_name=stmt.arg,
             description=self._escape_docstring(stmt.search_one("description").arg)
             if stmt.search_one("description")
             else f"{stmt.keyword.capitalize()}: {stmt.arg}",
@@ -329,7 +357,10 @@ class IRBuilder:
     def _build_rpc(self, rpc):
         base_name = getattr(rpc, "_pydantic_class_name", self._to_class_name(rpc.arg))
         envelope = IRModel(
-            name=base_name, description=f"RPC: {rpc.arg}", is_rpc_envelope=True
+            name=base_name,
+            yang_name=rpc.arg,
+            description=f"RPC: {rpc.arg}",
+            is_rpc_envelope=True,
         )
 
         inp = rpc.search_one("input")
@@ -466,7 +497,12 @@ class IRBuilder:
                 final_name = self._register_model(nested)
                 stmt._pydantic_class_name = final_name
                 item_type = final_name
-            type_str = f"RestconfList[{item_type}]"
+
+            type_str = (
+                f"list[{item_type}]"
+                if self.target_format == "netconf"
+                else f"RestconfList[{item_type}]"
+            )
             is_optional = not self._is_mandatory(stmt)
 
             min_elements = stmt.search_one("min-elements")
@@ -501,7 +537,12 @@ class IRBuilder:
                     for p in constraints.pop("_patterns")
                 ]
                 item_type = f"Annotated[{item_type}, {', '.join(validators)}]"
-            type_str = f"RestconfList[{item_type}]"
+
+            type_str = (
+                f"list[{item_type}]"
+                if self.target_format == "netconf"
+                else f"RestconfList[{item_type}]"
+            )
             is_optional = not self._is_mandatory(stmt)
 
             min_elements = stmt.search_one("min-elements")
@@ -520,31 +561,58 @@ class IRBuilder:
         default_val = self._get_default_value(stmt)
 
         desc = self._build_field_description(stmt)
-        if desc:
-            field_params.append(f"description={repr(desc)}")
-        for k, v in constraints.items():
-            field_params.append(f"{k}={v}")
-        if default_val is not None:
-            field_params.append(
-                f"default={default_val if default_val != 'None' or not is_optional else 'None'}"
+
+        if self.target_format == "netconf":
+            field_params = [f'tag="{stmt.arg}"']
+            if default_val is not None:
+                field_params.append(
+                    "default=None"
+                    if is_optional and default_val == "None"
+                    else f"default={default_val}"
+                )
+            elif is_optional:
+                field_params.append("default=None")
+            elif stmt.keyword in ("list", "leaf-list"):
+                field_params.append("default_factory=list")
+
+            if desc:
+                field_params.append(f"description={repr(desc)}")
+            for k, v in constraints.items():
+                field_params.append(f"{k}={v}")
+
+            extra_dict["is_key"] = getattr(stmt, "i_is_key", False)
+            extra_dict["tag"] = stmt.arg
+            extra_dict["ns"] = self._get_module_namespace(stmt)
+            field_params.append(f"json_schema_extra={repr(extra_dict)}")
+            assign = f"element({', '.join(field_params)})"
+
+        else:
+            field_params = [f"json_schema_extra={repr(extra_dict)}"]
+            if desc:
+                field_params.append(f"description={repr(desc)}")
+            for k, v in constraints.items():
+                field_params.append(f"{k}={v}")
+            if default_val is not None:
+                field_params.append(
+                    f"default={default_val if default_val != 'None' or not is_optional else 'None'}"
+                )
+            elif is_optional:
+                field_params.append("default=None")
+
+            mod_name, parent_mod = (
+                self._get_module_name(stmt),
+                self._get_module_name(parent_stmt),
             )
-        elif is_optional:
-            field_params.append("default=None")
+            if parent_stmt.keyword in ("module", "submodule") or mod_name != parent_mod:
+                field_params.append(f'alias="{mod_name}:{stmt.arg}"')
+            elif field_name != stmt.arg:
+                field_params.append(f'alias="{stmt.arg}"')
 
-        mod_name, parent_mod = (
-            self._get_module_name(stmt),
-            self._get_module_name(parent_stmt),
-        )
-        if parent_stmt.keyword in ("module", "submodule") or mod_name != parent_mod:
-            field_params.append(f'alias="{mod_name}:{stmt.arg}"')
-        elif field_name != stmt.arg:
-            field_params.append(f'alias="{stmt.arg}"')
-
-        assign = (
-            f"Field({', '.join(field_params)})"
-            if field_params
-            else (default_val if default_val else "")
-        )
+            assign = (
+                f"Field({', '.join(field_params)})"
+                if field_params
+                else (default_val if default_val else "")
+            )
 
         return IRField(name=field_name, type_str=field_def, assignment=assign)
 

@@ -1,0 +1,182 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING, Any
+from lxml import etree
+from ._base import Node, ListNode, ItemNode, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth
+
+if TYPE_CHECKING:
+    from ..data_models import {{ module.py_name }}
+
+{% for node in module.nav_nodes %}
+{% if node.node_type == 'container' %}
+class {{ node.class_name }}Node(ItemNode):
+    def retrieve(self, *, source: str = 'running', content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> {{ node.pydantic_module }}.{{ node.class_name }} | None:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
+        xml_filter = build_filter_tree(self._path, {{ node.class_name }}, content=content, depth=depth, fields=fields)
+        xml_data = self._client.get_config(source=source, filter_xml=xml_filter, with_defaults=with_defaults) if content == 'config' else self._client.get(filter_xml=xml_filter, with_defaults=with_defaults)
+        matched = find_xml_node(xml_data, self._path)
+        if matched is not None:
+            if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
+            return {{ node.class_name }}.from_xml(etree.tostring(matched))
+        return None
+
+    def update(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str = 'candidate', operation: str = 'merge', **kwargs: Any) -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
+        if data is None and kwargs: data = {k.replace('_', '-'): v for k, v in kwargs.items()}
+        if isinstance(data, dict): data = {{ node.class_name }}.model_validate(data)
+        elif isinstance(data, str): data = {{ node.class_name }}.from_xml(data) if data.strip().startswith('<') else {{ node.class_name }}.model_validate_json(data)
+        if data is None: raise ValueError('No data provided for update. Provide a dict, string, or kwargs.')
+        data.nc_operation = operation
+        elem = etree.fromstring(data.to_xml_payload())
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+
+    def replace(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str = 'candidate', **kwargs: Any) -> bool:
+        return self.update(data, target=target, operation='replace', **kwargs)
+
+    def delete(self, *, target: str = 'candidate') -> bool:
+        last_ns, last_tag, _ = self._path[-1]
+        elem = etree.Element("{" + last_ns + "}" + last_tag, nsmap={None: last_ns})
+        elem.set('operation', 'delete')
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+        
+    {% for prop in node.properties %}
+    @property
+    def {{ prop.name }}(self) -> {{ prop.type_hint }}:
+        path = self._path + [('{{ prop.ns }}', '{{ prop.yang_name }}', {})]
+        {% if prop.item_cls %}
+        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}, {{ prop.item_cls }}
+        return {{ prop.nav_cls }}(self._client, {{ prop.item_cls }}, path)
+        {% else %}
+        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}
+        return {{ prop.nav_cls }}(self._client, path)
+        {% endif %}
+    {% endfor %}
+
+{% elif node.node_type == 'list' %}
+class {{ node.item_class_name }}Node(ItemNode):
+    def retrieve(self, *, source: str = 'running', content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> {{ node.pydantic_module }}.{{ node.item_class_name }} | None:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
+        xml_filter = build_filter_tree(self._path, {{ node.item_class_name }}, content=content, depth=depth, fields=fields)
+        xml_data = self._client.get_config(source=source, filter_xml=xml_filter, with_defaults=with_defaults) if content == 'config' else self._client.get(filter_xml=xml_filter, with_defaults=with_defaults)
+        matched = find_xml_node(xml_data, self._path)
+        if matched is not None:
+            if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): prune_xml_tree_to_depth(matched, {{ node.item_class_name }}, int(depth))
+            return {{ node.item_class_name }}.from_xml(etree.tostring(matched))
+        return None
+
+    def update(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str = 'candidate', operation: str = 'merge', **kwargs: Any) -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
+        if data is None and kwargs: data = {k.replace('_', '-'): v for k, v in kwargs.items()}
+        if isinstance(data, dict): data = {{ node.item_class_name }}.model_validate(data)
+        elif isinstance(data, str): data = {{ node.item_class_name }}.from_xml(data) if data.strip().startswith('<') else {{ node.item_class_name }}.model_validate_json(data)
+        if data is None: raise ValueError('No data provided for update. Provide a dict, string, or kwargs.')
+        data.nc_operation = operation
+        elem = etree.fromstring(data.to_xml_payload())
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+
+    def replace(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str = 'candidate', **kwargs: Any) -> bool:
+        return self.update(data, target=target, operation='replace', **kwargs)
+
+    def delete(self, *, target: str = 'candidate') -> bool:
+        last_ns, last_tag, keys_dict = self._path[-1]
+        elem = etree.Element("{" + last_ns + "}" + last_tag, nsmap={None: last_ns})
+        elem.set('operation', 'delete')
+        for k, v in keys_dict.items():
+            key_elem = etree.Element("{" + last_ns + "}" + k)
+            key_elem.text = str(v)
+            elem.append(key_elem)
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+        
+    {% for prop in node.properties %}
+    @property
+    def {{ prop.name }}(self) -> {{ prop.type_hint }}:
+        path = self._path + [('{{ prop.ns }}', '{{ prop.yang_name }}', {})]
+        {% if prop.item_cls %}
+        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}, {{ prop.item_cls }}
+        return {{ prop.nav_cls }}(self._client, {{ prop.item_cls }}, path)
+        {% else %}
+        from .{{ node.pydantic_module }} import {{ prop.nav_cls }}
+        return {{ prop.nav_cls }}(self._client, path)
+        {% endif %}
+    {% endfor %}
+
+class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
+    def __call__(self, {% for k in node.keys %}{{ k.replace('-', '_') }}: str | int{% if not loop.last %}, {% endif %}{% endfor %}) -> {{ node.item_class_name }}Node:
+        keys_dict = { {% for k in node.keys %}'{{ k }}': {{ k.replace('-', '_') }}{% if not loop.last %}, {% endif %}{% endfor %} }
+        new_path = self._path[:-1] + [(self._path[-1][0], self._path[-1][1], keys_dict)]
+        return {{ node.item_class_name }}Node(self._client, new_path)
+
+    def retrieve(self, *, source: str = 'running', content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> list[{{ node.pydantic_module }}.{{ node.item_class_name }}]:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
+        xml_filter = build_filter_tree(self._path, {{ node.item_class_name }}, content=content, depth=depth, fields=fields)
+        xml_data = self._client.get_config(source=source, filter_xml=xml_filter, with_defaults=with_defaults) if content == 'config' else self._client.get(filter_xml=xml_filter, with_defaults=with_defaults)
+        matched = find_xml_nodes(xml_data, self._path)
+        if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()):
+            for m in matched: prune_xml_tree_to_depth(m, {{ node.item_class_name }}, int(depth))
+        return [{{ node.item_class_name }}.from_xml(etree.tostring(m)) for m in matched]
+
+    def create(self, data: list[{{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str], *, target: str = 'candidate') -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
+        elements = []
+        for item in data:
+            if isinstance(item, dict): item = {{ node.item_class_name }}.model_validate(item)
+            elif isinstance(item, str): item = {{ node.item_class_name }}.from_xml(item) if item.strip().startswith('<') else {{ node.item_class_name }}.model_validate_json(item)
+            item.nc_operation = 'create'
+            elements.append(etree.fromstring(item.to_xml_payload()))
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_list_in_parent_hierarchy(elements, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+
+    def replace(self, data: list[{{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str], *, target: str = 'candidate') -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
+        elements = []
+        for item in data:
+            if isinstance(item, dict): item = {{ node.item_class_name }}.model_validate(item)
+            elif isinstance(item, str): item = {{ node.item_class_name }}.from_xml(item) if item.strip().startswith('<') else {{ node.item_class_name }}.model_validate_json(item)
+            item.nc_operation = 'replace'
+            elements.append(etree.fromstring(item.to_xml_payload()))
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_list_in_parent_hierarchy(elements, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+
+    def delete(self, *, target: str = 'candidate') -> bool:
+        last_ns, last_tag, _ = self._path[-1]
+        elem = etree.Element("{" + last_ns + "}" + last_tag, nsmap={None: last_ns})
+        elem.set('operation', 'delete')
+        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
+        return self._client.edit_config(config_xml=config_xml, target=target)
+
+{% elif node.node_type == 'rpc' %}
+class {{ node.class_name }}Node(Node):
+    def __call__(self{% if node.has_input %}, input_data: {{ node.pydantic_module }}.{{ node.class_name }}Input | dict | str | None = None, **kwargs: Any{% endif %}){% if node.has_output %} -> {{ node.pydantic_module }}.{{ node.class_name }}Output | None{% else %} -> None{% endif %}:
+        {% if node.has_input or node.has_output %}
+        from ..data_models.{{ node.pydantic_module }} import {% if node.has_input %}{{ node.class_name }}Input{% endif %}{% if node.has_input and node.has_output %}, {% endif %}{% if node.has_output %}{{ node.class_name }}Output{% endif %}
+        {% endif %}
+        ns, tag, _ = self._path[-1]
+        rpc_elem = etree.Element("{" + ns + "}" + tag, nsmap={None: ns})
+        
+        {% if node.has_input %}
+        if input_data is None and kwargs: input_data = {k.replace('_', '-'): v for k, v in kwargs.items()}
+        if isinstance(input_data, dict): input_data = {{ node.class_name }}Input.model_validate(input_data)
+        elif isinstance(input_data, str): input_data = {{ node.class_name }}Input.from_xml(input_data) if input_data.strip().startswith('<') else {{ node.class_name }}Input.model_validate_json(input_data)
+        if input_data:
+            for child in etree.fromstring(input_data.to_xml_payload()): rpc_elem.append(child)
+        {% endif %}
+        
+        resp_elem = self._client.rpc(rpc_elem)
+        
+        {% if node.has_output %}
+        if resp_elem is not None and len(resp_elem) > 0:
+            return {{ node.class_name }}Output.from_xml(etree.tostring(resp_elem))
+        return None
+        {% endif %}
+{% endif %}
+{% endfor %}

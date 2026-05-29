@@ -1,0 +1,30 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+from pydantic import ConfigDict
+from pydantic_xml import element
+from ._base import NetconfXmlModel
+
+if TYPE_CHECKING:
+{% for mod_name in module_names %}
+    from . import {{ mod_name }}
+{% endfor %}
+
+class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in data_props %}, '{{ prop.module }}': '{{ prop.ns }}'{% endfor %}}, ns=''):
+    """Aggregate root data nodes."""
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, defer_build=True, populate_by_name=True)
+    
+    {% if not data_props %}pass{% else %}
+    {% for prop in data_props %}
+    {{ prop.module }}_{{ prop.field }}: '{{ prop.module }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
+    {% endfor %}
+    {% endif %}
+
+class Operations(NetconfXmlModel, tag='operations', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in rpc_props %}, '{{ prop.module }}': '{{ prop.ns }}'{% endfor %}}, ns=''):
+    """Aggregate RPC operations."""
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, defer_build=True, populate_by_name=True)
+    
+    {% if not rpc_props %}pass{% else %}
+    {% for prop in rpc_props %}
+    {{ prop.module }}_{{ prop.field }}: '{{ prop.module }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
+    {% endfor %}
+    {% endif %}

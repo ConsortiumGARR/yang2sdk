@@ -694,6 +694,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pydantic-xml"
+version = "2.21.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/87/085533e0873b2f80bdeb12156ffe5dddae7ee55573e2057ad574d73e3b6a/pydantic_xml-2.21.0.tar.gz", hash = "sha256:678ba9149c24e190ad94d6e3ce47f94cbb1409fd88d7df65d3d26939ff669ed0", size = 26825, upload-time = "2026-05-17T15:24:19.534Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/b1/278da37b539595b2cb6bb4fb3da1d69ff084c7bf5cc143f0a444550dc41a/pydantic_xml-2.21.0-py3-none-any.whl", hash = "sha256:966b8990746528304ebb96c97db7603ee3faf38f06266247b1fa444dbc16f8d6", size = 43449, upload-time = "2026-05-17T15:24:21.182Z" },
+]
+
+[[package]]
 name = "pynacl"
 version = "1.6.2"
 source = { registry = "https://pypi.org/simple" }
@@ -974,6 +987,7 @@ dependencies = [
     { name = "ncclient" },
     { name = "pyang" },
     { name = "pydantic" },
+    { name = "pydantic-xml" },
     { name = "python-dotenv" },
     { name = "requests" },
 ]
@@ -990,6 +1004,7 @@ requires-dist = [
     { name = "ncclient", specifier = ">=0.7.0" },
     { name = "pyang", specifier = ">=2.7.1" },
     { name = "pydantic", specifier = ">=2.12.5" },
+    { name = "pydantic-xml", specifier = ">=2.21.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "requests", specifier = ">=2.32.5" },
 ]
