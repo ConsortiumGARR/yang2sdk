@@ -61,7 +61,7 @@ Modify and save `.env` with your device's information.
 Get the YANG models from the vendor or use the following to try pulling what the network device is running.
 
 ```bash
-uv run yang_downloader
+uv run yang-downloader
 ```
 
 ### YANG Tree inspection and modules identification
