@@ -61,7 +61,7 @@ Modify and save `.env` with your device's information.
 Get the YANG models from the vendor or use the following to try pulling what the network device is running.
 
 ```bash
-uv run yang_downloader
+uv run yang-downloader
 ```
 
 ### YANG Tree inspection and modules identification
@@ -151,3 +151,7 @@ The core of this project is the [pyang](https://github.com/mbj4668/pyang) plugin
 It does not provide the code for network operations.
 
 **pyangbind** dynamically generates Python classes at runtime and does not provide the code for network operations.
+
+## Status
+
+This is a public prototype. For the moment only RESTCONF is implemented, in future this tool can be extended to output NETCONF clients too.
