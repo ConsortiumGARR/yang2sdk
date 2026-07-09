@@ -1,19 +1,22 @@
+# --- src/yang2sdk/plugin/src/templates/netconf/session_manager.py.jinja ---
 import logging
-from typing import Any
-from ncclient import manager
-from lxml import etree
 import os
+from typing import Any, Self
+from ncclient import manager
+from ncclient.operations import RPCError
+from lxml import etree
 
 log = logging.getLogger(__name__)
 
 class NetconfClient:
     """Production-ready NETCONF API client wrapping ncclient."""
 
-    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = False, **kwargs):
+    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = False, timeout: int = 60, auto_commit: bool = True, **kwargs):
         self.host = loopback_ip or management_ip
         self.port = port
         self.username = username or os.environ.get("DEVICE_USER")
         self.password = password or os.environ.get("DEVICE_PASS")
+        self.auto_commit = auto_commit
         
         if not self.host:
             raise ValueError("Either loopback_ip or management_ip must be provided")
@@ -25,31 +28,183 @@ class NetconfClient:
             username=self.username,
             password=self.password,
             hostkey_verify=verify,
+            timeout=timeout,
             **kwargs
         )
         
+        # Capability Discovery (RFC 6241 Sec 8)
+        self.server_capabilities = list(self._manager.server_capabilities)
+        self.has_candidate = any("urn:ietf:params:netconf:capability:candidate:1.0" in cap for cap in self.server_capabilities)
+        self.has_writable_running = any("urn:ietf:params:netconf:capability:writable-running:1.0" in cap for cap in self.server_capabilities)
+        self.has_nmda = any("ietf-netconf-nmda" in cap for cap in self.server_capabilities)
+        
+        if not self.has_candidate and not self.has_writable_running:
+            log.warning("Device advertises neither :candidate nor :writable-running. Modifications may fail.")
+            self.default_target = "running"
+        else:
+            self.default_target = "candidate" if self.has_candidate else "running"
+
+        log.debug(f"Capabilities resolved. Default write target: {self.default_target}")
+
         from .data_navigators import Data, Operations
         self.data = Data(self, path=[])
         self.operations = Operations(self, path=[])
 
-    def get_config(self, source: str = "running", filter_xml: str | etree._Element | None = None, with_defaults: str | None = None) -> etree._Element:
-        if isinstance(filter_xml, str): filter_xml = ("subtree", filter_xml)
-        elif isinstance(filter_xml, etree._Element): filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
-        kwargs = {"with_defaults": with_defaults} if with_defaults else {}
-        return self._manager.get_config(source=source, filter=filter_xml, **kwargs).data_ele
+    def __enter__(self) -> Self:
+        """Context manager for safe, locked transaction blocks."""
+        self.lock()
+        return self
 
-    def get(self, filter_xml: str | etree._Element | None = None, with_defaults: str | None = None) -> etree._Element:
-        if isinstance(filter_xml, str): filter_xml = ("subtree", filter_xml)
-        elif isinstance(filter_xml, etree._Element): filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
-        kwargs = {"with_defaults": with_defaults} if with_defaults else {}
-        return self._manager.get(filter=filter_xml, **kwargs).data_ele
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None and self.has_candidate:
+            log.warning("Exception during transaction, discarding candidate changes.")
+            self.discard_changes()
+        self.unlock()
 
-    def edit_config(self, config_xml: str | etree._Element, target: str = "candidate", default_operation: str = "merge") -> bool:
-        if isinstance(config_xml, etree._Element): config_xml = etree.tostring(config_xml, encoding="unicode")
-        return self._manager.edit_config(target=target, config=config_xml, default_operation=default_operation).ok
+    def lock(self, target: str | None = None) -> bool:
+        target = target or self.default_target
+        log.debug(f"Acquiring lock on {target} datastore.")
+        return self._handle_rpc(self._manager.lock, target=target).ok
+
+    def unlock(self, target: str | None = None) -> bool:
+        target = target or self.default_target
+        log.debug(f"Releasing lock on {target} datastore.")
+        return self._handle_rpc(self._manager.unlock, target=target).ok
+
+    def _handle_rpc(self, func, *args, **kwargs) -> Any:
+        """Centralized error handling for ncclient operations."""
+        try:
+            return func(*args, **kwargs)
+        except RPCError as e:
+            # Transform ncclient XML exceptions into standard Python runtime exceptions
+            error_msg = f"NETCONF RPC Error: {e.tag} (Type: {e.type}, Severity: {e.severity})"
+            if getattr(e, 'message', None):
+                error_msg += f" - {e.message}"
+            log.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+    def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
+        """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running."""
+        if source is None:
+            source = "running" if content == "config" else "operational"
+
+        if isinstance(filter_xml, str):
+            filter_xml = etree.fromstring(filter_xml)
+
+        if self.has_nmda:
+            # Construct NMDA <get-data> (RFC 8526)
+            NMDA_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
+            DS_NS = "urn:ietf:params:xml:ns:yang:ietf-datastores"
+            
+            rpc = etree.Element(f"{{{NMDA_NS}}}get-data", nsmap={None: NMDA_NS, "ds": DS_NS})
+            ds = etree.SubElement(rpc, f"{{{NMDA_NS}}}datastore")
+            ds.text = f"ds:{source}"
+            
+            if filter_xml is not None:
+                sf = etree.SubElement(rpc, f"{{{NMDA_NS}}}subtree-filter")
+                sf.append(filter_xml)
+                
+            if content in ("config", "nonconfig"):
+                cf = etree.SubElement(rpc, f"{{{NMDA_NS}}}config-filter")
+                cf.text = "true" if content == "config" else "false"
+                
+            if with_defaults:
+                wd = etree.SubElement(rpc, f"{{{NMDA_NS}}}with-defaults")
+                wd.text = with_defaults
+
+            if depth and str(depth).lower() != "unbounded":
+                md = etree.SubElement(rpc, f"{{{NMDA_NS}}}max-depth")
+                md.text = str(depth)
+                
+            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            
+            # RFC 8526 guarantees output payload wrapper inherits the module namespace
+            data_node = reply.ele.find("{urn:ietf:params:xml:ns:yang:ietf-netconf-nmda}data")
+            if data_node is None:
+                data_node = reply.ele.find("{urn:ietf:params:xml:ns:netconf:base:1.0}data")
+            if data_node is None:
+                data_node = reply.ele.find("data")
+            return data_node
+
+        else:
+            # Fallback to Legacy <get> and <get-config> (RFC 6241)
+            if isinstance(filter_xml, etree._Element):
+                filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
+            kwargs = {"with_defaults": with_defaults} if with_defaults else {}
+            
+            # Legacy <get> does not support querying specific datastores natively, it queries state + running config
+            if content in ("all", "nonconfig") or source == "operational":
+                reply = self._handle_rpc(self._manager.get, filter=filter_xml, **kwargs)
+            else:
+                reply = self._handle_rpc(self._manager.get_config, source=source, filter=filter_xml, **kwargs)
+            return reply.data_ele
+
+    def edit(self, config_xml: str | etree._Element, target: str | None = None, default_operation: str = "merge") -> bool:
+        """Capability-routed edits. Uses <edit-data> if NMDA is supported, otherwise raw <edit-config>."""
+        target = target or self.default_target
+        if isinstance(config_xml, str):
+            config_xml = etree.fromstring(config_xml)
+
+        if self.has_nmda:
+            # Construct NMDA <edit-data> (RFC 8526)
+            NMDA_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
+            DS_NS = "urn:ietf:params:xml:ns:yang:ietf-datastores"
+            
+            rpc = etree.Element(f"{{{NMDA_NS}}}edit-data", nsmap={None: NMDA_NS, "ds": DS_NS})
+            ds = etree.SubElement(rpc, f"{{{NMDA_NS}}}datastore")
+            ds.text = f"ds:{target}"
+            
+            def_op = etree.SubElement(rpc, f"{{{NMDA_NS}}}default-operation")
+            def_op.text = default_operation
+            
+            # <config> is a choice case inside <edit-content>, so it maps transparently without <edit-content>.
+            conf = etree.SubElement(rpc, f"{{{NMDA_NS}}}config")
+            
+            # Strip the legacy '<config>' wrapper tag passed by navigators, keeping just the children
+            if config_xml.tag.endswith("config"):
+                for child in config_xml:
+                    conf.append(child)
+            else:
+                conf.append(config_xml)
+                
+            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            success = reply.ok
+
+        else:
+            # Fallback to natively constructed Legacy <edit-config> (RFC 6241)
+            # We strictly bypass self._manager.edit_config() to avert multiple-root crashes and tag double-wrapping
+            NC_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+            rpc = etree.Element(f"{{{NC_NS}}}edit-config", nsmap={None: NC_NS})
+            tgt = etree.SubElement(rpc, f"{{{NC_NS}}}target")
+            etree.SubElement(tgt, f"{{{NC_NS}}}{target}")
+            
+            def_op = etree.SubElement(rpc, f"{{{NC_NS}}}default-operation")
+            def_op.text = default_operation
+            
+            if config_xml.tag.endswith("config"):
+                rpc.append(config_xml)
+            else:
+                conf = etree.SubElement(rpc, f"{{{NC_NS}}}config")
+                conf.append(config_xml)
+
+            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            success = reply.ok
+
+        if success and target == "candidate" and self.auto_commit:
+            self.commit()
+        return success
 
     def commit(self) -> bool:
-        return self._manager.commit().ok
+        if not self.has_candidate:
+            log.debug("Commit requested, but device lacks :candidate capability. Ignoring.")
+            return True
+        reply = self._handle_rpc(self._manager.commit)
+        return reply.ok
+
+    def discard_changes(self) -> bool:
+        if not self.has_candidate: return True
+        return self._handle_rpc(self._manager.discard_changes).ok
 
     def rpc(self, rpc_xml: etree._Element) -> etree._Element:
-        return self._manager.dispatch(rpc_xml).data_ele
+        reply = self._handle_rpc(self._manager.dispatch, rpc_xml)
+        return reply.ele

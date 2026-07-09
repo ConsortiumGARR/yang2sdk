@@ -1,0 +1,66 @@
+{
+  "meta": {
+    "rfc": 6242,
+    "obsoletes": 4742,
+    "status": "Standards Track",
+    "date": "2011-06",
+    "author": "M. Wasserman (Painless Security)",
+    "issn": "2070-1721"
+  },
+  "abstract": "NETCONF via SSH subsystem mapping spec.",
+  "terminology": {
+    "req_levels": "RFC2119 (MUST, SHOULD, MAY, etc.)"
+  },
+  "architecture": {
+    "stack": "NETCONF[RFC6241] -> SSH_Connection[RFC4254] -> SSH_Transport[RFC4253]",
+    "init_sequence": [
+      "SSH Transport TCP/830 (default) -> Key Exchange",
+      "ssh-userauth [RFC4252] -> Username passed to NETCONF",
+      "Drop session IF username ∉ Valid_XML",
+      "ssh-connection -> Open channel 'session' -> Invoke subsystem 'netconf' (SSHv2 ONLY)"
+    ]
+  },
+  "capabilities_exchange": {
+    "trigger": "Immediate/simultaneous post-subsystem init",
+    "payload": "<hello> XML document containing capabilities & session-id",
+    "eom_init": "]]>]]>"
+  },
+  "framing_protocol": {
+    "negotiation": {
+      "if": "both peers support :base:1.1",
+      "then": "Chunked Framing (Section 4.2)",
+      "else": "End-of-Message Framing (Section 4.3)"
+    },
+    "chunked": {
+      "abnf": "Chunked-Message = 1*chunk end-of-chunks; chunk = LF '#' chunk-size LF chunk-data; end-of-chunks = LF '#' '#' LF",
+      "constraints": {
+        "chunk-size": "1*DIGIT, no leading zeros, max 4294967295",
+        "error_handling": "Invalid size/decode_error => Terminate SSH channel immediately (buffer overrun protection)"
+      }
+    },
+    "eom_legacy": {
+      "marker": "]]>]]>",
+      "context": "Fallback for :base:1.0 only. Vulnerable to payload injection if delimiter exists in native XML attributes/comments."
+    }
+  },
+  "session_lifecycle": {
+    "termination": "Client sends <close-session> -> Server replies <rpc-reply><ok/></rpc-reply> -> Server closes SSH channel instantly (ignores subsequent mutations)"
+  },
+  "security": {
+    "auth": "Mutual identity verification mandatory prior to data/credential tx",
+    "crypto": "Strong transport encryption required for confidentiality (sensitive configurations/keys)",
+    "firewall": "TCP/830 defaults allow distinct filtering, but increases attack surface discovery. Alternative ports MUST be configurable.",
+    "mitigation": "Chunked framing removes payload delimiter injection vector present in RFC 4742."
+  },
+  "iana": {
+    "tcp_port": "830",
+    "ssh_subsystem_name": "netconf"
+  },
+  "diff_4742": [
+    "+ Chunked framing (fixes EOM injection flaw)",
+    "+ Strict XML validity check for authenticated username",
+    "+ Distinct mapping definitions for SSH vs NETCONF layer entity roles",
+    "+ Standardized nomenclature ('operation' vice 'command/message')",
+    "+ Errata integration"
+  ]
+}

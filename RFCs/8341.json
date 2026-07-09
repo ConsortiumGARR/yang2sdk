@@ -1,0 +1,157 @@
+{
+  "document": {
+    "title": "Network Configuration Access Control Model (NACM)",
+    "status": "IETF STD 91",
+    "rfc": 8341,
+    "obsoletes": 6536,
+    "authors": ["A. Bierman (YumaWorks)", "M. Bjorklund (Tail-f Systems)"],
+    "date": "2018-03",
+    "layer_coverage": {
+      "netconf": "Operations & Content Layers [RFC6241]",
+      "restconf": "Operations & Content Layers [RFC8040]",
+      "yang": "YANG 1.1 [RFC7950] compatibility (actions & nested notifications)"
+    }
+  },
+  "design_objectives": {
+    "control_points": {
+      "protocol_operation": "Authorize execution of RPCs/actions",
+      "datastore": "Authorize CRUD on data nodes within conventional/operational datastores",
+      "notification": "Authorize receipt of specific event streams/types"
+    },
+    "group_model": {
+      "type": "Group-based access control (Users ⊂ Groups)",
+      "external_groups": "Support for RADIUS/Transport-provided group assertions"
+    },
+    "sensitivity_tagging": {
+      "default-deny-write": "Machine-readable YANG extension to automatically deny write access to sensitive nodes",
+      "default-deny-all": "Machine-readable YANG extension to automatically deny all access (R/W/X) to critical nodes"
+    }
+  },
+  "nacm_machinery": {
+    "variables": {
+      "enable-nacm": "boolean [default: true]",
+      "read-default": "permit | deny [default: permit]",
+      "write-default": "permit | deny [default: deny]",
+      "exec-default": "permit | deny [default: permit]",
+      "enable-external-groups": "boolean [default: true]"
+    },
+    "recovery_session": {
+      "definition": "Bypasses all ACM checks",
+      "scope": "Implementation-specific mechanism (emergency rescue)"
+    },
+    "crudx_operations": {
+      "create": "Add new data node",
+      "read": "Retrieve data node / receive notification",
+      "update": "Modify existing data node",
+      "delete": "Remove data node",
+      "exec": "Invoke RPC / Action"
+    },
+    "restconf_mapping": {
+      "GET / HEAD": "read",
+      "POST (data)": "create",
+      "POST (action)": "execute",
+      "PUT": "create + update (data) / update (datastore)",
+      "PATCH": "update",
+      "DELETE": "delete"
+    }
+  },
+  "enforcement_algorithms": {
+    "incoming_rpc_check": {
+      "bypass_conditions": [
+        "enable-nacm == false",
+        "session == recovery_session",
+        "rpc == <close-session>"
+      ],
+      "evaluation_order": [
+        "Resolve user groups (local + external if enabled)",
+        "Iterate rule-lists (ordered-by user) matching user's groups",
+        "Iterate rules (ordered-by user) within matching rule-lists",
+        "Rule match criteria: (module-name == * | TargetModule) && (rule-type == protocol-operation && rpc-name == * | TargetRPC) && (access-operations == exec | *)",
+        "If matched: action == permit => Allow; action == deny => Deny",
+        "If no match: if rpc contains 'nacm:default-deny-all' => Deny",
+        "If rpc == <kill-session> or <delete-config> => Deny",
+        "Else: Fall back to exec-default"
+      ]
+    },
+    "data_node_check": {
+      "bypass_conditions": [
+        "enable-nacm == false",
+        "session == recovery_session"
+      ],
+      "evaluation_order": [
+        "Resolve groups",
+        "Iterate rule-lists matching user's groups",
+        "Iterate rules within lists",
+        "Rule match criteria: (module-name == * | TargetModule) && (rule-type == data-node && path matches target_node_or_descendant) && (access-operations == current_op | *)",
+        "If matched: action == permit => Allow; action == deny => Deny",
+        "If no match:",
+        "  - If read && node has 'default-deny-all' => Deny",
+        "  - If write && node has 'default-deny-write' | 'default-deny-all' => Deny",
+        "  - If read => fallback to read-default",
+        "  - If write => fallback to write-default",
+        "  - If execute (action) => fallback to exec-default"
+      ],
+      "implicit_side_effects": "No NACM access rights are required for data nodes implicitly changed by server-side evaluation (when-stmt, choice-stmt)."
+    },
+    "outgoing_notification_check": {
+      "bypass_conditions": [
+        "enable-nacm == false",
+        "session == recovery_session",
+        "event == <replayComplete> | <notificationComplete>"
+      ],
+      "evaluation_order": [
+        "If nested notification: verify read access to ancestor hierarchy + notification node via Data Node Check",
+        "If top-level notification: resolve groups, parse rules matching rule-type 'notification' and access-operations 'read'",
+        "If matched: action == permit => Send; action == deny => Drop",
+        "If no match: if event has 'default-deny-all' => Drop",
+        "Else: fallback to read-default"
+      ]
+    }
+  },
+  "yang_module": {
+    "name": "ietf-netconf-acm",
+    "namespace": "urn:ietf:params:xml:ns:yang:ietf-netconf-acm",
+    "prefix": "nacm",
+    "schema": {
+      "nacm": {
+        "enable-nacm": "boolean",
+        "read-default": "enumeration [permit, deny]",
+        "write-default": "enumeration [permit, deny]",
+        "exec-default": "enumeration [permit, deny]",
+        "enable-external-groups": "boolean",
+        "denied-operations": "yang:zero-based-counter32 [ro]",
+        "denied-data-writes": "yang:zero-based-counter32 [ro]",
+        "denied-notifications": "yang:zero-based-counter32 [ro]",
+        "groups": {
+          "group": {
+            "key": "name",
+            "name": "group-name-type",
+            "user-name": "leaf-list string"
+          }
+        },
+        "rule-list": {
+          "key": "name",
+          "ordered-by": "user",
+          "name": "string",
+          "group": "leaf-list union [matchall-string-type, group-name-type]",
+          "rule": {
+            "key": "name",
+            "ordered-by": "user",
+            "name": "string",
+            "module-name": "union [matchall-string-type, string]",
+            "rule-type": {
+              "choice": {
+                "protocol-operation": { "rpc-name": "union [matchall-string-type, string]" },
+                "notification": { "notification-name": "union [matchall-string-type, string]" },
+                "data-node": { "path": "node-instance-identifier (xpath1.0)" }
+              }
+            },
+            "access-operations": "union [matchall-string-type, bits [create, read, update, delete, exec]]",
+            "action": "enumeration [permit, deny]",
+            "comment": "string"
+          }
+        }
+      }
+    }
+  }
+}

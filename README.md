@@ -4,7 +4,7 @@ Generate a Pydantic-based IDE-friendly SDK for your network devices directly fro
 
 ## Overview
 
-This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF SDK interface to your device.
+This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF or NETCONF SDK interface to your device.
 
 Then you can do stuff like this to update the description of a port:
 
@@ -94,7 +94,7 @@ uv run tester
 
 ### Usage
 
-Copy-paste the entire directory `temp/restconf_clients/device_name` into your own project and start automating!
+Copy-paste the entire directory `temp/netconf_clients/device_name` into your own project and start automating!
 
 #### Scaling to Production (Multi-Vendor / Multi-Version)
 
@@ -154,4 +154,4 @@ It does not provide the code for network operations.
 
 ## Status
 
-This is a public prototype. For the moment only RESTCONF is implemented, in future this tool can be extended to output NETCONF clients too.
+This is a public prototype. For the moment only RESTCONF implementation is complete, while NETCONF implementation is being actively developed. NETCONF and RESTCONF clients will be interchangable so that from the perspective of the developer nothing changes and if you already developed code using RESTCONF, changing to NETCONF only requires changing the imported client.

@@ -85,6 +85,7 @@ class IRModule:
     name: str
     py_name: str
     namespace: str = ""
+    imports_nsmap: dict[str, str] = field(default_factory=dict)
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
     nav_nodes: list[IRNavNode] = field(default_factory=list)
@@ -106,10 +107,28 @@ class IRBuilder:
         self.uses_refs = {}
 
         ns = module.search_one("namespace")
+        
+        imports_nsmap = {}
+        
+        own_prefix = module.search_one("prefix")
+        if own_prefix and ns:
+            imports_nsmap[own_prefix.arg] = ns.arg
+            
+        for imp in module.search("import"):
+            prefix_stmt = imp.search_one("prefix")
+            if prefix_stmt:
+                imported_module = self.ctx.get_module(imp.arg)
+                if imported_module:
+                    ns_stmt = imported_module.search_one("namespace")
+                    if ns_stmt:
+                        imports_nsmap[prefix_stmt.arg] = ns_stmt.arg
+        # ----------------------------------------------------------------------
+
         self.ir = IRModule(
             name=module.arg,
             py_name=module.arg.replace("-", "_"),
             namespace=ns.arg if ns else "urn:unknown",
+            imports_nsmap=imports_nsmap  # Pass the map to the IR
         )
 
     def _get_module_namespace(self, stmt) -> str:
@@ -257,7 +276,7 @@ class IRBuilder:
     def _build_nav_nodes(self, stmt):
         if hasattr(stmt, "i_children"):
             for child in stmt.i_children:
-                if child.keyword in ["container", "list", "rpc"]:
+                if child.keyword in ["container", "list", "rpc", "action"]:
                     node = self._build_nav_node(child)
                     if node and not any(
                         n.class_name == node.class_name for n in self.ir.nav_nodes
@@ -275,8 +294,11 @@ class IRBuilder:
             else []
         )
 
+        # Map both 'rpc' and 'action' to the abstract 'rpc' node_type for the navigator
+        node_type = "rpc" if stmt.keyword in ["rpc", "action"] else stmt.keyword
+
         node = IRNavNode(
-            node_type=stmt.keyword,
+            node_type=node_type,
             class_name=cls_name,
             path_name=stmt.arg,
             yang_name=stmt.arg,
@@ -284,44 +306,37 @@ class IRBuilder:
             module_yang_name=self.module.arg,
             ns=ns,
             keys=keys,
-            has_input=stmt.search_one("input") is not None
-            if stmt.keyword == "rpc"
-            else False,
-            has_output=stmt.search_one("output") is not None
-            if stmt.keyword == "rpc"
-            else False,
+            has_input=stmt.search_one("input") is not None if node_type == "rpc" else False,
+            has_output=stmt.search_one("output") is not None if node_type == "rpc" else False,
         )
 
         if stmt.keyword == "list":
-            node.item_class_name = (
-                cls_name if cls_name.endswith("Item") else f"{cls_name}Item"
-            )
-            node.list_class_name = (
-                node.item_class_name[:-4] + "List"
-                if node.item_class_name.endswith("Item")
-                else node.item_class_name + "List"
-            )
+            node.item_class_name = cls_name if cls_name.endswith("Item") else f"{cls_name}Item"
+            node.list_class_name = node.item_class_name[:-4] + "List" if node.item_class_name.endswith("Item") else node.item_class_name + "List"
 
         if hasattr(stmt, "i_children"):
             for child in stmt.i_children:
-                if child.keyword in ["container", "list"]:
-                    child_cls = getattr(
-                        child, "_pydantic_class_name", self._to_class_name(child.arg)
-                    )
+                if child.keyword in ["container", "list", "action"]:
+                    child_cls = getattr(child, "_pydantic_class_name", self._to_class_name(child.arg))
+                    
+                    if child.keyword == "action":
+                        type_hint = f"{child_cls}Node"
+                        nav_cls = f"{child_cls}Node"
+                    elif child.keyword == "container":
+                        type_hint = f"{child_cls}Node"
+                        nav_cls = f"{child_cls}Node"
+                    else:
+                        type_hint = f"{child_cls[:-4] if child_cls.endswith('Item') else child_cls}ListNode"
+                        nav_cls = type_hint
+
                     prop = IRNavProperty(
                         name=self._to_field_name(child.arg),
-                        type_hint=f"{child_cls}Node"
-                        if child.keyword == "container"
-                        else f"{child_cls[:-4] if child_cls.endswith('Item') else child_cls}ListNode",
-                        nav_cls=f"{child_cls}Node"
-                        if child.keyword == "container"
-                        else f"{child_cls[:-4] if child_cls.endswith('Item') else child_cls}ListNode",
+                        type_hint=type_hint,
+                        nav_cls=nav_cls,
                         path_name=child.arg,
                         yang_name=child.arg,
                         ns=self._get_module_namespace(child),
-                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
-                        if child.keyword == "list"
-                        else None,
+                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node" if child.keyword == "list" else None,
                     )
                     node.properties.append(prop)
         return node
@@ -554,6 +569,7 @@ class IRBuilder:
 
         elif stmt.keyword in ["anydata", "anyxml"]:
             is_optional = True
+            type_str = "str"
         else:
             return None
 
@@ -583,6 +599,7 @@ class IRBuilder:
             extra_dict["is_key"] = getattr(stmt, "i_is_key", False)
             extra_dict["tag"] = stmt.arg
             extra_dict["ns"] = self._get_module_namespace(stmt)
+            field_params.append(f'ns="{extra_dict["ns"]}"')
             field_params.append(f"json_schema_extra={repr(extra_dict)}")
             assign = f"element({', '.join(field_params)})"
 

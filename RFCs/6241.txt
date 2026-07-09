@@ -1,0 +1,140 @@
+RFC6241 (Obsoletes RFC4741) | NETCONF 1.1 | Standard Track | June 2011
+Eds: R. Enns, M. Bjorklund, J. Schoenwaelder, A. Bierman
+Schema: Appx B | YANG: Appx C (ietf-netconf, Namespace: urn:ietf:params:xml:ns:netconf:base:1.0)
+
+
+1. CORE ARCHITECTURE & SYSTEM LAYERS
+
+L4: Content    ::= Config & State Data (outside RFC scope; modeled via YANG RFC6020)
+L3: Operations ::= RPC-based execution (<edit-config>, <get>, etc.)
+L2: Messages   ::= Framing layer (<rpc>, <rpc-reply>, <notification> RFC5717)
+L1: Transport  ::= Connection-oriented, persistent, reliable, sequenced.
+                  Must provide Server/Client Auth, Integrity, Confidentiality, Replay Protection.
+                  Mandatory: SSH (RFC6242). Optional: TLS (RFC5246), BEEP.
+                  Yields "NETCONF username" (Char production match) for authorization enforcement.
+
+Session Initialization:
+  Simultaneous <hello> exchange on L1 connect.
+  Each peer lists capabilities. Base URN: "urn:ietf:params:netconf:base:1.1".
+  Highest common protocol version chosen; mismatch => terminate session.
+  Server MUST output <session-id>. Client MUST NOT. Violation => terminate.
+
+
+2. RPC MESSAGE LAYER (L2)
+
+Encoding: Well-formed XML, UTF-8. No Document Type Declarations (DTDs).
+Pipelining: Server MUST process serially, replying in exact order of request arrival.
+
+Elements:
+  - <rpc message-id="STR">: Mandatory unique ID. Peers return it unmodified in response.
+  - <rpc-reply message-id="STR">: Contains response payload. Matches request ID.
+  - <ok/>: Empty response signifying successful operation execution.
+  - <rpc-error>: Returned if processing fails. Multiple errors allowed. Structure:
+    * error-type:     (transport | rpc | protocol | application)
+    * error-tag:      Standard token from Error List (Appx A)
+    * error-severity: (error | warning)
+    * error-app-tag:  Implementation/Data-model specific error code (opt)
+    * error-path:     XPath expression locating target node in error context (opt)
+    * error-message:  Human-readable string [xml:lang attribute supported] (opt)
+    * error-info:     Protocol/Data-model specific error details container (opt)
+
+
+3. DATASTORE MODEL & SEPARATION
+
+Datastore ::= Complete configuration dataset required to transition device from default -> operational.
+  - Configuration Data (writable) ̸= State Data (read-only, statistics, runtime status).
+  - <running/> : Active system configuration. Mandatory. Always present.
+  - <candidate/>, <startup/> : Capabilities-defined workspaces.
+
+<get-config> ➔ Config Data only.
+<get>        ➔ Config Data ∪ State Data.
+
+
+4. SUBTREE FILTERING (L3/L4 FILTER)
+
+Used within <filter type="subtree"> inside <get> or <get-config>.
+Components:
+  1. Namespace Selection: Namespace URI matching. (Wildcard: Element prefix-free/unqualified xmlns="").
+  2. Attribute Match: Node selected iff all declared XML attributes match target.
+  3. Containment Nodes: Structural branch nodes used to traverse hierarchy.
+  4. Selection Nodes: Empty leaf (e.g. <users/>) => Explicitly returns that specific subtree only.
+  5. Content Match Nodes: Leaf containing text value. Siblings are evaluated via logical AND.
+     If TRUE: returns content match node + siblings + ancestor keys.
+     If FALSE: entire sibling set is pruned.
+  [Errata 3980]: Key/Instance Identifier nodes (e.g. list key leaf) of processed sibling nodes 
+                 MAY always be returned in outputs to ensure semantic structural integrity.
+
+
+5. PROTOCOL OPERATIONS (L3)
+
+- <get-config> : Retrieve target datastore. Params: <source>, <filter>.
+- <edit-config> : Manipulate datastore structure. Params: <target>, <default-operation>, <test-option>, <error-option>, <config>|<url>.
+  * "operation" Attribute Values (unqualified in NETCONF namespace):
+    * merge   : Combine config with target datastore (Default).
+    * replace : Replace target node. If absent, create it.
+    * create  : Add node. Error "data-exists" if already present.
+    * delete  : Remove node. Error "data-missing" if absent.
+    * remove  : Remove node. Silently ignore if absent.
+- <copy-config> : Complete target overwrite. Params: <target>, <source>. Source can be inline <config>.
+- <delete-config> : Erase datastore. Params: <target> (startup | url). Note: <running/> cannot be deleted.
+- <lock> : Global lock. Prevents other sessions/SNMP/CLI modifications. Fails (returns lock-denied + <session-id>) if lock exists. Reverts on close.
+- <unlock> : Release lock. Must be issued by same session.
+- <get> : Retrieve state data + running config. Params: <filter>.
+- <close-session> : Graceful termination. Releases locks & resources.
+- <kill-session> : Forceful termination. Params: <session-id>.
+
+
+6. STANDARD CAPABILITIES (SEC 8)
+
+Format: "urn:ietf:params:netconf:capability:{name}:1.x" (Shorthand: :{name})
+
+1. :writable-running (1.0)
+   - Allows direct writes to <running/> in <edit-config> / <copy-config> targets.
+
+2. :candidate (1.0)
+   - Enables <candidate/> datastore workspace.
+   - Adds <commit> operation (atomic application of candidate -> running).
+   - Adds <discard-changes> operation (reverts candidate to running).
+   - Outstanding changes discarded on lock release or session failure.
+
+3. :confirmed-commit:1.1 (1.1) [Requires :candidate]
+   - Extends <commit> with parameters:
+     * <confirmed/> : Requires a follow-up commit to make persistent.
+     * <confirm-timeout> : Period (default 600s) before auto-reverting config.
+     * <persist> token : Keeps commit alive across session drops.
+     * <persist-id> token : Credentials to issue confirming commit from any session.
+   - Adds <cancel-commit> operation (aborts pending commit, rolls back changes).
+   - [Errata EID 5790]:
+     * Revert occurs if session terminates before timeout, unless <persist> is active.
+     * If device reboots: restores configuration to state pre-confirmed-commit, unless <persist> is active (then server MAY resume confirm sequence).
+     * Receiving <kill-session> during confirmed commit => restores previous configuration state.
+
+4. :rollback-on-error (1.0)
+   - Extends <edit-config> with <error-option> = "rollback-on-error".
+   - Aborts operation and reverts transaction to pre-edit state upon any 'error' severity.
+
+5. :validate:1.1 (1.1)
+   - Adds <validate> operation to check configuration semantics/syntax. Target: <source>.
+   - Extends <edit-config> with <test-option>: "test-then-set" (default), "set", "test-only".
+
+6. :startup (1.0)
+   - Declares separate startup datastore (<startup/>), loaded on boot.
+   - Must copy running to startup explicitly (<copy-config>) to save updates.
+   - Startup becomes valid source/target for: <get-config>, <copy-config>, <lock>, <unlock>, <validate>, <delete-config>.
+
+7. :url (1.0)
+   - Accepts URL instead of inline config. Format: capability:url:1.0?scheme=http,ftp,file,...
+   - Extends: <edit-config>, <copy-config>, <delete-config>, <validate>.
+
+8. :xpath (1.0)
+   - Enables type="xpath" select="EXPR" on <filter> elements in <get> and <get-config>.
+   - Evaluated under root context, namespace declarations of the filter in scope. Returns target node-set.
+
+
+7. STANDARD ERROR CODES (APPX A)
+
+in-use | invalid-value | too-big | missing-attribute | bad-attribute | 
+unknown-attribute | missing-element | bad-element | unknown-element | 
+unknown-namespace | access-denied | lock-denied | resource-denied | 
+rollback-failed | data-exists | data-missing | operation-not-supported | 
+operation-failed | malformed-message (new in 1.1) | partial-operation (obsolete)

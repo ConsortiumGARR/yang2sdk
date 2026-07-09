@@ -16,7 +16,7 @@ class {{ enum.name }}(str, Enum):
 
 {% endfor %}
 {% for model in module.models %}
-class {{ model.name }}({% if model.is_rpc_envelope %}NetconfXmlModel{% else %}NetconfBaseModel{% endif %}, tag="{{ model.yang_name }}", nsmap={"": "{{ module.namespace }}"}, ns=""):
+class {{ model.name }}({% if model.is_rpc_envelope %}NetconfXmlModel{% else %}NetconfBaseModel{% endif %}, tag="{{ model.yang_name }}", nsmap={"": "{{ module.namespace }}"{% for prefix, uri in module.imports_nsmap.items() %}, "{{ prefix }}": "{{ uri }}"{% endfor %}}, ns=""):
     """{{ model.description }}"""
     {% if not model.fields and not model.is_rpc_envelope %}
     pass

@@ -1,4 +1,5 @@
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, get_args, get_origin, Union
+import types
 from pydantic import ConfigDict, BaseModel
 from pydantic_xml import BaseXmlModel, attr
 from lxml import etree
@@ -37,9 +38,6 @@ def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] =
     if getattr(cls, "__xml_serializer__", None) is None:
         cls.model_rebuild()
 
-    from typing import get_args, get_origin, Union, Annotated
-    import types
-
     def extract_models(annot: Any) -> list[type[NetconfXmlModel]]:
         if annot is None:
             return []
@@ -68,23 +66,66 @@ def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] =
 
 class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
     model_config = ConfigDict(extra="forbid", validate_assignment=True, defer_build=True, populate_by_name=True)
-    nc_operation: str | None = attr(name="operation", ns="nc", default=None)
+    nc_operation: str | None = attr(name="operation", ns=NETCONF_BASE_NS, default=None)
+
+    @classmethod
+    def _build_exclusion_dict(cls, memo: set[type] | None = None) -> dict[str, Any]:
+        """Recursively scans and drops unwriteable operational state schemas from XML payloads."""
+        if memo is None: memo = set()
+        if cls in memo: return {}
+        memo.add(cls)
+        
+        def extract_models(annot: Any) -> list[type[BaseModel]]:
+            if annot is None: return []
+            origin = get_origin(annot)
+            if origin is Annotated:
+                return extract_models(get_args(annot)[0])
+            if origin in (Union, types.UnionType, list, tuple, set):
+                res = []
+                for arg in get_args(annot):
+                    res.extend(extract_models(arg))
+                return res
+            elif isinstance(annot, type) and issubclass(annot, BaseModel):
+                return [annot]
+            return []
+
+        exclude_dict = {}
+        for field_name, field_info in cls.model_fields.items():
+            is_config = True
+            if field_info.json_schema_extra:
+                is_config = field_info.json_schema_extra.get("is_config", True)
+                
+            if not is_config:
+                exclude_dict[field_name] = True
+                continue
+
+            models = extract_models(field_info.annotation)
+            for m in models:
+                if hasattr(m, "_build_exclusion_dict"):
+                    child_ex = m._build_exclusion_dict(memo.copy())
+                    if child_ex:
+                        if field_name not in exclude_dict:
+                            exclude_dict[field_name] = {}
+                        if isinstance(child_ex, dict) and isinstance(exclude_dict[field_name], dict):
+                            exclude_dict[field_name].update(child_ex)
+                        else:
+                            exclude_dict[field_name] = True
+                            
+        return {k: v for k, v in exclude_dict.items() if v}
 
     def to_xml_payload(self, **kwargs: Any) -> str | bytes:
-        """Serializes to XML while omitting unset fields and operational-only elements."""
-        cls = type(self)
-        exclude: set[str] = set()
-        
-        for field_name, field_info in cls.model_fields.items():
-            if field_info.json_schema_extra and not field_info.json_schema_extra.get("is_config", True):
-                exclude.add(field_name)
-
+        """Serializes to XML while omitting unset fields and operational-only elements recursively."""
+        exclude_dict = self._build_exclusion_dict()
         user_exclude = kwargs.get("exclude")
-        if user_exclude:
-            if isinstance(user_exclude, (set, list, tuple)):
-                exclude |= set(user_exclude)
-
-        kwargs["exclude"] = exclude if exclude else None
+        
+        if user_exclude and isinstance(user_exclude, dict) and isinstance(exclude_dict, dict):
+            # Enforce non-destructive overwrite
+            merged = exclude_dict.copy()
+            merged.update(user_exclude)
+            kwargs["exclude"] = merged
+        else:
+            kwargs["exclude"] = exclude_dict if exclude_dict else None
+            
         kwargs.setdefault("exclude_unset", True)
         kwargs.setdefault("by_alias", True)
         return self.to_xml(**kwargs)

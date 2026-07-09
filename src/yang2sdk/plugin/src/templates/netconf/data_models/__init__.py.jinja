@@ -9,7 +9,8 @@ if TYPE_CHECKING:
     from . import {{ mod_name }}
 {% endfor %}
 
-class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in data_props %}, '{{ prop.module }}': '{{ prop.ns }}'{% endfor %}}, ns=''):
+{% set seen_data_ns = [] %}
+class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in data_props %}{% if prop.module not in seen_data_ns %}, '{{ prop.module }}': '{{ prop.ns }}'{% set _ = seen_data_ns.append(prop.module) %}{% endif %}{% endfor %}}, ns=''):
     """Aggregate root data nodes."""
     model_config = ConfigDict(extra='forbid', validate_assignment=True, defer_build=True, populate_by_name=True)
     
@@ -19,7 +20,8 @@ class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netco
     {% endfor %}
     {% endif %}
 
-class Operations(NetconfXmlModel, tag='operations', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in rpc_props %}, '{{ prop.module }}': '{{ prop.ns }}'{% endfor %}}, ns=''):
+{% set seen_rpc_ns = [] %}
+class Operations(NetconfXmlModel, tag='operations', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in rpc_props %}{% if prop.module not in seen_rpc_ns %}, '{{ prop.module }}': '{{ prop.ns }}'{% set _ = seen_rpc_ns.append(prop.module) %}{% endif %}{% endfor %}}, ns=''):
     """Aggregate RPC operations."""
     model_config = ConfigDict(extra='forbid', validate_assignment=True, defer_build=True, populate_by_name=True)
     
