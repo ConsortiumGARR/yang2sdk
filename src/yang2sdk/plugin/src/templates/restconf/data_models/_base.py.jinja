@@ -45,27 +45,89 @@ class YangBaseModel(BaseModel):
         # Force JSON mode to ensure 64-bit numbers become strings and Enums become values
         kwargs.setdefault("mode", "json")
         kwargs.setdefault("by_alias", True)
-        
+
         if content == "all":
             return super().model_dump(**kwargs)
 
-        cls = type(self)
-        exclude: set[str] = set()
+        data = super().model_dump(**kwargs)
+        # Prune non-matching nodes recursively (RFC 8040 §4.5.2 content
+        # semantics): pydantic's `exclude` only applies at the top level, so
+        # walk the dumped tree using each level's own is_config flags. Runs
+        # after super().model_dump so it composes with exclude_unset and any
+        # caller-passed exclude.
+        type(self)._prune_content(data, content, by_alias=kwargs["by_alias"])
+        return data
+
+    @classmethod
+    def _prune_content(cls, data: Any, content: str, by_alias: bool) -> None:
+        """Drop in place every subtree holding no node that matches content.
+
+        Bottom-up: children are pruned first, then a mismatching node is
+        dropped only when nothing matchable remains below it. This keeps
+        ancestor shells (e.g. a config container above a state leaf in a
+        ``nonconfig`` dump) while never leaking mismatched leaves. Emptied
+        *matching* containers are retained: the IR does not track presence
+        containers, so dropping them could corrupt round-trips, and an empty
+        shell is harmless in PATCH/PUT bodies.
+        """
+        if not isinstance(data, dict):
+            return
         for field_name, field_info in cls.model_fields.items():
-            is_config = field_info.json_schema_extra.get("is_config", True)
-            if content == "config" and not is_config:
-                exclude.add(field_name)
-            if content == "nonconfig" and is_config:
-                exclude.add(field_name)
+            alias = field_info.alias
+            key = alias if by_alias and alias and alias in data else field_name
+            if key not in data:
+                continue
+            extra = field_info.json_schema_extra
+            is_config = extra.get("is_config", True) if isinstance(extra, dict) else True
+            match = (content == "config") == bool(is_config)
+            value = data[key]
+            sub = _child_yang_model(field_info.annotation)
+            if sub is not None:
+                if isinstance(value, dict):
+                    sub._prune_content(value, content, by_alias)
+                elif isinstance(value, list):
+                    for item in value:
+                        sub._prune_content(item, content, by_alias)
+            # A mismatching leaf/leaf-list always drops. A mismatching
+            # container/list keeps an ancestor shell only when a matchable
+            # descendant remains, so state under config (or vice versa) never
+            # leaks but RFC 8040 hierarchy is preserved.
+            keep_shell = (
+                sub is not None
+                and isinstance(value, (dict, list))
+                and _has_content(value)
+            )
+            if not match and not keep_shell:
+                del data[key]
 
 
-        # Merge with any exclude the caller already passed
-        user_exclude = kwargs.get("exclude")
-        if user_exclude:
-            if isinstance(user_exclude, (set, list, tuple)):
-                exclude |= set(user_exclude)
-            else: # dict-style exclude not implemented yet
-                raise NotImplementedError
+def _has_content(value: Any) -> bool:
+    """True when a pruned subtree still holds at least one live value."""
+    if isinstance(value, dict):
+        return any(_has_content(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_content(v) for v in value)
+    return value is not None
 
-        kwargs["exclude"] = exclude if exclude else None
-        return super().model_dump(**kwargs)
+
+def _child_yang_model(annotation: Any) -> type[YangBaseModel] | None:
+    """Unwrap Annotated/Optional/Union/list to find a single YangBaseModel subclass.
+
+    Returns None when ambiguous (union of several models) or absent, in which
+    case the subtree is left unpruned rather than pruned wrongly.
+    """
+    from typing import get_args
+
+    found: set[type[YangBaseModel]] = set()
+
+    def walk(ann: Any) -> None:
+        if isinstance(ann, type):
+            if issubclass(ann, YangBaseModel):
+                found.add(ann)
+        for arg in get_args(ann):
+            walk(arg)
+
+    walk(annotation)
+    if len(found) == 1:
+        return found.pop()
+    return None

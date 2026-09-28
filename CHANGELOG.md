@@ -8,6 +8,17 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ### Fixed
 
+- Generated RESTCONF models: `model_dump(content="config"|"nonconfig")`
+  now prunes `config false`/`config true` nodes at every depth
+  (RFC 8040 §4.5.2). Previously only top-level fields were excluded, so
+  nested state (state leaves inside config containers/list items,
+  state leaf-lists) leaked into config dumps — and therefore into
+  PATCH/PUT bodies, which serialize with `content="config"`. The walk is
+  bottom-up: mismatching leaves/leaf-lists always drop; mismatching
+  containers/lists keep an ancestor shell only when a matchable
+  descendant remains. Regression test in `tests/test_matrix.py`
+  (`test_content_filter_prunes_nested_state`); validated live against the
+  notconf simulator.
 - Packaging: added `py.typed` so downstream type-checkers see the generated
   SDK types; added missing direct `lxml` dependency (previously only
   transitive via `ncclient`). Verified with `uv build` + clean-venv install

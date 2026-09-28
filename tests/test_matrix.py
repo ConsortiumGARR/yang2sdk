@@ -29,6 +29,36 @@ MINIMAL_YANG = """module tmod {
 }
 """
 
+NESTED_STATE_YANG = """module tcontent {
+  prefix tc;
+  namespace "urn:test:tcontent";
+  revision 2026-01-01;
+  container top {
+    leaf name {
+      type string;
+    }
+    leaf counter {
+      type uint64;
+      config false;
+    }
+    leaf-list event-log {
+      type string;
+      config false;
+    }
+    list hist {
+      key "ts";
+      leaf ts {
+        type uint32;
+      }
+      leaf val {
+        type uint32;
+        config false;
+      }
+    }
+  }
+}
+"""
+
 
 def _load():
     return json.loads(MATRIX.read_text())
@@ -143,3 +173,67 @@ def test_generate_rpc_free_module_compiles_and_imports(fmt, tmp_path):
         assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
     finally:
         sys.path.remove(str(tmp_path))
+
+
+def test_content_filter_prunes_nested_state(tmp_path):
+    """model_dump(content=...) prunes state nodes at every depth (RFC 8040 §4.5.2).
+
+    Regression: filtering built a top-level pydantic `exclude` set only, so
+    nested state leaked into config dumps — and therefore into PATCH/PUT
+    bodies, which serialize with content="config".
+    """
+    yang = tmp_path / "tcontent.yang"
+    yang.write_text(NESTED_STATE_YANG)
+    out = tmp_path / "tcontent_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            "tcontent",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    sys.path.insert(0, str(tmp_path))
+    try:
+        models = __import__("tcontent_restconf.data_models.tcontent", fromlist=["*"])
+        data_cls = models.TcontentData
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    m = data_cls.model_validate(
+        {
+            "tcontent:top": {
+                "name": "x",
+                "counter": "5",
+                "event-log": ["boot", "link-up"],
+                "hist": [{"ts": 1, "val": 2}],
+            }
+        }
+    )
+    config = m.model_dump(content="config")["tcontent:top"]
+    assert "counter" not in config, "nested state leaf leaked into config dump"
+    assert "event-log" not in config, "state leaf-list leaked into config dump"
+    assert config["hist"] == [{"ts": 1}], "state inside list items must be pruned"
+    nonconfig = m.model_dump(content="nonconfig")["tcontent:top"]
+    assert nonconfig["counter"] == "5", "state must survive a nonconfig dump"
+    assert nonconfig["event-log"] == ["boot", "link-up"]
+    assert nonconfig["hist"] == [
+        {"val": 2}
+    ]  # uint32 stays numeric; only 64-bit is stringified
+    assert "name" not in nonconfig
