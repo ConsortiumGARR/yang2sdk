@@ -58,9 +58,9 @@ def build_filter_tree(path_tuples: list[tuple[str, str, dict[str, Any]]], model_
     """Builds a precise RFC 6241 selection node without sending exhaustive trees."""
     root = current = None
     for ns, tag, keys in path_tuples:
-        elem = etree.Element(f"{{{ns}}}{tag}" if ns else tag, nsmap={None: ns} if ns else None)
+        elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
         for k, v in keys.items():
-            key_elem = etree.Element(f"{{{ns}}}{k}" if ns else k)
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
             key_elem.text = str(v)
             elem.append(key_elem)
             
@@ -78,7 +78,7 @@ def build_filter_tree(path_tuples: list[tuple[str, str, dict[str, Any]]], model_
                 extra = field_info.json_schema_extra or {}
                 f_ns = extra.get("ns", path_tuples[-1][0] if path_tuples else "")
                 f_tag = extra.get("tag", field_name)
-                current.append(etree.Element(f"{{{f_ns}}}{f_tag}" if f_ns else f_tag, nsmap={None: f_ns} if f_ns else None))
+                current.append(etree.Element("{" + f_ns + "}" + f_tag if f_ns else f_tag, nsmap={None: f_ns} if f_ns else None))
 
     return root
 
@@ -92,7 +92,7 @@ def find_xml_node(root_element: etree._Element | None, path_tuples: list[tuple[s
             if etree.QName(child).localname == tag and (not ns or etree.QName(child).namespace == ns):
                 match = True
                 for k, v in keys.items():
-                    key_child = child.find(f"./{{{ns}}}{k}" if ns else f"./{k}")
+                    key_child = child.find("./{" + ns + "}" + k if ns else f"./{k}")
                     if key_child is None:
                         key_child = child.find(f"./{k}")
                     if key_child is None or key_child.text != str(v):
@@ -119,7 +119,7 @@ def find_xml_nodes(root_element: etree._Element | None, path_tuples: list[tuple[
         if etree.QName(child).localname == last_tag and (not last_ns or etree.QName(child).namespace == last_ns):
             match = True
             for k, v in last_keys.items():
-                key_child = child.find(f"./{{{last_ns}}}{k}" if last_ns else f"./{k}")
+                key_child = child.find("./{" + last_ns + "}" + k if last_ns else f"./{k}")
                 if key_child is None:
                     key_child = child.find(f"./{k}")
                 if key_child is None or key_child.text != str(v):
@@ -132,9 +132,9 @@ def find_xml_nodes(root_element: etree._Element | None, path_tuples: list[tuple[
 def wrap_in_parent_hierarchy(element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element:
     current = element
     for ns, tag, keys in reversed(path_tuples[:-1]):
-        parent_elem = etree.Element(f"{{{ns}}}{tag}" if ns else tag, nsmap={None: ns} if ns else None)
+        parent_elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
         for k, v in keys.items():
-            key_elem = etree.Element(f"{{{ns}}}{k}" if ns else k)
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
             key_elem.text = str(v)
             parent_elem.append(key_elem)
         parent_elem.append(current)
@@ -147,9 +147,9 @@ def wrap_list_in_parent_hierarchy(elements: list[etree._Element], path_tuples: l
         return elements
         
     parent_ns, parent_tag, parent_keys = path_tuples[-2]
-    parent_elem = etree.Element(f"{{{parent_ns}}}{parent_tag}" if parent_ns else parent_tag, nsmap={None: parent_ns} if parent_ns else None)
+    parent_elem = etree.Element("{" + parent_ns + "}" + parent_tag if parent_ns else parent_tag, nsmap={None: parent_ns} if parent_ns else None)
     for k, v in parent_keys.items():
-        key_elem = etree.Element(f"{{{parent_ns}}}{k}" if parent_ns else k)
+        key_elem = etree.Element("{" + parent_ns + "}" + k if parent_ns else k)
         key_elem.text = str(v)
         parent_elem.append(key_elem)
         
@@ -157,9 +157,9 @@ def wrap_list_in_parent_hierarchy(elements: list[etree._Element], path_tuples: l
         
     current = parent_elem
     for ns, tag, keys in reversed(path_tuples[:-2]):
-        anc_elem = etree.Element(f"{{{ns}}}{tag}" if ns else tag, nsmap={None: ns} if ns else None)
+        anc_elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
         for k, v in keys.items():
-            key_elem = etree.Element(f"{{{ns}}}{k}" if ns else k)
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
             key_elem.text = str(v)
             anc_elem.append(key_elem)
         anc_elem.append(current)

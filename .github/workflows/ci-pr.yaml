@@ -1,0 +1,49 @@
+name: ci-pr
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-typecheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --group dev
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
+      - run: uvx ty check
+      - run: uvx pyrefly check
+
+  offline-tests:
+    needs: lint-typecheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --group dev
+      - run: uv run pytest tests/test_matrix.py -v
+
+  smoke:
+    needs: lint-typecheck
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - { package: notconf, tag: latest }
+          - { package: notconf-ietf, tag: latest }
+          - { package: notconf-sros, tag: "22.2" }
+          - { package: notconf-junos, tag: 23.4R1 }
+          - { package: notconf-cisco-xr, tag: "2411" }
+          - { package: notconf-cisco-nx, tag: 10.4-4 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --group dev
+      - run: uv run pytest tests/test_notconf_protocol.py tests/test_sdk_generate.py -v
+        env:
+          NOTCONF_RUN_INTEGRATION: "1"
+          NOTCONF_IMAGE_PACKAGE: ${{ matrix.image.package }}
+          NOTCONF_IMAGE_TAG: ${{ matrix.image.tag }}

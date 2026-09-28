@@ -96,24 +96,24 @@ class NetconfClient:
             NMDA_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
             DS_NS = "urn:ietf:params:xml:ns:yang:ietf-datastores"
             
-            rpc = etree.Element(f"{{{NMDA_NS}}}get-data", nsmap={None: NMDA_NS, "ds": DS_NS})
-            ds = etree.SubElement(rpc, f"{{{NMDA_NS}}}datastore")
+            rpc = etree.Element("{" + NMDA_NS + "}get-data", nsmap={None: NMDA_NS, "ds": DS_NS})
+            ds = etree.SubElement(rpc, "{" + NMDA_NS + "}datastore")
             ds.text = f"ds:{source}"
             
             if filter_xml is not None:
-                sf = etree.SubElement(rpc, f"{{{NMDA_NS}}}subtree-filter")
+                sf = etree.SubElement(rpc, "{" + NMDA_NS + "}subtree-filter")
                 sf.append(filter_xml)
                 
             if content in ("config", "nonconfig"):
-                cf = etree.SubElement(rpc, f"{{{NMDA_NS}}}config-filter")
+                cf = etree.SubElement(rpc, "{" + NMDA_NS + "}config-filter")
                 cf.text = "true" if content == "config" else "false"
                 
             if with_defaults:
-                wd = etree.SubElement(rpc, f"{{{NMDA_NS}}}with-defaults")
+                wd = etree.SubElement(rpc, "{" + NMDA_NS + "}with-defaults")
                 wd.text = with_defaults
 
             if depth and str(depth).lower() != "unbounded":
-                md = etree.SubElement(rpc, f"{{{NMDA_NS}}}max-depth")
+                md = etree.SubElement(rpc, "{" + NMDA_NS + "}max-depth")
                 md.text = str(depth)
                 
             reply = self._handle_rpc(self._manager.dispatch, rpc)
@@ -150,15 +150,15 @@ class NetconfClient:
             NMDA_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
             DS_NS = "urn:ietf:params:xml:ns:yang:ietf-datastores"
             
-            rpc = etree.Element(f"{{{NMDA_NS}}}edit-data", nsmap={None: NMDA_NS, "ds": DS_NS})
-            ds = etree.SubElement(rpc, f"{{{NMDA_NS}}}datastore")
+            rpc = etree.Element("{" + NMDA_NS + "}edit-data", nsmap={None: NMDA_NS, "ds": DS_NS})
+            ds = etree.SubElement(rpc, "{" + NMDA_NS + "}datastore")
             ds.text = f"ds:{target}"
             
-            def_op = etree.SubElement(rpc, f"{{{NMDA_NS}}}default-operation")
+            def_op = etree.SubElement(rpc, "{" + NMDA_NS + "}default-operation")
             def_op.text = default_operation
             
             # <config> is a choice case inside <edit-content>, so it maps transparently without <edit-content>.
-            conf = etree.SubElement(rpc, f"{{{NMDA_NS}}}config")
+            conf = etree.SubElement(rpc, "{" + NMDA_NS + "}config")
             
             # Strip the legacy '<config>' wrapper tag passed by navigators, keeping just the children
             if config_xml.tag.endswith("config"):
@@ -174,17 +174,17 @@ class NetconfClient:
             # Fallback to natively constructed Legacy <edit-config> (RFC 6241)
             # We strictly bypass self._manager.edit_config() to avert multiple-root crashes and tag double-wrapping
             NC_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
-            rpc = etree.Element(f"{{{NC_NS}}}edit-config", nsmap={None: NC_NS})
-            tgt = etree.SubElement(rpc, f"{{{NC_NS}}}target")
-            etree.SubElement(tgt, f"{{{NC_NS}}}{target}")
+            rpc = etree.Element("{" + NC_NS + "}edit-config", nsmap={None: NC_NS})
+            tgt = etree.SubElement(rpc, "{" + NC_NS + "}target")
+            etree.SubElement(tgt, "{" + NC_NS + "}" + target)
             
-            def_op = etree.SubElement(rpc, f"{{{NC_NS}}}default-operation")
+            def_op = etree.SubElement(rpc, "{" + NC_NS + "}default-operation")
             def_op.text = default_operation
             
             if config_xml.tag.endswith("config"):
                 rpc.append(config_xml)
             else:
-                conf = etree.SubElement(rpc, f"{{{NC_NS}}}config")
+                conf = etree.SubElement(rpc, "{" + NC_NS + "}config")
                 conf.append(config_xml)
 
             reply = self._handle_rpc(self._manager.dispatch, rpc)

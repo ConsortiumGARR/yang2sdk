@@ -25,6 +25,9 @@ class Data(Node):
     {% endfor %}
 
 class Operations(Node):
+    {% if not rpc_props %}
+    pass
+    {% endif %}
     {% for prop in rpc_props %}
     
     @property

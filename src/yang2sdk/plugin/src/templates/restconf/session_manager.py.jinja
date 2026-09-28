@@ -59,15 +59,23 @@ class RestconfClient:
         username: str | None = None,
         password: str | None = None,
         verify: bool = True,
+        scheme: str = "https",
     ):
         self.url = None
         self.fallback_url = None
 
+        if scheme not in ("http", "https"):
+            raise ValueError("scheme must be 'http' or 'https'")
+        if scheme == "http":
+            # Explicit plaintext opt-out for lab/simulators (e.g. notconf
+            # exposes RESTCONF over plain HTTP on port 80). Never the default.
+            log.warning("RESTCONF using plaintext HTTP (verify/TLS disabled by scheme). Lab/simulator use only.")
+
         self.urls = []
         if loopback_ip:
-            self.urls.append(f"https://{loopback_ip}:{port}/restconf")
+            self.urls.append(f"{scheme}://{loopback_ip}:{port}/restconf")
         if management_ip:
-            self.urls.append(f"https://{management_ip}:{port}/restconf")
+            self.urls.append(f"{scheme}://{management_ip}:{port}/restconf")
 
         if not self.urls:
             raise ValueError("Either loopback_ip or management_ip must be provided")

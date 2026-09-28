@@ -25,6 +25,9 @@ class Data(Node):
 
 class Operations(Node):
     """Navigator for RPC operations."""
+    {% if not rpc_props %}
+    pass
+    {% endif %}
     {% for prop in rpc_props %}
     
     @property

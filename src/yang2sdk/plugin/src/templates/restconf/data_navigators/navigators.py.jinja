@@ -118,7 +118,7 @@ class {{ node.class_name }}Node(Node):
 
     def __call__(self{% if node.has_input %}, input_data: {{ node.pydantic_module }}.{{ node.class_name }}Input | dict | str | None = None, **kwargs: Any{% endif %}){% if node.has_output %} -> {{ node.pydantic_module }}.{{ node.class_name }}Output{% else %} -> None{% endif %}:
         {% if node.has_input or node.has_output %}
-        from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}{% if node.has_input %}, {{ node.class_name }}Input{% endif %}{% if node.has_output %}, {{ node.class_name }}Output{% endif %}
+        from ..data_models.{{ node.pydantic_module }} import {{ [node.class_name, (node.class_name ~ "Input") if node.has_input, (node.class_name ~ "Output") if node.has_output] | select | join(", ") }}
         {% endif %}
         {% if node.has_input %}
         

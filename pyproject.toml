@@ -28,11 +28,26 @@ yang2netconf = "yang2sdk.cli.compiler:netconf"
 [dependency-groups]
 dev = [
     "ruff>=0.1.0",
+    "pytest>=8.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "smoke: fast subset (latest tag per notconf family)",
+    "integration: requires docker + pulled notconf images (needs NOTCONF_RUN_INTEGRATION=1)",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yang2sdk"]
 
-[tool.pyright]
-include = ["src", "temp"]
-extraPaths = ["temp"]
+[tool.ruff]
+target-version = "py312"
+exclude = ["temp", ".venv", ".ruff_cache"]
+
+# ty needs no section: it respects .gitignore by default, so ephemeral
+# temp/ output is excluded; Python version comes from .python-version/.venv.
+
+[tool.pyrefly]
+project-excludes = ["temp/**", ".venv/**"]

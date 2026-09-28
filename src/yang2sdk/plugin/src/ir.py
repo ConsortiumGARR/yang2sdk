@@ -105,6 +105,7 @@ class IRBuilder:
         self.groupings = {}
         self.enum_registry = {}
         self.uses_refs = {}
+        self._synth_prefixes: dict[str, str] = {}
 
         ns = module.search_one("namespace")
         
@@ -135,6 +136,31 @@ class IRBuilder:
         mod = getattr(stmt, "i_module", self.module)
         ns = mod.search_one("namespace")
         return ns.arg if ns else "urn:unknown"
+
+    def _ns_alias(self, uri: str) -> str:
+        """Map a namespace URI to its pydantic-xml prefix alias.
+
+        pydantic-xml resolves declaration `ns=` through the model nsmap, so it
+        must be a prefix ("" for the module default), not a URI. URIs outside
+        the module imports (e.g. augmenting modules) get a deterministic
+        synthetic prefix that build() backfills into imports_nsmap.
+        """
+        if uri == self.ir.namespace:
+            return ""
+        for prefix, ns_uri in self.ir.imports_nsmap.items():
+            if ns_uri == uri:
+                return prefix
+        if uri in self._synth_prefixes:
+            return self._synth_prefixes[uri]
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", uri.rsplit(":", 1)[-1] or "ns")
+        if not base or not (base[0].isalpha() or base[0] == "_"):
+            base = f"ns_{base}"
+        candidate, i = base, 2
+        taken = set(self.ir.imports_nsmap) | set(self._synth_prefixes.values())
+        while candidate in taken:
+            candidate, i = f"{base}_{i}", i + 1
+        self._synth_prefixes[uri] = candidate
+        return candidate
 
     def _models_are_equivalent(self, m1: IRModel, m2: IRModel) -> bool:
         """Determines if two models are semantically equivalent."""
@@ -268,6 +294,11 @@ class IRBuilder:
 
         # Build Navigator IR
         self._build_nav_nodes(self.module)
+
+        # Backfill synthetic prefixes for augmenting-module namespaces so every
+        # ns= alias used in field declarations exists in the model nsmaps.
+        for uri, prefix in self._synth_prefixes.items():
+            self.ir.imports_nsmap.setdefault(prefix, uri)
 
         return self.ir
 
@@ -599,7 +630,7 @@ class IRBuilder:
             extra_dict["is_key"] = getattr(stmt, "i_is_key", False)
             extra_dict["tag"] = stmt.arg
             extra_dict["ns"] = self._get_module_namespace(stmt)
-            field_params.append(f'ns="{extra_dict["ns"]}"')
+            field_params.append(f'ns="{self._ns_alias(extra_dict["ns"])}"')
             field_params.append(f"json_schema_extra={repr(extra_dict)}")
             assign = f"element({', '.join(field_params)})"
 

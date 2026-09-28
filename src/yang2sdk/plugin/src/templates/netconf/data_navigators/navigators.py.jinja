@@ -32,7 +32,7 @@ class {{ node.class_name }}Node(ItemNode):
         
         data.nc_operation = operation
         elem = etree.fromstring(data.to_xml_payload())
-        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml = etree.Element('{urn:ietf:params:xml:ns:netconf:base:1.0}config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
         config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -46,15 +46,15 @@ class {{ node.class_name }}Node(ItemNode):
         nsmap = {"nc": NETCONF_NS}
         if last_ns: nsmap[None] = last_ns
         
-        elem = etree.Element(f"{{{last_ns}}}{last_tag}" if last_ns else last_tag, nsmap=nsmap)
-        elem.set(f'{{{NETCONF_NS}}}operation', 'delete')
-        
+        elem = etree.Element("{" + last_ns + "}" + last_tag if last_ns else last_tag, nsmap=nsmap)
+        elem.set("{" + NETCONF_NS + "}operation", "delete")
+
         for k, v in keys_dict.items():
-            key_elem = etree.Element(f"{{{last_ns}}}{k}" if last_ns else k)
+            key_elem = etree.Element("{" + last_ns + "}" + k if last_ns else k)
             key_elem.text = str(v)
             elem.append(key_elem)
             
-        config_xml = etree.Element('config', nsmap={None: NETCONF_NS})
+        config_xml = etree.Element("{" + NETCONF_NS + "}config", nsmap={None: NETCONF_NS})
         config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -97,7 +97,7 @@ class {{ node.item_class_name }}Node(ItemNode):
         
         data.nc_operation = operation
         elem = etree.fromstring(data.to_xml_payload())
-        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml = etree.Element('{urn:ietf:params:xml:ns:netconf:base:1.0}config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
         config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -111,15 +111,15 @@ class {{ node.item_class_name }}Node(ItemNode):
         nsmap = {"nc": NETCONF_NS}
         if last_ns: nsmap[None] = last_ns
         
-        elem = etree.Element(f"{{{last_ns}}}{last_tag}" if last_ns else last_tag, nsmap=nsmap)
-        elem.set(f'{{{NETCONF_NS}}}operation', 'delete')
-        
+        elem = etree.Element("{" + last_ns + "}" + last_tag if last_ns else last_tag, nsmap=nsmap)
+        elem.set("{" + NETCONF_NS + "}operation", "delete")
+
         for k, v in keys_dict.items():
-            key_elem = etree.Element(f"{{{last_ns}}}{k}" if last_ns else k)
+            key_elem = etree.Element("{" + last_ns + "}" + k if last_ns else k)
             key_elem.text = str(v)
             elem.append(key_elem)
             
-        config_xml = etree.Element('config', nsmap={None: NETCONF_NS})
+        config_xml = etree.Element("{" + NETCONF_NS + "}config", nsmap={None: NETCONF_NS})
         config_xml.append(wrap_in_parent_hierarchy(elem, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -164,7 +164,7 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
             item.nc_operation = 'merge'
             elements.append(etree.fromstring(item.to_xml_payload()))
             
-        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml = etree.Element('{urn:ietf:params:xml:ns:netconf:base:1.0}config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
         config_xml.extend(wrap_list_in_parent_hierarchy(elements, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -178,7 +178,7 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
             item.nc_operation = 'create'
             elements.append(etree.fromstring(item.to_xml_payload()))
             
-        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml = etree.Element('{urn:ietf:params:xml:ns:netconf:base:1.0}config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
         config_xml.extend(wrap_list_in_parent_hierarchy(elements, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -192,7 +192,7 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
             item.nc_operation = 'replace'
             elements.append(etree.fromstring(item.to_xml_payload()))
             
-        config_xml = etree.Element('config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
+        config_xml = etree.Element('{urn:ietf:params:xml:ns:netconf:base:1.0}config', nsmap={None: 'urn:ietf:params:xml:ns:netconf:base:1.0'})
         config_xml.extend(wrap_list_in_parent_hierarchy(elements, self._path))
         
         return self._client.edit(config_xml=config_xml, target=target)
@@ -201,10 +201,10 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
 class {{ node.class_name }}Node(Node):
     def __call__(self{% if node.has_input %}, input_data: {{ node.pydantic_module }}.{{ node.class_name }}Input | dict | str | None = None, **kwargs: Any{% endif %}){% if node.has_output %} -> {{ node.pydantic_module }}.{{ node.class_name }}Output | None{% else %} -> None{% endif %}:
         {% if node.has_input or node.has_output %}
-        from ..data_models.{{ node.pydantic_module }} import {% if node.has_input %}{{ node.class_name }}Input{% endif %}{% if node.has_input and node.has_output %}, {% endif %}{% if node.has_output %}{{ node.class_name }}Output{% endif %}
+        from ..data_models.{{ node.pydantic_module }} import {{ [(node.class_name ~ "Input") if node.has_input, (node.class_name ~ "Output") if node.has_output] | select | join(", ") }}
         {% endif %}
         ns, tag, _ = self._path[-1]
-        rpc_elem = etree.Element(f"{{{ns}}}{tag}" if ns else tag, nsmap={None: ns} if ns else None)
+        rpc_elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
         
         {% if node.has_input %}
         if input_data is None and kwargs: input_data = {k.replace('_', '-'): v for k, v in kwargs.items()}
@@ -217,7 +217,7 @@ class {{ node.class_name }}Node(Node):
         # Determine if this is a top-level RPC or a deep data-tree Action (RFC 7950 Sec 7.15.2)
         if len(self._path) > 1:
             action_ns = "urn:ietf:params:xml:ns:yang:1"
-            action_elem = etree.Element(f"{{{action_ns}}}action", nsmap={None: action_ns})
+            action_elem = etree.Element("{" + action_ns + "}action", nsmap={None: action_ns})
             action_elem.append(wrap_in_parent_hierarchy(rpc_elem, self._path))
             payload_elem = action_elem
         else:

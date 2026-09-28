@@ -154,4 +154,8 @@ It does not provide the code for network operations.
 
 ## Status
 
-This is a public prototype. For the moment only RESTCONF implementation is complete, while NETCONF implementation is being actively developed. NETCONF and RESTCONF clients will be interchangable so that from the perspective of the developer nothing changes and if you already developed code using RESTCONF, changing to NETCONF only requires changing the imported client.
+This is a public prototype. Both RESTCONF and NETCONF clients generate, with an interchangeable navigator surface (`retrieve/update/replace/create/delete`, RPC `__call__`) so developer code written against one only needs the imported client swapped for the other.
+
+Both generated SDKs are exercised against all 11 pre-built [`notconf`](https://github.com/notconf/notconf) simulator images (Cisco IOS XR `762/771/2411/2531`, IOS NX `10.4-4`, Junos `21.1R1/23.4R1`, Nokia SROS `21.10/22.2`, IETF, base) via the `pytest` suite in `tests/`: protocol checks, per-image SDK generation from the simulator's own YANG, Pydantic validation of live payloads, and a NETCONF write round-trip. `uv run pytest tests/` runs the offline gate; `NOTCONF_RUN_INTEGRATION=1` runs the live matrix (see `tests/notconf/matrix.json`, `.github/workflows/`).
+
+Known limits (each pinned to a test): RESTCONF writes are rejected by the simulator (`LY_EVALID`, best-effort `xfail`); NETCONF identityref *values* need a prefix bound in the payload nsmap; mandatory `config false` leaves need placeholders for write-side validation. Details in `tests/test_sdk_generate.py`.
