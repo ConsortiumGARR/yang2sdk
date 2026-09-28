@@ -1,6 +1,3 @@
-import os
-import sys
-
 from yang2sdk.plugin.src import pyang_plugin_init as real_init
 
 # # Add package to Python path so internal imports work

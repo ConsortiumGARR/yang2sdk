@@ -16,26 +16,26 @@ client = DeviceNameClient(
     port=443,
     username="user",
     password="pass",
-    verify=True
+    verify=True,
 )
 
-    # IDE will suggest possibilities and autocomplete as soon as you type `client.`
+# IDE will suggest possibilities and autocomplete as soon as you type `client.`
 uri = client.data.ne.shelf(1).slot(3).card.port(1)
 
-    # Retrieve current config
-port131 = uri.retrieve(content='config', depth=2)
+# Retrieve current config
+port131 = uri.retrieve(content="config", depth=2)
 
-    # The retrieved config (JSON) is loaded into the corresponding Pydantic model that you can modify.
-    # As soon as you type `port1.` the IDE will show you all possible fields.
+# The retrieved config (JSON) is loaded into the corresponding Pydantic model that you can modify.
+# As soon as you type `port1.` the IDE will show you all possible fields.
 port131.service_label = "test137"
 
-port131.admin_status = "dowm" 
-    # Here the code fails immediately, raising the following error:
-    # pydantic_core._pydantic_core.ValidationError: 1 validation error for PortItem
-    # admin_status
-    #   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
+port131.admin_status = "dowm"
+# Here the code fails immediately, raising the following error:
+# pydantic_core._pydantic_core.ValidationError: 1 validation error for PortItem
+# admin_status
+#   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
 
-    # Update the device config
+# Update the device config
 uri.update(port131)
 ```
 
@@ -50,7 +50,7 @@ You need [`uv`](https://github.com/astral-sh/uv).
 ```bash
 git clone https://github.com/ConsortiumGARR/yang2sdk.git
 cd yang2sdk
-uv sync --locked
+uv sync --locked --extra lab   # lab extra: downloader/tester tooling
 cp .env.example .env
 ```
 

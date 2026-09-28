@@ -127,7 +127,7 @@ Agents must not hardcode vendor quirks into the generic IR/templates. Device-spe
 Requires Python `>=3.12` (see `pyproject.toml`, `.python-version`).
 
 ```bash
-uv sync --locked
+uv sync --locked --extra lab   # lab extra: downloader/tester + live-sim tests
 cp .env.example .env            # never commit .env
 uv run yang-downloader
 uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/* > temp/yang_tree/<device>.txt

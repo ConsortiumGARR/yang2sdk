@@ -11,7 +11,6 @@ import argparse
 import ast
 import sys
 from pathlib import Path
-from typing import List, Union
 
 
 class ASTCanonicalizer(ast.NodeTransformer):
@@ -22,7 +21,7 @@ class ASTCanonicalizer(ast.NodeTransformer):
         self.ignore_docstrings = ignore_docstrings
         self.ignore_order = ignore_order
 
-    def _remove_docstring(self, body: List[ast.stmt]) -> List[ast.stmt]:
+    def _remove_docstring(self, body: list[ast.stmt]) -> list[ast.stmt]:
         """Removes the leading docstring from a body of statements if present."""
         if not body:
             return body
@@ -43,13 +42,13 @@ class ASTCanonicalizer(ast.NodeTransformer):
 
         return body
 
-    def _canonicalize_body(self, body: List[ast.stmt]) -> List[ast.stmt]:
+    def _canonicalize_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
         """Sorts consecutive class and function definitions alphabetically by name."""
         if not self.ignore_order:
             return body
 
-        new_body: List[ast.stmt] = []
-        group: List[Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]] = []
+        new_body: list[ast.stmt] = []
+        group: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
 
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -209,7 +208,7 @@ def main() -> None:
             color_text(f"Syntax error in {args.input_file}: {e}", "31"), file=sys.stderr
         )
         sys.exit(1)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- top-level CLI guard; specific SyntaxError handled above
         print(
             color_text(f"An error occurred during canonicalization: {e}", "31"),
             file=sys.stderr,

@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --locked --group dev
+      - run: uv sync --locked --group dev --extra lab
       - run: uvx ruff check .
       - run: uvx ruff format --check .
       - run: uvx ty check
@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --locked --group dev
+      - run: uv sync --locked --group dev --extra lab
       - run: uv run pytest tests/test_matrix.py -v
 
   smoke:
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --locked --group dev
+      - run: uv sync --locked --group dev --extra lab
       - run: uv run pytest tests/test_notconf_protocol.py tests/test_sdk_generate.py -v
         env:
           NOTCONF_RUN_INTEGRATION: "1"

@@ -4,7 +4,7 @@ import hashlib
 import keyword
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from pyang import statements
 
@@ -24,15 +24,15 @@ class IRModel:
     yang_name: str = ""
     fields: list[IRField] = field(default_factory=list)
     is_rpc_envelope: bool = False
-    rpc_input_cls: Optional[str] = None
-    rpc_output_cls: Optional[str] = None
+    rpc_input_cls: str | None = None
+    rpc_output_cls: str | None = None
 
 
 @dataclass
 class IREnumValue:
     py_name: str
     value: str
-    description: Optional[str] = None
+    description: str | None = None
 
 
 @dataclass
@@ -50,15 +50,15 @@ class IRNavProperty:
     path_name: str
     yang_name: str
     ns: str = ""
-    item_cls: Optional[str] = None
+    item_cls: str | None = None
 
 
 @dataclass
 class IRNavNode:
     node_type: str  # 'container', 'list', 'rpc'
     class_name: str
-    item_class_name: Optional[str] = None
-    list_class_name: Optional[str] = None
+    item_class_name: str | None = None
+    list_class_name: str | None = None
     path_name: str = ""
     yang_name: str = ""
     pydantic_module: str = ""
@@ -108,13 +108,13 @@ class IRBuilder:
         self._synth_prefixes: dict[str, str] = {}
 
         ns = module.search_one("namespace")
-        
+
         imports_nsmap = {}
-        
+
         own_prefix = module.search_one("prefix")
         if own_prefix and ns:
             imports_nsmap[own_prefix.arg] = ns.arg
-            
+
         for imp in module.search("import"):
             prefix_stmt = imp.search_one("prefix")
             if prefix_stmt:
@@ -129,7 +129,7 @@ class IRBuilder:
             name=module.arg,
             py_name=module.arg.replace("-", "_"),
             namespace=ns.arg if ns else "urn:unknown",
-            imports_nsmap=imports_nsmap  # Pass the map to the IR
+            imports_nsmap=imports_nsmap,  # Pass the map to the IR
         )
 
     def _get_module_namespace(self, stmt) -> str:
@@ -316,7 +316,7 @@ class IRBuilder:
                 # Recurse regardless of whether the current node is a container/list/rpc
                 self._build_nav_nodes(child)
 
-    def _build_nav_node(self, stmt) -> Optional[IRNavNode]:
+    def _build_nav_node(self, stmt) -> IRNavNode | None:
         cls_name = getattr(stmt, "_pydantic_class_name", self._to_class_name(stmt.arg))
         ns = self._get_module_namespace(stmt)
         keys = (
@@ -337,27 +337,36 @@ class IRBuilder:
             module_yang_name=self.module.arg,
             ns=ns,
             keys=keys,
-            has_input=stmt.search_one("input") is not None if node_type == "rpc" else False,
-            has_output=stmt.search_one("output") is not None if node_type == "rpc" else False,
+            has_input=stmt.search_one("input") is not None
+            if node_type == "rpc"
+            else False,
+            has_output=stmt.search_one("output") is not None
+            if node_type == "rpc"
+            else False,
         )
 
         if stmt.keyword == "list":
-            node.item_class_name = cls_name if cls_name.endswith("Item") else f"{cls_name}Item"
-            node.list_class_name = node.item_class_name[:-4] + "List" if node.item_class_name.endswith("Item") else node.item_class_name + "List"
+            node.item_class_name = (
+                cls_name if cls_name.endswith("Item") else f"{cls_name}Item"
+            )
+            node.list_class_name = (
+                node.item_class_name[:-4] + "List"
+                if node.item_class_name.endswith("Item")
+                else node.item_class_name + "List"
+            )
 
         if hasattr(stmt, "i_children"):
             for child in stmt.i_children:
                 if child.keyword in ["container", "list", "action"]:
-                    child_cls = getattr(child, "_pydantic_class_name", self._to_class_name(child.arg))
-                    
-                    if child.keyword == "action":
-                        type_hint = f"{child_cls}Node"
-                        nav_cls = f"{child_cls}Node"
-                    elif child.keyword == "container":
+                    child_cls = getattr(
+                        child, "_pydantic_class_name", self._to_class_name(child.arg)
+                    )
+
+                    if child.keyword == "action" or child.keyword == "container":
                         type_hint = f"{child_cls}Node"
                         nav_cls = f"{child_cls}Node"
                     else:
-                        type_hint = f"{child_cls[:-4] if child_cls.endswith('Item') else child_cls}ListNode"
+                        type_hint = f"{child_cls.removesuffix('Item')}ListNode"
                         nav_cls = type_hint
 
                     prop = IRNavProperty(
@@ -367,7 +376,9 @@ class IRBuilder:
                         path_name=child.arg,
                         yang_name=child.arg,
                         ns=self._get_module_namespace(child),
-                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node" if child.keyword == "list" else None,
+                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
+                        if child.keyword == "list"
+                        else None,
                     )
                     node.properties.append(prop)
         return node
@@ -376,7 +387,7 @@ class IRBuilder:
 
     def _build_model(
         self, stmt, class_name, bypass_config_check=False
-    ) -> Optional[IRModel]:
+    ) -> IRModel | None:
         if (
             not bypass_config_check
             and self.config_only
@@ -508,7 +519,7 @@ class IRBuilder:
         parent_class_name,
         bypass_config_check,
         active_choices=None,
-    ) -> Optional[IRField]:
+    ) -> IRField | None:
         field_name = self._to_field_name(stmt.arg)
         constraints = {}
         type_str = "Any"
@@ -519,7 +530,7 @@ class IRBuilder:
         if active_choices:
             extra_dict["choice_mapping"] = active_choices
 
-        field_params = [f"json_schema_extra={repr(extra_dict)}"]
+        field_params = [f"json_schema_extra={extra_dict!r}"]
 
         if stmt.keyword == "container":
             type_str = getattr(
@@ -562,7 +573,7 @@ class IRBuilder:
             type_str, constraints = self._get_leaf_type(stmt)
             if "_patterns" in constraints:
                 validators = [
-                    f"AfterValidator(lambda v: check_pattern({repr(f'^(?:{self._convert_yang_regex(p)})$')}, v))"
+                    f"AfterValidator(lambda v: check_pattern({f'^(?:{self._convert_yang_regex(p)})$'!r}, v))"
                     for p in constraints.pop("_patterns")
                 ]
                 type_str = f"Annotated[{type_str}, {', '.join(validators)}]"
@@ -579,7 +590,7 @@ class IRBuilder:
                 item_type = f"Annotated[{item_type}, Field({', '.join(inner)})]"
             if "_patterns" in constraints:
                 validators = [
-                    f"AfterValidator(lambda v: check_pattern({repr(f'^(?:{self._convert_yang_regex(p)})$')}, v))"
+                    f"AfterValidator(lambda v: check_pattern({f'^(?:{self._convert_yang_regex(p)})$'!r}, v))"
                     for p in constraints.pop("_patterns")
                 ]
                 item_type = f"Annotated[{item_type}, {', '.join(validators)}]"
@@ -623,7 +634,7 @@ class IRBuilder:
                 field_params.append("default_factory=list")
 
             if desc:
-                field_params.append(f"description={repr(desc)}")
+                field_params.append(f"description={desc!r}")
             for k, v in constraints.items():
                 field_params.append(f"{k}={v}")
 
@@ -631,13 +642,13 @@ class IRBuilder:
             extra_dict["tag"] = stmt.arg
             extra_dict["ns"] = self._get_module_namespace(stmt)
             field_params.append(f'ns="{self._ns_alias(extra_dict["ns"])}"')
-            field_params.append(f"json_schema_extra={repr(extra_dict)}")
+            field_params.append(f"json_schema_extra={extra_dict!r}")
             assign = f"element({', '.join(field_params)})"
 
         else:
-            field_params = [f"json_schema_extra={repr(extra_dict)}"]
+            field_params = [f"json_schema_extra={extra_dict!r}"]
             if desc:
-                field_params.append(f"description={repr(desc)}")
+                field_params.append(f"description={desc!r}")
             for k, v in constraints.items():
                 field_params.append(f"{k}={v}")
             if default_val is not None:
@@ -997,7 +1008,7 @@ class IRBuilder:
                 name_registry.setdefault(full_name, []).append(entry)
 
             has_collision = False
-            for name, entries in name_registry.items():
+            for entries in name_registry.values():
                 if len(entries) > 1:
                     has_collision = True
                     for entry in entries:
@@ -1011,11 +1022,10 @@ class IRBuilder:
 
         def propagate_names(stmt):
             orig = self._get_original_node(stmt)
-            if orig:
-                if not getattr(stmt, "_pydantic_class_name", None):
-                    orig_name = getattr(orig, "_pydantic_class_name", None)
-                    if orig_name:
-                        stmt._pydantic_class_name = orig_name
+            if orig and not getattr(stmt, "_pydantic_class_name", None):
+                orig_name = getattr(orig, "_pydantic_class_name", None)
+                if orig_name:
+                    stmt._pydantic_class_name = orig_name
             if hasattr(stmt, "i_children"):
                 for child in stmt.i_children:
                     propagate_names(child)

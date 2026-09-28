@@ -2,16 +2,14 @@ import argparse
 import importlib.resources as pkg_resources
 import os
 import sys
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Literal
+from typing import Literal
 
-from dotenv import load_dotenv
 from pyang.scripts.pyang_tool import run
 
 import yang2sdk.plugin as entry_pkg
-
-load_dotenv()
 
 
 @contextmanager
@@ -78,7 +76,7 @@ class Compiler:
                     file=sys.stderr,
                 )
                 sys.exit(e.code)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- pyang run() raises arbitrary errors; CLI crash guard must not escape
             print(f"Compilation engine crashed unexpectedly: {e}", file=sys.stderr)
             sys.exit(1)
 
@@ -142,7 +140,7 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
 
     try:
         plugin_dir = Path(str(pkg_resources.files(entry_pkg))).resolve()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- resource resolution varies by installer; fail fast with message
         print(
             f"Error: Failed to resolve core compiler plugin location: {e}",
             file=sys.stderr,

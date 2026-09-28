@@ -1080,18 +1080,23 @@ name = "yang2sdk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "gitingest" },
     { name = "jinja2" },
-    { name = "ncclient" },
     { name = "pyang" },
     { name = "pydantic" },
     { name = "pydantic-xml" },
-    { name = "python-dotenv" },
     { name = "requests" },
+]
+
+[package.optional-dependencies]
+lab = [
+    { name = "lxml" },
+    { name = "ncclient" },
+    { name = "python-dotenv" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "gitingest" },
     { name = "pytest" },
     { name = "pyyaml" },
     { name = "ruff" },
@@ -1099,18 +1104,20 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "gitingest", specifier = ">=0.3.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "ncclient", specifier = ">=0.7.0" },
+    { name = "lxml", marker = "extra == 'lab'", specifier = ">=4.9.0" },
+    { name = "ncclient", marker = "extra == 'lab'", specifier = ">=0.7.0" },
     { name = "pyang", specifier = ">=2.7.1" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-xml", specifier = ">=2.21.0" },
-    { name = "python-dotenv", specifier = ">=1.0.1" },
+    { name = "python-dotenv", marker = "extra == 'lab'", specifier = ">=1.0.1" },
     { name = "requests", specifier = ">=2.32.5" },
 ]
+provides-extras = ["lab"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "gitingest", specifier = ">=0.3.1" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "ruff", specifier = ">=0.1.0" },

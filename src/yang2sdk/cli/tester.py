@@ -1,9 +1,18 @@
+"""Validate a generated client against a lab device. LAB ONLY — never production."""
+
+import importlib
+import logging
 import os
 import sys
-import logging
-import importlib
 from pathlib import Path
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError as e:
+    raise ImportError(
+        "tester needs the lab extra: pip install 'yang2sdk[lab]' "
+        "(or `uv sync --extra lab` for development)"
+    ) from e
 
 log_file = Path.cwd() / "temp" / "client_tester.log"
 log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -51,8 +60,12 @@ def main():
         password=password,
         verify=False,
     )
+    logger.warning(
+        "verify=False is an explicit lab-only opt-out for self-signed devices; "
+        "never use the tester against production"
+    )
 
-    for attr_name, prop in vars(type(client.data)).items():
+    for prop in vars(type(client.data)).values():
         if isinstance(prop, property):
             navigator = prop.fget(client.data)
             print(f"Testing validation sequence on: {navigator._path}")
@@ -67,7 +80,7 @@ def main():
                     f"  [OK] Parsed model: {pydantic_instance.__class__.__name__}"
                 )
             except Exception as e:
-                logger.error(f"  [FAIL] {navigator._path} - Error: {e}", exc_info=True)
+                logger.exception(f"  [FAIL] {navigator._path}")
                 print(f"  [FAIL] {navigator._path} - Error: {e}")
 
 

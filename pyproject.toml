@@ -9,24 +9,33 @@ description = "Generate a Pydantic-based IDE-friendly SDK from YANG modules."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "python-dotenv>=1.0.1",
-    "gitingest>=0.3.1",
     "jinja2>=3.1.6",
-    "ncclient>=0.7.0",
     "pyang>=2.7.1",
     "pydantic>=2.12.5",
-    "requests>=2.32.5",
     "pydantic-xml>=2.21.0",
+    "requests>=2.32.5",
+]
+
+[project.optional-dependencies]
+# Lab-only tooling (downloader/tester + live-simulator tests). Kept out of the
+# default install so downstream consumers of the generator never pay for it.
+# Lab work: `uv sync --locked --extra lab` or `pip install yang2sdk[lab]`.
+lab = [
+    "lxml>=4.9.0",
+    "ncclient>=0.7.0",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.scripts]
-yang-downloader = "yang2sdk.cli.downloader:main"
-tester = "yang2sdk.cli.tester:main"
 yang2restconf = "yang2sdk.cli.compiler:restconf"
 yang2netconf = "yang2sdk.cli.compiler:netconf"
+# Lab-only (require `yang2sdk[lab]`); kept as scripts for the documented dev workflow.
+yang-downloader = "yang2sdk.cli.downloader:main"
+tester = "yang2sdk.cli.tester:main"
 
 [dependency-groups]
 dev = [
+    "gitingest>=0.3.1",
     "ruff>=0.1.0",
     "pytest>=8.0.0",
     "pyyaml>=6.0.0",

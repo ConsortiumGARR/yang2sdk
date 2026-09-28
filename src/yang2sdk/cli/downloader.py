@@ -1,9 +1,18 @@
-import os
+"""Download YANG modules from a lab device. LAB ONLY — never production."""
+
 import logging
+import os
 from pathlib import Path
-from dotenv import load_dotenv
-from lxml import etree
-from ncclient import manager
+
+try:
+    from dotenv import load_dotenv
+    from lxml import etree
+    from ncclient import manager
+except ImportError as e:
+    raise ImportError(
+        "yang-downloader needs the lab extra: pip install 'yang2sdk[lab]' "
+        "(or `uv sync --extra lab` for development)"
+    ) from e
 
 # Configure logging using standard pathways
 log_file = Path.cwd() / "temp" / "yang_downloader.log"
@@ -46,6 +55,10 @@ class YangDownloader:
 
     def download_all(self) -> None:
         """Iterate schemas and execute get-schema operations."""
+        logger.warning(
+            "hostkey_verify=False is a lab-only opt-out; "
+            "never use the downloader against production"
+        )
         try:
             with manager.connect(
                 host=self.host,
@@ -80,9 +93,12 @@ class YangDownloader:
                         content = m.get_schema(identifier=name, version=version).data
                         filepath.write_text(content, encoding="utf-8")
                         print(f"[+] Saved: {filepath}")
-                    except Exception as e:
-                        logger.error(f"Failed to fetch {name}: {e}")
-                        print(f"[!] Failed to fetch {name}: {e}")
+                    except Exception:
+                        # Broad: one broken schema must not abort the whole
+                        # extraction. logger.exception records the traceback,
+                        # which also satisfies BLE001 (no blind swallow).
+                        logger.exception(f"Failed to fetch {name}")
+                        print(f"[!] Failed to fetch {name}")
 
         except Exception as e:
             logger.critical(f"System extraction error: {e}", exc_info=True)

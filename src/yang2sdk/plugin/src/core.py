@@ -142,6 +142,7 @@ class Yang2Restconf(plugin.PyangPlugin):
             with open(full_path, "w") as f:
                 f.write(env.get_template(template_path).render())
 
+
 class Yang2Netconf(plugin.PyangPlugin):
     """Main plugin class for YANG to NETCONF Pydantic-XML conversion"""
 
@@ -179,13 +180,19 @@ class Yang2Netconf(plugin.PyangPlugin):
             ir_modules.append(builder.build())
 
         for ir_mod in ir_modules:
-            model_out = env.get_template("netconf/data_models/models.py.jinja").render(module=ir_mod)
+            model_out = env.get_template("netconf/data_models/models.py.jinja").render(
+                module=ir_mod
+            )
             with open(os.path.join(models_dir, f"{ir_mod.py_name}.py"), "w") as f:
                 f.write(model_out)
 
             if ir_mod.nav_nodes:
-                nav_out = env.get_template("netconf/data_navigators/navigators.py.jinja").render(module=ir_mod)
-                with open(os.path.join(navigators_dir, f"{ir_mod.py_name}.py"), "w") as f:
+                nav_out = env.get_template(
+                    "netconf/data_navigators/navigators.py.jinja"
+                ).render(module=ir_mod)
+                with open(
+                    os.path.join(navigators_dir, f"{ir_mod.py_name}.py"), "w"
+                ) as f:
                     f.write(nav_out)
 
         all_data_props, all_rpc_props, module_names = [], [], []
@@ -195,14 +202,22 @@ class Yang2Netconf(plugin.PyangPlugin):
             all_rpc_props.extend(mod.root_rpc_props)
 
         with open(os.path.join(models_dir, "__init__.py"), "w") as f:
-            f.write(env.get_template("netconf/data_models/__init__.py.jinja").render(
-                module_names=module_names, data_props=all_data_props, rpc_props=all_rpc_props
-            ))
+            f.write(
+                env.get_template("netconf/data_models/__init__.py.jinja").render(
+                    module_names=module_names,
+                    data_props=all_data_props,
+                    rpc_props=all_rpc_props,
+                )
+            )
 
         with open(os.path.join(navigators_dir, "__init__.py"), "w") as f:
-            f.write(env.get_template("netconf/data_navigators/__init__.py.jinja").render(
-                module_names=module_names, data_props=all_data_props, rpc_props=all_rpc_props
-            ))
+            f.write(
+                env.get_template("netconf/data_navigators/__init__.py.jinja").render(
+                    module_names=module_names,
+                    data_props=all_data_props,
+                    rpc_props=all_rpc_props,
+                )
+            )
 
         static_files = {
             "__init__.py": "netconf/__init__.py.jinja",
