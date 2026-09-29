@@ -2,11 +2,31 @@
 import logging
 import os
 from typing import Any, Self
+from urllib.parse import parse_qs
 from ncclient import manager
 from ncclient.operations import RPCError
 from lxml import etree
 
 log = logging.getLogger(__name__)
+
+def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, str]) -> etree._Element:
+    """Declare xmlns for module-name prefixes used in identityref/instance-identifier values.
+
+    RFC 7951 Sec 6.8/6.11 encode those values as 'module-name:identity-name'.
+    XML requires the prefix to be bound (RFC 7950 Sec 9.10.3). Module names
+    are valid XML NCNames, so the module name itself is used as the prefix.
+    """
+    used: dict[str, str] = {}
+    for el in element.iter():
+        if el.text and ":" in el.text:
+            prefix = el.text.split(":", 1)[0]
+            if prefix in module_namespaces and prefix not in (el.nsmap or {}):
+                used[prefix] = module_namespaces[prefix]
+    if used:
+        # keep_ns_prefixes: the prefixes only appear in text, which the
+        # cleanup pass would otherwise drop as "unused" declarations.
+        etree.cleanup_namespaces(element, top_nsmap=used, keep_ns_prefixes=list(used))
+    return element
 
 class NetconfClient:
     """Production-ready NETCONF API client wrapping ncclient."""
@@ -37,6 +57,19 @@ class NetconfClient:
         self.has_candidate = any("urn:ietf:params:netconf:capability:candidate:1.0" in cap for cap in self.server_capabilities)
         self.has_writable_running = any("urn:ietf:params:netconf:capability:writable-running:1.0" in cap for cap in self.server_capabilities)
         self.has_nmda = any("ietf-netconf-nmda" in cap for cap in self.server_capabilities)
+
+        # RFC 6241 Sec 8.3: module capabilities are 'namespace?module=name&...'.
+        # Maps module name -> namespace for identityref prefix binding on
+        # write and prefix -> module-name normalization on read.
+        self.module_namespaces: dict[str, str] = {}
+        for cap in self.server_capabilities:
+            if "?" not in cap:
+                continue
+            base, _, query = cap.partition("?")
+            names = parse_qs(query).get("module")
+            if names:
+                self.module_namespaces[names[0]] = base
+        self.namespace_modules: dict[str, str] = {ns: name for name, ns in self.module_namespaces.items()}
         
         if not self.has_candidate and not self.has_writable_running:
             log.warning("Device advertises neither :candidate nor :writable-running. Modifications may fail.")
@@ -166,7 +199,8 @@ class NetconfClient:
                     conf.append(child)
             else:
                 conf.append(config_xml)
-                
+
+            bind_module_prefixes(rpc, self.module_namespaces)
             reply = self._handle_rpc(self._manager.dispatch, rpc)
             success = reply.ok
 
@@ -187,6 +221,7 @@ class NetconfClient:
                 conf = etree.SubElement(rpc, "{" + NC_NS + "}config")
                 conf.append(config_xml)
 
+            bind_module_prefixes(rpc, self.module_namespaces)
             reply = self._handle_rpc(self._manager.dispatch, rpc)
             success = reply.ok
 
@@ -206,5 +241,6 @@ class NetconfClient:
         return self._handle_rpc(self._manager.discard_changes).ok
 
     def rpc(self, rpc_xml: etree._Element) -> etree._Element:
+        bind_module_prefixes(rpc_xml, self.module_namespaces)
         reply = self._handle_rpc(self._manager.dispatch, rpc_xml)
         return reply.ele

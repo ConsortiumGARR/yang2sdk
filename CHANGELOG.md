@@ -6,8 +6,48 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Integration coverage for CRUD through the generated SDKs
+  (`tests/test_sdk_generate.py`): `test_restconf_sdk_crud_roundtrip` and
+  `test_netconf_sdk_crud_roundtrip` drive create → retrieve → update
+  (merge) → replace → delete of a throwaway ietf-interfaces entry with
+  read-back assertions (RESTCONF read-backs fall back to the RFC 8527
+  running datastore because the lab backend hides `/data` writes; NETCONF
+  read-backs also assert identityref values come back in RFC 7951 §6.8
+  module-name form), plus per-protocol
+  `test_*_all_config_nodes_retrieve_update` idempotent same-data merges of
+  every top-level config node (a throwaway entry is seeded when a fresh
+  image ships no config). Hard assertions — the previous
+  best-effort/xfail RESTCONF write test is gone.
+
 ### Fixed
 
+- RESTCONF write envelopes: nested list/container nodes now send
+  module-qualified top-level body members (RFC 7951 §4) via a navigator
+  `_envelope_name` (write key) separate from the response key; response
+  matching keeps the simple name. Regression test in `tests/test_matrix.py`
+  (`test_restconf_write_bodies_are_module_qualified`).
+- RESTCONF `create` sends one POST per new entry; the lab backend rejects
+  multi-entry create bodies ("MUST contain exactly one instance",
+  2026-09-28 probe).
+- RESTCONF models accept Python field names on input
+  (`populate_by_name=True`), matching the NETCONF models; previously
+  `Model(some_leaf=...)` / `model_validate({"some_leaf": ...})` failed with
+  "field required" because only wire aliases were accepted. This was the
+  actual cause of the long-suspected "RESTCONF write rejected (LY_EVALID)"
+  xfail — the failure was client-side validation, not a server rejection.
+- State (`config false`) leaves, leaf-lists, and lists are now optional on
+  generated models; previously a mandatory state leaf (e.g. ietf-interfaces
+  `if-index`/`oper-status`) made read-back of freshly created running
+  entries fail validation.
+- NETCONF identityref support: values stay RFC 7951 §6.8 module-name
+  strings; the write path binds the prefix from the server's advertised
+  capabilities (RFC 7950 §9.10.3) and the read path normalizes server
+  prefixes back to the module name. Previously `create`/`replace` of
+  ietf-interfaces failed with "unable to map prefix to YANG schema".
+  Regression test in `tests/test_matrix.py`
+  (`test_netconf_identityref_binding_and_normalization`).
 - Generated RESTCONF models: `model_dump(content="config"|"nonconfig")`
   now prunes `config false`/`config true` nodes at every depth
   (RFC 8040 §4.5.2). Previously only top-level fields were excluded, so

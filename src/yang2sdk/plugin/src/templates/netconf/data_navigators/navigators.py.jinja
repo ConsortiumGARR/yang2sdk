@@ -20,7 +20,7 @@ class {{ node.class_name }}Node(ItemNode):
         if matched is not None:
             if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
                 prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
-            return {{ node.class_name }}.from_xml(etree.tostring(matched))
+            return {{ node.class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
         return None
 
     def update(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str | None = None, operation: str = 'merge', **kwargs: Any) -> bool:
@@ -85,7 +85,7 @@ class {{ node.item_class_name }}Node(ItemNode):
         if matched is not None:
             if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
                 prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
-            return {{ node.class_name }}.from_xml(etree.tostring(matched))
+            return {{ node.item_class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
         return None
 
     def update(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str | None = None, operation: str = 'merge', **kwargs: Any) -> bool:
@@ -153,7 +153,7 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
         if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()):
             for m in matched: 
                 prune_xml_tree_to_depth(m, {{ node.item_class_name }}, int(depth))
-        return [{{ node.item_class_name }}.from_xml(etree.tostring(m)) for m in matched]
+        return [{{ node.item_class_name }}.from_xml(etree.tostring(m), module_namespaces=self._client.module_namespaces) for m in matched]
 
     def update(self, data: list[{{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str], *, target: str | None = None) -> bool:
         from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
@@ -209,7 +209,7 @@ class {{ node.class_name }}Node(Node):
         {% if node.has_input %}
         if input_data is None and kwargs: input_data = {k.replace('_', '-'): v for k, v in kwargs.items()}
         if isinstance(input_data, dict): input_data = {{ node.class_name }}Input.model_validate(input_data)
-        elif isinstance(input_data, str): input_data = {{ node.class_name }}Input.from_xml(input_data) if input_data.strip().startswith('<') else {{ node.class_name }}Input.model_validate_json(input_data)
+        elif isinstance(input_data, str): input_data = {{ node.class_name }}Input.from_xml(input_data, module_namespaces=self._client.module_namespaces) if input_data.strip().startswith('<') else {{ node.class_name }}Input.model_validate_json(input_data)
         if input_data:
             for child in etree.fromstring(input_data.to_xml_payload()): rpc_elem.append(child)
         {% endif %}
@@ -231,7 +231,7 @@ class {{ node.class_name }}Node(Node):
             out_elem = etree.Element("output", nsmap={None: ns} if ns else None)
             for child in resp_elem:
                 out_elem.append(child)
-            return {{ node.class_name }}Output.from_xml_tree(out_elem)
+            return {{ node.class_name }}Output.from_xml_tree(out_elem, module_namespaces=self._client.module_namespaces)
         return None
         {% endif %}
 {% endif %}

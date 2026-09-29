@@ -10,12 +10,18 @@ if TYPE_CHECKING:
 def _get_max_depth(data: Any, current_depth: int = 1) -> int:
     """Calculates max depth, treating lists of primitives as leaf values."""
     if isinstance(data, dict) and data:
-        return max((_get_max_depth(v, current_depth + 1) for v in data.values()), default=current_depth)
+        return max(
+            (_get_max_depth(v, current_depth + 1) for v in data.values()),
+            default=current_depth,
+        )
 
     if isinstance(data, list) and data:
         # Check if the list contains complex structures (dicts or nested lists)
         if any(isinstance(item, (dict, list)) for item in data):
-            return max((_get_max_depth(item, current_depth + 1) for item in data), default=current_depth)
+            return max(
+                (_get_max_depth(item, current_depth + 1) for item in data),
+                default=current_depth,
+            )
         # If it's a list of primitives (leaf-list), don't increment depth
         return current_depth
 
@@ -36,18 +42,34 @@ def _prune_at_max_depth(data: Any, target_depth: int, current_depth: int = 1) ->
         return [
             _prune_at_max_depth(item, target_depth, current_depth + 1)
             for item in data
-            if not (isinstance(item, (dict, list)) and not item and current_depth + 1 == target_depth)
+            if not (
+                isinstance(item, (dict, list))
+                and not item
+                and current_depth + 1 == target_depth
+            )
         ]
     return data
 
 
 class Node:
-    __slots__ = ("_client", "_name", "_path")
+    __slots__ = ("_client", "_name", "_path", "_envelope_name")
 
-    def __init__(self, client: RestconfClient, path: str, name: str):
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        envelope_name: str | None = None,
+    ):
         self._client = client
         self._path = path
         self._name = name
+        # Key used for request bodies. RFC 7951 Sec 4 requires a
+        # module-qualified member name for the top-level member of a body,
+        # while responses use the simple name when the module matches the
+        # parent (RFC 7951 Sec 4), so `_name` (response key) and
+        # `_envelope_name` (write key) can differ for nested nodes.
+        self._envelope_name = envelope_name or name
 
     def _retrieve(
         self,
@@ -97,13 +119,21 @@ class Node:
         return payload
 
     def _update(self, **kwargs: Any) -> None:
-        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
-        data = {self._name: kwargs}
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        data = {self._envelope_name: kwargs}
         return self._client._request("PATCH", self._path, json=data)
 
     def _replace(self, **kwargs: Any) -> None:
-        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
-        data = {self._name: kwargs}
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        data = {self._envelope_name: kwargs}
         return self._client._request("PUT", self._path, json=data)
 
     def delete(self) -> None:
@@ -111,12 +141,19 @@ class Node:
 
 
 class ItemNode:
-    __slots__ = ("_client", "_name", "_path")
+    __slots__ = ("_client", "_name", "_path", "_envelope_name")
 
-    def __init__(self, client: RestconfClient, path: str, name: str):
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        envelope_name: str | None = None,
+    ):
         self._client = client
         self._path = path
         self._name = name
+        self._envelope_name = envelope_name or name
 
     def _retrieve(
         self,
@@ -150,7 +187,9 @@ class ItemNode:
                 inner = resp[self._name]
                 if isinstance(inner, list):
                     if not inner:
-                        raise ValueError(f"Received empty list inside key '{self._name}'")
+                        raise ValueError(
+                            f"Received empty list inside key '{self._name}'"
+                        )
                     payload = inner[0]
                 else:
                     # Handle case where it returns a single object instead of a list
@@ -165,7 +204,9 @@ class ItemNode:
                     inner = resp[found_keys[0]]
                     if isinstance(inner, list):
                         if not inner:
-                            raise ValueError(f"Received empty list inside key '{found_keys[0]}'")
+                            raise ValueError(
+                                f"Received empty list inside key '{found_keys[0]}'"
+                            )
                         payload = inner[0]
                     else:
                         payload = inner
@@ -183,13 +224,26 @@ class ItemNode:
         return payload
 
     def _update(self, **kwargs: Any) -> None:
-        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
-        data = {self._name: [kwargs]}
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        # The target backend (notconf/rousette) requires a single-element
+        # array body for item PATCH/PUT (evidence:
+        # ghcr.io/notconf/notconf-ietf:latest, 2026-09-28); a bare object
+        # body is rejected with LY_EVALID. RFC 8040 Sec 5.2 shows an object
+        # body, so this is a documented device deviation.
+        data = {self._envelope_name: [kwargs]}
         return self._client._request("PATCH", self._path, json=data)
 
     def _replace(self, **kwargs: Any) -> None:
-        kwargs = {k: v for k, v in kwargs.items() if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)}
-        data = {self._name: [kwargs]}
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        data = {self._envelope_name: [kwargs]}
         return self._client._request("PUT", self._path, json=data)
 
     def delete(self) -> None:
@@ -200,7 +254,7 @@ TNode = TypeVar("TNode", bound=ItemNode)
 
 
 class ListNode(Generic[TNode]):
-    __slots__ = ("_client", "_item_cls", "_name", "_path")
+    __slots__ = ("_client", "_item_cls", "_name", "_path", "_envelope_name")
 
     def __init__(
         self,
@@ -208,11 +262,13 @@ class ListNode(Generic[TNode]):
         path: str,
         name: str,
         item_cls: type[TNode],
+        envelope_name: str | None = None,
     ):
         self._client = client
         self._path = path
         self._name = name
         self._item_cls = item_cls
+        self._envelope_name = envelope_name or name
 
     def __call__(self, *keys: str | int) -> TNode:
         """
@@ -227,7 +283,9 @@ class ListNode(Generic[TNode]):
 
         new_path = f"{self._path}={encoded_keys}"
 
-        return self._item_cls(self._client, new_path, self._name)
+        return self._item_cls(
+            self._client, new_path, self._name, envelope_name=self._envelope_name
+        )
 
     def _retrieve(
         self,
@@ -267,7 +325,9 @@ class ListNode(Generic[TNode]):
                     # Fallback for primitives or unknown types, though unlikely for a list node
                     # We might want to raise, but let's try to treat as single item or error?
                     # Raising is safer.
-                    raise ValueError(f"Unexpected value type for '{self._name}': {type(inner)}")
+                    raise ValueError(
+                        f"Unexpected value type for '{self._name}': {type(inner)}"
+                    )
 
             # 2b. Namespaced key match
             else:
@@ -294,13 +354,26 @@ class ListNode(Generic[TNode]):
         return data_list
 
     def _create(self, data_list: list[dict[str, Any]]) -> None:
-        envelope = {self._name: data_list}
+        # One POST per new entry, targeting the parent container with a
+        # single-element array body. Evidence (notconf/rousette,
+        # ghcr.io/notconf/notconf-ietf:latest, 2026-09-28): POST to the
+        # collection resource is rejected (400 "requires 1 keys"), a
+        # multi-entry body is rejected ("MUST contain exactly one instance"),
+        # and POST to the parent with a one-element array returns 201.
+        # RFC 8040 Sec 4.6.2 specifies POST to the collection resource with
+        # one entry, so this is a documented device deviation.
         url = self._path.removesuffix(f"/{self._name}")
-        self._client._request("POST", url, json=envelope)
+        for item in data_list:
+            self._client._request("POST", url, json={self._envelope_name: [item]})
 
     def _replace(self, data_list: list[dict[str, Any]]) -> None:
-        envelope = {self._name: data_list}
+        # Whole-list replace: PUT to the parent container with the RFC 7951
+        # Sec 6.3 list encoding. Note: notconf/rousette rejects this list-keyed
+        # body (LY_EVALID, 2026-09-28 probe); it only accepts a container-encoded
+        # body, which would also replace sibling children. So this bulk op is
+        # not exercised by the item-level CRUD tests.
         url = self._path.removesuffix(f"/{self._name}")
+        envelope = {self._envelope_name: data_list}
         return self._client._request("PUT", url, json=envelope)
 
     def delete(self) -> None:

@@ -45,9 +45,9 @@ class {{ node.class_name }}Node(Node):
     @property
     def {{ prop.name }}(self) -> {{ prop.type_hint }}:
         {% if prop.item_cls %}
-        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }})
+        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }}, "{{ prop.module_yang_name }}:{{ prop.yang_name }}")
         {% else %}
-        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}")
+        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", envelope_name="{{ prop.module_yang_name }}:{{ prop.yang_name }}")
         {% endif %}
     {% endfor %}
 
@@ -90,9 +90,9 @@ class {{ node.item_class_name }}Node(ItemNode):
     @property
     def {{ prop.name }}(self) -> {{ prop.type_hint }}:
         {% if prop.item_cls %}
-        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }})
+        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", {{ prop.item_cls }}, "{{ prop.module_yang_name }}:{{ prop.yang_name }}")
         {% else %}
-        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}")
+        return {{ prop.nav_cls }}(self._client, f"{self._path}/{{ prop.path_name }}", "{{ prop.yang_name }}", envelope_name="{{ prop.module_yang_name }}:{{ prop.yang_name }}")
         {% endif %}
     {% endfor %}
 

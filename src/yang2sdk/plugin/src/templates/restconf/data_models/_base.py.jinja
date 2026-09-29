@@ -12,7 +12,10 @@ class YangBaseModel(BaseModel):
         extra="forbid",
         validate_assignment=True,
         defer_build=True,
-        validate_default=True
+        validate_default=True,
+        # Accept Python field names as well as wire aliases on input,
+        # matching the NETCONF model config (protocol parity).
+        populate_by_name=True
     )
 
     @model_validator(mode='after')

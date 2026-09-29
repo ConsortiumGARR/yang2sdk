@@ -12,13 +12,19 @@ class NetconfXmlModel(BaseXmlModel):
     """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml."""
     
     @classmethod
-    def from_xml(cls, source: str | bytes, *args: Any, **kwargs: Any) -> Self:
+    def from_xml(cls, source: str | bytes, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
         rebuild_model_and_dependencies(cls)
+        if module_namespaces:
+            root = etree.fromstring(source)
+            normalize_identityrefs(root, cls, module_namespaces)
+            return super().from_xml_tree(root, *args, **kwargs)
         return super().from_xml(source, *args, **kwargs)
 
     @classmethod
-    def from_xml_tree(cls, root: etree._Element, *args: Any, **kwargs: Any) -> Self:
+    def from_xml_tree(cls, root: etree._Element, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
         rebuild_model_and_dependencies(cls)
+        if module_namespaces:
+            normalize_identityrefs(root, cls, module_namespaces)
         return super().from_xml_tree(root, *args, **kwargs)
 
     def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
@@ -82,6 +88,42 @@ def _extract_child_model(annot: Any) -> type | None:
     elif isinstance(annot, type) and issubclass(annot, BaseModel):
         return annot
     return None
+
+def normalize_identityrefs(element: etree._Element, model_cls: type | None, module_namespaces: dict[str, str]) -> None:
+    """Rewrite identityref values from XML prefix form to RFC 7951 Sec 6.8
+    module-name form ('module:identity') using the in-scope namespaces.
+
+    Keeps models protocol-agnostic: retrieved values match the canonical
+    JSON encoding, so they round-trip unchanged through both transports.
+    """
+    if model_cls is None or not hasattr(model_cls, "model_fields"):
+        return
+    namespace_modules = {ns: name for name, ns in module_namespaces.items()}
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if tag is None:
+            continue
+        ns = extra.get("ns")
+        if extra.get("is_identityref"):
+            for child in element:
+                qname = etree.QName(child)
+                if qname.localname != tag or (ns and qname.namespace != ns):
+                    continue
+                text = child.text or ""
+                if ":" not in text:
+                    continue
+                prefix, name = text.split(":", 1)
+                module = namespace_modules.get((child.nsmap or {}).get(prefix, ""))
+                if module:
+                    child.text = f"{module}:{name}"
+            continue
+        child_cls = _extract_child_model(field_info.annotation)
+        if child_cls is not None and child_cls is not model_cls:
+            for child in element:
+                qname = etree.QName(child)
+                if qname.localname == tag and (not ns or qname.namespace == ns):
+                    normalize_identityrefs(child, child_cls, module_namespaces)
 
 def _strip_nonconfig_tree(element: etree._Element, model_cls: type | None) -> None:
     """Remove `config false` subtrees in place using is_config metadata."""

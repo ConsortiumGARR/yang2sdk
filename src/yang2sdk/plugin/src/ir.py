@@ -51,6 +51,7 @@ class IRNavProperty:
     yang_name: str
     ns: str = ""
     item_cls: str | None = None
+    module_yang_name: str = ""
 
 
 @dataclass
@@ -379,6 +380,7 @@ class IRBuilder:
                         item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
                         if child.keyword == "list"
                         else None,
+                        module_yang_name=self._get_module_name(child),
                     )
                     node.properties.append(prop)
         return node
@@ -524,6 +526,7 @@ class IRBuilder:
         constraints = {}
         type_str = "Any"
         is_optional = False
+        is_identityref = False
 
         is_config = getattr(stmt, "i_config", True)
         extra_dict = {"is_config": is_config}
@@ -560,7 +563,7 @@ class IRBuilder:
                 if self.target_format == "netconf"
                 else f"RestconfList[{item_type}]"
             )
-            is_optional = not self._is_mandatory(stmt)
+            is_optional = not is_config or (not self._is_mandatory(stmt))
 
             min_elements = stmt.search_one("min-elements")
             if min_elements:
@@ -571,16 +574,24 @@ class IRBuilder:
 
         elif stmt.keyword == "leaf":
             type_str, constraints = self._get_leaf_type(stmt)
+            is_identityref = constraints.pop("_identityref", False)
             if "_patterns" in constraints:
                 validators = [
                     f"AfterValidator(lambda v: check_pattern({f'^(?:{self._convert_yang_regex(p)})$'!r}, v))"
                     for p in constraints.pop("_patterns")
                 ]
                 type_str = f"Annotated[{type_str}, {', '.join(validators)}]"
-            is_optional = not self._is_mandatory(stmt) and not hasattr(stmt, "i_is_key")
+            # State (config false) leaves are device-generated; a
+            # get/get-config response may legitimately omit them (e.g. an
+            # entry with no operational counterpart), so they must never be
+            # required on read.
+            is_optional = not is_config or (
+                not self._is_mandatory(stmt) and not hasattr(stmt, "i_is_key")
+            )
 
         elif stmt.keyword == "leaf-list":
             item_type, constraints = self._get_leaf_type(stmt)
+            is_identityref = constraints.pop("_identityref", False)
             inner = [
                 f"{k}={constraints.pop(k)}"
                 for k in ["ge", "le", "gt", "lt", "min_length", "max_length"]
@@ -600,7 +611,7 @@ class IRBuilder:
                 if self.target_format == "netconf"
                 else f"RestconfList[{item_type}]"
             )
-            is_optional = not self._is_mandatory(stmt)
+            is_optional = not is_config or (not self._is_mandatory(stmt))
 
             min_elements = stmt.search_one("min-elements")
             if min_elements:
@@ -641,6 +652,8 @@ class IRBuilder:
             extra_dict["is_key"] = getattr(stmt, "i_is_key", False)
             extra_dict["tag"] = stmt.arg
             extra_dict["ns"] = self._get_module_namespace(stmt)
+            if is_identityref:
+                extra_dict["is_identityref"] = True
             field_params.append(f'ns="{self._ns_alias(extra_dict["ns"])}"')
             field_params.append(f"json_schema_extra={extra_dict!r}")
             assign = f"element({', '.join(field_params)})"
@@ -763,8 +776,13 @@ class IRBuilder:
             return "Decimal64", self._get_range_constraints(type_stmt)
         elif yt in ["boolean", "empty"]:
             return "bool", {}
-        elif yt in ["binary", "bits", "identityref", "instance-identifier"]:
+        elif yt in ["binary", "bits", "instance-identifier"]:
             return "str", {}
+        elif yt == "identityref":
+            # Marked so the NETCONF emitter can bind the value's module prefix
+            # in XML (RFC 7950 Sec 9.10.3); values are RFC 7951 Sec 6.8
+            # module-name-qualified strings.
+            return "str", {"_identityref": True}
         elif yt == "string":
             c = {}
             length = type_stmt.search_one("length")
