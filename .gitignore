@@ -15,6 +15,9 @@ wheels/
 # env files
 *.env
 
+# containerlab runtime state (LAB ONLY) — lives next to the topology file
+tests/srl/clab-*/
+
 # Temporary files
 digest.txt
 # Simulator snapshot payloads (run-local; strict golden comparison is follow-up)

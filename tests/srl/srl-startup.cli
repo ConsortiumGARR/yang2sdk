@@ -1,0 +1,11 @@
+# Minimal overlay — AAA role only.
+# Containerlab default already configures:
+#   system ssh-server mgmt-netconf (port 830, mgmt, disable-shell true)
+#   system netconf-server mgmt -> ssh-server mgmt-netconf
+# (see containerlab nodes/srl/version_configs/netconf.cfg)
+# What defaults do NOT cover: NETCONF RPC authorization.
+# Per Nokia docs all <allowed-operations> are disabled by default and must be
+# enabled one-by-one under /system aaa authorization role <name> netconf.
+# Least-privilege set for v1 (no copy-config/delete-config/kill-session/url).
+set / system aaa authorization role yang2sdk-test services [ netconf ]
+set / system aaa authorization role yang2sdk-test netconf allowed-operations [ get get-config get-data get-schema edit-config edit-data commit discard-changes lock unlock validate close-session ]

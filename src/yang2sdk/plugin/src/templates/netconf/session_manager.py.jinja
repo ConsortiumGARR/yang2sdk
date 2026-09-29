@@ -53,6 +53,37 @@ def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, s
         etree.cleanup_namespaces(element, top_nsmap=used, keep_ns_prefixes=list(used))
     return element
 
+
+def _reply_root(reply: Any) -> etree._Element | None:
+    """Return the <rpc-reply> element across ncclient versions.
+
+    ncclient <=0.6 exposed ``reply.ele``; ncclient 0.7 removed it from the
+    base ``RPCReply`` (only ``GetReply`` keeps ``data_ele``). The raw
+    ``reply.xml`` string is stable across versions, so lxml-parse it to
+    guarantee an ``lxml`` element for downstream ``find``/``tostring``.
+    """
+    ele = getattr(reply, "ele", None)
+    if ele is not None:
+        return ele
+    raw = getattr(reply, "xml", None)
+    if raw is not None:
+        if isinstance(raw, str):
+            raw = raw.encode()
+        try:
+            return etree.fromstring(raw)
+        except Exception:
+            log.debug("Failed to parse NETCONF reply xml", exc_info=True)
+    root = getattr(reply, "_root", None)
+    if root is not None:
+        try:
+            reply.parse()
+        except Exception:
+            log.debug("Failed to parse NETCONF reply root", exc_info=True)
+        root = getattr(reply, "_root", None)
+        if root is not None and isinstance(root, etree._Element):
+            return root
+    return None
+
 class NetconfClient:
     """Production-ready NETCONF API client wrapping ncclient.
 
@@ -204,13 +235,17 @@ class NetconfClient:
                 md.text = str(depth)
                 
             reply = self._handle_rpc(self._manager.dispatch, rpc)
-            
-            # RFC 8526 guarantees output payload wrapper inherits the module namespace
-            data_node = reply.ele.find("{urn:ietf:params:xml:ns:yang:ietf-netconf-nmda}data")
+
+            # RFC 8526 guarantees output payload wrapper inherits the module namespace.
+            # _reply_root keeps ncclient<=0.6 (.ele) and >=0.7 (.xml) working.
+            root = _reply_root(reply)
+            if root is None:
+                return None
+            data_node = root.find("{urn:ietf:params:xml:ns:yang:ietf-netconf-nmda}data")
             if data_node is None:
-                data_node = reply.ele.find("{urn:ietf:params:xml:ns:netconf:base:1.0}data")
+                data_node = root.find("{urn:ietf:params:xml:ns:netconf:base:1.0}data")
             if data_node is None:
-                data_node = reply.ele.find("data")
+                data_node = root.find("data")
             return data_node
 
         else:
@@ -224,7 +259,16 @@ class NetconfClient:
                 reply = self._handle_rpc(self._manager.get, filter=filter_xml, **kwargs)
             else:
                 reply = self._handle_rpc(self._manager.get_config, source=source, filter=filter_xml, **kwargs)
-            return reply.data_ele
+            data_ele = getattr(reply, "data_ele", None)
+            if data_ele is not None:
+                return data_ele
+            root = _reply_root(reply)
+            if root is None:
+                return None
+            data_node = root.find("{urn:ietf:params:xml:ns:netconf:base:1.0}data")
+            if data_node is None:
+                data_node = root.find("data")
+            return data_node
 
     def edit(self, config_xml: str | etree._Element, target: str | None = None, default_operation: str = "merge") -> bool:
         """Capability-routed edits. Uses <edit-data> if NMDA is supported, otherwise raw <edit-config>."""
@@ -298,9 +342,9 @@ class NetconfClient:
         if not self.has_candidate: return True
         return self._handle_rpc(self._manager.discard_changes).ok
 
-    def rpc(self, rpc_xml: etree._Element) -> etree._Element:
+    def rpc(self, rpc_xml: etree._Element) -> etree._Element | None:
         bind_module_prefixes(rpc_xml, self.module_namespaces)
         if self.log_bodies:
             log.debug("NETCONF rpc: %s", _redact(etree.tostring(rpc_xml)))
         reply = self._handle_rpc(self._manager.dispatch, rpc_xml)
-        return reply.ele
+        return _reply_root(reply)

@@ -10,6 +10,16 @@ from typing import Any
 
 import pytest
 
+from yang2sdk.cli.compiler import resolve_features
+from yang2sdk.cli.features import (
+    parse_capability_features,
+    read_features_file,
+    to_pyang_args,
+    write_features_file,
+)
+from yang2sdk.cli.model_gaps import main as model_gaps_main
+from yang2sdk.cli.model_gaps import run_gap_check
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATRIX = REPO_ROOT / "tests" / "notconf" / "matrix.json"
 T_RESTCONF_SM = (
@@ -589,11 +599,10 @@ def test_rfc8040_jukebox_array_shape():
     assert body["example-jukebox:album"][0]["name"] == "Wasting Light"
 
 
+_COMPILER_CODE = "import sys; from yang2sdk.cli.compiler import run_compiler; run_compiler(%r, sys.argv[1:])"
+
+
 def _run_compiler(fmt, yang_path, tmp_path, out, extra_args=None):
-    code = (
-        "import sys; from yang2sdk.cli.compiler import run_compiler; "
-        f"run_compiler({fmt!r}, sys.argv[1:])"
-    )
     argv = [
         str(yang_path),
         "--device",
@@ -605,7 +614,7 @@ def _run_compiler(fmt, yang_path, tmp_path, out, extra_args=None):
     ]
     argv += list(extra_args or [])
     proc = subprocess.run(
-        [sys.executable, "-c", code, *argv],
+        [sys.executable, "-c", _COMPILER_CODE % fmt, *argv],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -661,8 +670,13 @@ def test_generated_package_is_registry_ready(tmp_path):
 
 
 def test_package_manifest_records_deviations_and_features(tmp_path):
+    # `--feature` is forwarded to pyang as a real whitelist now, so pyang
+    # rejects a feature the module does not declare (pyang_tool: "unknown
+    # feature ... in module ..."). The module must declare it.
     yang = tmp_path / "tmod.yang"
-    yang.write_text(MINIMAL_YANG)
+    yang.write_text(
+        MINIMAL_YANG.replace("container top {", "feature myfeat;\n  container top {")
+    )
     # Minimal deviation module that pyang can load (applies cleanly to tmod).
     dev = tmp_path / "my-dev.yang"
     dev.write_text(
@@ -695,6 +709,39 @@ def test_package_manifest_records_deviations_and_features(tmp_path):
     manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
     assert any("my-dev.yang" in d for d in manifest["deviations"])
     assert "tmod:myfeat" in manifest["features"]
+    assert manifest["features_source"] == "manual"
+
+
+def test_unknown_manual_feature_is_a_hard_error(tmp_path):
+    """A manual feature the module does not declare must fail loudly.
+
+    Silently dropping it would hand back a model that does not contain what
+    the operator asked for — the same silent-wrong-model failure the device
+    feature set exists to prevent.
+    """
+    yang = tmp_path / "tmod.yang"
+    yang.write_text(MINIMAL_YANG)
+    proc = subprocess.run(
+        [sys.executable, "-c", _COMPILER_CODE % "restconf"]
+        + [
+            str(yang),
+            "--device",
+            "tmod",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--feature",
+            "tmod:nosuchfeature",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode != 0, "unknown feature must not be silently ignored"
+    assert "unknown feature nosuchfeature" in proc.stderr
 
 
 def test_logging_hygiene_generated_client(tmp_path):
@@ -741,3 +788,198 @@ def test_logging_hygiene_generated_client(tmp_path):
             assert client.log_bodies is False
     finally:
         sys.path.remove(str(tmp_path))
+
+
+# --- device feature set (RFC 7950 if-feature -> pyang --features) -------------
+
+FEATURE_YANG = """module tfeat {
+  yang-version 1.1;
+  prefix tf;
+  namespace "urn:test:tfeat";
+  revision 2026-01-01;
+  feature f;
+  feature other;
+  container s {
+    container g {
+      if-feature "not f";
+      leaf x {
+        type string;
+      }
+    }
+  }
+}
+"""
+
+FEATURE_NS = "urn:test:tfeat"
+
+
+def _rendered_paths(paths, report) -> set[str]:
+    from yang2sdk.cli.model_gaps import _render
+
+    return {_render(p, report.ns_to_module) for p in paths}
+
+
+def test_parse_capability_features_excludes_modules_without_features():
+    """RFC 6241 Sec 8.3: only a capability carrying `features=` is a whitelist.
+
+    pyang reads ctx.features as a per-module allow-list (pyang/statements.py:
+    an if-feature resolves False unless listed for the *defining* module), so
+    feeding it a module that advertised no `features=` as an empty list would
+    disable every feature of that module. Non-module capabilities and modules
+    advertised without `features=` must therefore be dropped entirely.
+    """
+    caps = [
+        "urn:ietf:params:netconf:base:1.0",
+        "urn:ietf:params:netconf:capability:yang-library:1.0?revision=2016-06-21",
+        f"{FEATURE_NS}?module=tfeat&revision=2026-01-01&features=other,f3",
+        f"{FEATURE_NS}?module=tfeat&revision=2026-01-01",
+        "urn:ietf:params:xml:ns:yang:ietf-netconf?module=ietf-netconf&revision=2011-06-01",
+    ]
+    parsed = parse_capability_features(caps)
+    assert parsed == {"tfeat": ["other", "f3"]}, (
+        f"only capabilities carrying features= may become a pyang whitelist: {parsed}"
+    )
+    assert "ietf-netconf" not in parsed, (
+        "a module with no features= is unknown, not empty; it must stay out"
+    )
+
+
+def test_pyang_features_args_are_one_arg_per_module():
+    """pyang parses `--features <mod>:[<f>,]*`; repeating `mod:f` reads as a filename."""
+    args = to_pyang_args({"srl_nokia-features": {"b", "a"}, "ietf-netconf": {"nmda"}})
+    assert args == ["ietf-netconf:nmda", "srl_nokia-features:a,b"], args
+
+
+def test_model_gaps_detects_if_feature_gap(tmp_path):
+    """The discriminating test: default vs device feature set must differ.
+
+    `g` is gated by `if-feature "not f"`, so pyang's default (all features
+    supported) prunes it while a device that does not support `f` keeps it.
+    A default-model client reading that device then fails on the first
+    unknown element (`extra="forbid"`). This test needs BOTH halves:
+    the feature plumbing into pyang *and* a surface diff that notices.
+    """
+    yang = tmp_path / "tfeat.yang"
+    yang.write_text(FEATURE_YANG)
+    features_file = tmp_path / "features.json"
+    write_features_file(features_file, {"tfeat": ["other"]}, source="test")
+
+    report = run_gap_check(
+        roots=[str(yang)],
+        yang_dir=tmp_path,
+        features_file=features_file,
+        device="tfeat",
+        work_dir=tmp_path / "work",
+    )
+
+    missing = _rendered_paths(report.missing_from_default, report)
+    assert missing == {"s/g", "s/g/x"}, (
+        f"read-risk paths wrong: {missing} (raw: {report.missing_from_default})"
+    )
+    assert (FEATURE_NS, "s") not in report.missing_from_default, (
+        "the shared parent must not be reported missing"
+    )
+    assert report.absent_on_device == set(), "device is a superset here"
+    assert "tfeat.G" in report.missing_classes, "the dropped model class is the tell"
+    assert _rendered_paths(report.missing_nav, report) == {"s/g"}
+    assert report.unresolved == [], report.unresolved
+    # Both compiles really happened and really differed.
+    assert report.missing_from_default, "gap must be non-empty to be meaningful"
+
+
+def test_model_gaps_exit_codes(tmp_path):
+    """0 when the model already matches the device set, 1 on read risk."""
+    yang = tmp_path / "tfeat.yang"
+    yang.write_text(FEATURE_YANG)
+    features_file = tmp_path / "features.json"
+    base = [
+        str(yang),
+        "--yang-dir",
+        str(tmp_path),
+        "--device",
+        "tfeat",
+        "--work-dir",
+        str(tmp_path / "work"),
+    ]
+    # Device does not support `f` -> `g` is real on the device -> exit 1.
+    write_features_file(features_file, {"tfeat": ["other"]}, source="test")
+    assert model_gaps_main([*base, "--features-file", str(features_file)]) == 1
+    # Device supports `f` -> default model already matches -> exit 0.
+    write_features_file(features_file, {"tfeat": ["f", "other"]}, source="test")
+    assert model_gaps_main([*base, "--features-file", str(features_file)]) == 0
+
+
+def test_features_file_roundtrip(tmp_path):
+    features = {"m1": ["a", "b"], "m2": []}
+    path = write_features_file(tmp_path / "features.json", features, source="unit")
+    assert read_features_file(path) == features
+    # A bare mapping is accepted too, so hand-written fixtures stay trivial.
+    (tmp_path / "bare.json").write_text(json.dumps(features))
+    assert read_features_file(tmp_path / "bare.json") == features
+
+
+# --- Change B: forwarding the device feature set to pyang --------------------
+
+
+def test_resolve_features_is_a_noop_without_a_features_file(tmp_path):
+    """No features file + no --feature => nothing forwarded, so existing
+    compilations stay byte-identical (pyang keeps its "all features" default)."""
+    resolved = resolve_features(yang_dir=tmp_path, manual=[])
+    assert resolved.modules == {}
+    assert resolved.source == "none"
+    assert to_pyang_args(resolved.modules) == []
+
+
+def test_resolve_features_unions_device_and_manual(tmp_path):
+    """The operator may add features, never narrow them.
+
+    Narrowing is the silent-wrong-model failure: pyang prunes
+    `if-feature "not X"` subtrees the device actually has.
+    """
+    write_features_file(tmp_path / "features.json", {"tfeat": ["other"]}, source="t")
+    resolved = resolve_features(
+        yang_dir=tmp_path, manual=["tfeat:f", "tfeat:other", "tm2:x"]
+    )
+    assert resolved.modules == {
+        "tfeat": ["f", "other"],  # union, device feature kept
+        "tm2": ["x"],
+    }
+    assert resolved.source == "device+manual"
+    assert to_pyang_args(resolved.modules) == ["tfeat:f,other", "tm2:x"]
+
+
+def test_resolve_features_honours_opt_out(tmp_path):
+    write_features_file(tmp_path / "features.json", {"tfeat": ["other"]}, source="t")
+    assert (
+        resolve_features(yang_dir=tmp_path, manual=[], use_device_features=False).source
+        == "none"
+    )
+    assert (
+        resolve_features(
+            yang_dir=tmp_path, manual=[], features_file=str(tmp_path / "features.json")
+        ).source
+        == "device"
+    )
+
+
+def test_auto_device_features_reach_pyang(tmp_path):
+    """End-to-end: features.json next to the YANG is picked up automatically."""
+    yang = tmp_path / "tfeat.yang"
+    yang.write_text(FEATURE_YANG)
+    write_features_file(tmp_path / "features.json", {"tfeat": ["other"]}, source="t")
+
+    auto = tmp_path / "auto"
+    _run_compiler("restconf", yang, tmp_path, auto)
+    auto_manifest = json.loads((auto / "MANIFEST.yang-revisions.json").read_text())
+    assert auto_manifest["features_source"] == "device"
+    assert auto_manifest["features"] == ["tfeat:other"]
+    # `g` is `if-feature "not f"` and f is unsupported, so the auto-detected
+    # device set must keep it in the model.
+    assert "G" in (auto / "data_models" / "tfeat.py").read_text()
+
+    opted_out = tmp_path / "opted_out"
+    _run_compiler("restconf", yang, tmp_path, opted_out, ["--no-device-features"])
+    out_manifest = json.loads((opted_out / "MANIFEST.yang-revisions.json").read_text())
+    assert out_manifest["features_source"] == "none"
+    assert out_manifest["features"] == []
+    assert "class G(" not in (opted_out / "data_models" / "tfeat.py").read_text()

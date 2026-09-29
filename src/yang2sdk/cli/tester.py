@@ -67,7 +67,9 @@ def main():
 
     for prop in vars(type(client.data)).values():
         if isinstance(prop, property):
-            navigator = prop.fget(client.data)
+            fget = prop.fget
+            assert fget is not None
+            navigator = fget(client.data)
             print(f"Testing validation sequence on: {navigator._path}")
             logger.info(f"Testing validation sequence on: {navigator._path}")
 

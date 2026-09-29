@@ -11,6 +11,7 @@ import argparse
 import ast
 import sys
 from pathlib import Path
+from typing import cast
 
 
 class ASTCanonicalizer(ast.NodeTransformer):
@@ -33,11 +34,9 @@ class ASTCanonicalizer(ast.NodeTransformer):
             if isinstance(val, ast.Constant) and isinstance(val.value, str):
                 return body[1:]
             # Fallback for older python AST specifications (ast.Str)
-            elif (
-                hasattr(ast, "Str")
-                and isinstance(val, ast.Str)
-                and isinstance(val.s, str)
-            ):  # type: ignore
+            elif isinstance(getattr(val, "s", None), str):
+                # ast.Str is deprecated since 3.8 and untyped; read the
+                # attribute instead of naming the class.
                 return body[1:]
 
         return body
@@ -66,21 +65,21 @@ class ASTCanonicalizer(ast.NodeTransformer):
         return new_body
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        node = self.generic_visit(node)
+        node = cast(ast.Module, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         node.body = self._canonicalize_body(node.body)
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        node = self.generic_visit(node)
+        node = cast(ast.ClassDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         node.body = self._canonicalize_body(node.body)
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        node = self.generic_visit(node)
+        node = cast(ast.FunctionDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         # Execution order inside functions is semantic and is preserved as-is
@@ -89,7 +88,7 @@ class ASTCanonicalizer(ast.NodeTransformer):
     def visit_AsyncFunctionDef(
         self, node: ast.AsyncFunctionDef
     ) -> ast.AsyncFunctionDef:
-        node = self.generic_visit(node)
+        node = cast(ast.AsyncFunctionDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         return node

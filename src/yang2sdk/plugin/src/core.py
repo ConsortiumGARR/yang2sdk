@@ -71,6 +71,13 @@ def _sdk_options() -> list:
             default=[],
             help="Enabled feature mod:feature (repeatable, recorded in MANIFEST).",
         ),
+        optparse.make_option(
+            "--sdk-features-source",
+            dest="sdk_features_source",
+            default="none",
+            help="Where the effective feature set came from: "
+            "device|manual|device+manual|none (recorded in MANIFEST).",
+        ),
     ]
 
 
@@ -149,6 +156,7 @@ def _package_context(ctx, modules, ir_modules, protocol: str) -> dict:
         "modules": mods,
         "deviations": deviations,
         "features": features,
+        "features_source": getattr(ctx.opts, "sdk_features_source", "none") or "none",
         "created_utc": datetime.now(UTC).isoformat(),
     }
 
@@ -404,6 +412,8 @@ def _write_package_files(
         f"- Protocol: `{protocol}`\n"
         f"- Generator: `yang2sdk {pkg['generator_version']}`\n"
         f"- Created (UTC): `{pkg['created_utc']}`\n"
+        f"- Features: source `{pkg['features_source']}` "
+        f"({len(pkg['features'])} enabled)\n"
         "- Secure defaults: `verify=True` (explicit `verify=False` lab-only "
         "with warning); RESTCONF `scheme=https` default.\n"
         "- No credentials, IPs, or CA bundles are embedded; pass auth at runtime.\n\n"

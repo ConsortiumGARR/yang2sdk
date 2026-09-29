@@ -4,9 +4,15 @@ import logging
 import os
 from pathlib import Path
 
+from yang2sdk.cli.features import (
+    FEATURES_FILENAME,
+    parse_capability_features,
+    write_features_file,
+)
+
 try:
     from dotenv import load_dotenv
-    from lxml import etree
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
     from ncclient import manager
 except ImportError as e:
     raise ImportError(
@@ -60,7 +66,7 @@ class YangDownloader:
             "never use the downloader against production"
         )
         try:
-            with manager.connect(
+            with manager.connect(  # type: ignore[union-attr] - ncclient stubs
                 host=self.host,
                 port=self.port,
                 username=self.user,
@@ -68,8 +74,20 @@ class YangDownloader:
                 hostkey_verify=False,
             ) as m:
                 schemas = self.get_schema_list(m)
+                # RFC 6241 Sec 8.3: the <hello> capabilities carry the exact
+                # per-module feature set the device implements. Persist it so a
+                # later compile can reproduce the device's model instead of
+                # pyang's "all features supported" default (see cli/features.py).
+                features = parse_capability_features(m.server_capabilities)
+                write_features_file(
+                    self.output_dir / FEATURES_FILENAME,
+                    features,
+                    source="netconf-hello",
+                )
                 print(
-                    f"[*] Found {len(schemas)} schemas on node. Commencing extraction..."
+                    f"[*] Found {len(schemas)} schemas on node. "
+                    f"Advertised features for {len(features)} module(s). "
+                    "Commencing extraction..."
                 )
 
                 for schema in schemas:

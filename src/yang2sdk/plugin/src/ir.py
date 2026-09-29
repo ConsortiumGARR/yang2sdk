@@ -237,17 +237,44 @@ class IRBuilder:
         ]
         for child in data_children:
             if child.keyword in ["container", "list"]:
+                # `_pydantic_class_name` is the model class name and always
+                # ends with "Item" for a list (set by _build_field), so no
+                # suffix is appended here: the aggregate Data class imports
+                # both the navigator and the model by this name.
                 cls_name = getattr(
                     child, "_pydantic_class_name", self._to_class_name(child.arg)
                 )
                 if child.keyword == "list" and not cls_name.endswith("Item"):
-                    cls_name += "Item"
+                    cls_name += "Item"  # pragma: no cover - only pre-resolve fallbacks
 
                 model = self._build_model(child, cls_name)
                 if model:
                     final_name = self._register_model(model)
                     child._pydantic_class_name = final_name
-                    cls_name = final_name
+
+        if data_children:
+            root_model = self._build_model(
+                self.module, f"{self._to_class_name(self.module.arg)}Data"
+            )
+            if root_model:
+                self._register_model(root_model)
+
+        # Root data properties are emitted *after* the module root model is
+        # built. Building it re-registers every top-level container/list, and
+        # the collision resolver can rename it a second time once the nested
+        # models are known (e.g. System -> System_1 on SR Linux). Both
+        # aggregate `Data` classes (data_models/__init__.py and
+        # data_navigators/__init__.py) import `prop.cls` verbatim, so a name
+        # captured before that step made `client.data.<root>` raise
+        # ImportError at runtime.
+        for child in data_children:
+            if child.keyword in ["container", "list"]:
+                # `cls` is the model class name; the aggregate Data classes
+                # import the navigator (`<cls>Node` / `<cls>ListNode`) and the
+                # model (`<cls>`) by it. It is never re-suffixed here.
+                cls_name = getattr(
+                    child, "_pydantic_class_name", self._to_class_name(child.arg)
+                )
 
                 self.ir.root_data_props.append(
                     IRParentProperty(
@@ -259,13 +286,6 @@ class IRBuilder:
                         ns=self._get_module_namespace(child),
                     )
                 )
-
-        if data_children:
-            root_model = self._build_model(
-                self.module, f"{self._to_class_name(self.module.arg)}Data"
-            )
-            if root_model:
-                self._register_model(root_model)
 
         rpcs = [ch for ch in self.module.i_children if ch.keyword == "rpc"]
         for rpc in rpcs:
@@ -350,9 +370,16 @@ class IRBuilder:
         )
 
         if stmt.keyword == "list":
-            node.item_class_name = (
-                cls_name if cls_name.endswith("Item") else f"{cls_name}Item"
-            )
+            # `item_class_name` is the *model* class name: the navigator
+            # template uses it to import from data_models (the item retrieve
+            # already mixed `node.class_name` and `node.item_class_name`).
+            # Deriving it by appending "Item" to the collision-resolved name
+            # produced `InterfaceItem_1Item` for a model actually named
+            # `InterfaceItem_1` (SR Linux), so every list read raised
+            # ImportError at runtime. `list_class_name` keeps the same
+            # strip-suffix rule the aggregate Data class applies
+            # (data_navigators/__init__.py.jinja) so the two agree.
+            node.item_class_name = cls_name
             node.list_class_name = (
                 node.item_class_name[:-4] + "List"
                 if node.item_class_name.endswith("Item")
@@ -787,7 +814,8 @@ class IRBuilder:
             # module-name-qualified strings.
             return "str", {"_identityref": True}
         elif yt == "string":
-            c = {}
+            # This map carries ints, strs, bools and the "_patterns" list.
+            c: dict[str, Any] = {}
             length = type_stmt.search_one("length")
             if length:
                 match = re.search(r"(\d+)\.\.(\d+)", length.arg)
@@ -860,7 +888,7 @@ class IRBuilder:
                 return self._resolve_type_stmt(typedef_type_stmt, type_stmt.i_typedef)
         return "str", {}
 
-    def _get_default_value(self, stmt) -> str:
+    def _get_default_value(self, stmt) -> str | None:
         default = stmt.search_one("default")
         if not default:
             return None
@@ -986,9 +1014,9 @@ class IRBuilder:
 
     def _resolve_names(self, module):
         """Restore the iterative O(N) collision resolver."""
-        nodes_map = []
+        nodes_map: list[dict[str, Any]] = []
 
-        def collect_nodes(stmt):
+        def collect_nodes(stmt: Any) -> None:
             orig = self._get_original_node(stmt)
             if orig and len(getattr(stmt, "i_children", [])) == len(
                 getattr(orig, "i_children", [])
@@ -1014,17 +1042,19 @@ class IRBuilder:
         for _ in range(30):
             name_registry = {}
             for entry in nodes_map:
-                stmt, suffix, depth = entry["stmt"], entry["suffix"], entry["depth"]
+                stmt: Any = entry["stmt"]
+                suffix: str = entry["suffix"]
+                depth: int = entry["depth"]
                 parts = [self._to_class_name(stmt.arg)]
                 curr = stmt
-                for _ in range(depth):
+                for _ in range(int(depth)):
                     parent = getattr(curr, "parent", None)
                     if parent and parent.keyword not in ("module", "submodule"):
                         parts.insert(0, self._to_class_name(parent.arg))
                         curr = parent
                     else:
                         break
-                full_name = "".join(parts) + suffix
+                full_name = "".join(parts) + str(suffix)
                 entry["current_name"] = full_name
                 name_registry.setdefault(full_name, []).append(entry)
 
@@ -1039,9 +1069,10 @@ class IRBuilder:
                 break
 
         for entry in nodes_map:
-            entry["stmt"]._pydantic_class_name = entry["current_name"]
+            stmt_any: Any = entry["stmt"]
+            stmt_any._pydantic_class_name = entry["current_name"]
 
-        def propagate_names(stmt):
+        def propagate_names(stmt: Any) -> None:
             orig = self._get_original_node(stmt)
             if orig and not getattr(stmt, "_pydantic_class_name", None):
                 orig_name = getattr(orig, "_pydantic_class_name", None)

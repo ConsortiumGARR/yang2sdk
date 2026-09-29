@@ -1,19 +1,117 @@
 {
   "$schema": "notconf-matrix-v1",
   "registry": "ghcr.io/notconf",
-  "credentials": {"username": "admin", "password": "admin"},
-  "transports": {"netconf_port": 830, "restconf_port": 80, "restconf_scheme": "http"},
+  "credentials": {
+    "username": "admin",
+    "password": "admin"
+  },
+  "transports": {
+    "netconf_port": 830,
+    "restconf_port": 80,
+    "restconf_scheme": "http"
+  },
   "images": [
-    {"package": "notconf", "tag": "latest", "smoke": true, "notes": "base image, minimal modules"},
-    {"package": "notconf-ietf", "tag": "latest", "smoke": true, "digest": "sha256:d175ae495b4b0f7b8b99a9eda0b7b0a0f9480e288007c90110e81878bb995b5e", "notes": "IETF device models; no NMDA cap (legacy RFC6241 path); config via /ds/running (RFC8527)"},
-    {"package": "notconf-sros", "tag": "21.10", "smoke": false, "notes": "Nokia SROS"},
-    {"package": "notconf-sros", "tag": "22.2", "smoke": true, "notes": "Nokia SROS latest"},
-    {"package": "notconf-junos", "tag": "21.1R1", "smoke": false, "notes": "Juniper JUNOS"},
-    {"package": "notconf-junos", "tag": "23.4R1", "smoke": true, "notes": "Juniper JUNOS latest"},
-    {"package": "notconf-cisco-xr", "tag": "762", "smoke": false, "notes": "Cisco IOS XR"},
-    {"package": "notconf-cisco-xr", "tag": "771", "smoke": false, "notes": "Cisco IOS XR"},
-    {"package": "notconf-cisco-xr", "tag": "2411", "smoke": true, "notes": "Cisco IOS XR latest-ish"},
-    {"package": "notconf-cisco-xr", "tag": "2531", "smoke": false, "notes": "Cisco IOS XR"},
-    {"package": "notconf-cisco-nx", "tag": "10.4-4", "smoke": true, "notes": "Cisco NX-OS"}
+    {
+      "package": "notconf",
+      "tag": "latest",
+      "smoke": true,
+      "notes": "base image, minimal modules"
+    },
+    {
+      "package": "notconf-ietf",
+      "tag": "latest",
+      "smoke": true,
+      "digest": "sha256:d175ae495b4b0f7b8b99a9eda0b7b0a0f9480e288007c90110e81878bb995b5e",
+      "notes": "IETF device models; no NMDA cap (legacy RFC6241 path); config via /ds/running (RFC8527)"
+    },
+    {
+      "package": "notconf-sros",
+      "tag": "21.10",
+      "smoke": false,
+      "notes": "Nokia SROS"
+    },
+    {
+      "package": "notconf-sros",
+      "tag": "22.2",
+      "smoke": true,
+      "notes": "Nokia SROS latest"
+    },
+    {
+      "package": "notconf-junos",
+      "tag": "21.1R1",
+      "smoke": false,
+      "notes": "Juniper JUNOS"
+    },
+    {
+      "package": "notconf-junos",
+      "tag": "23.4R1",
+      "smoke": true,
+      "notes": "Juniper JUNOS latest"
+    },
+    {
+      "package": "notconf-cisco-xr",
+      "tag": "762",
+      "smoke": false,
+      "notes": "Cisco IOS XR"
+    },
+    {
+      "package": "notconf-cisco-xr",
+      "tag": "771",
+      "smoke": false,
+      "notes": "Cisco IOS XR"
+    },
+    {
+      "package": "notconf-cisco-xr",
+      "tag": "2411",
+      "smoke": true,
+      "notes": "Cisco IOS XR latest-ish"
+    },
+    {
+      "package": "notconf-cisco-xr",
+      "tag": "2531",
+      "smoke": false,
+      "notes": "Cisco IOS XR"
+    },
+    {
+      "package": "notconf-cisco-nx",
+      "tag": "10.4-4",
+      "smoke": true,
+      "notes": "Cisco NX-OS"
+    }
+  ],
+  "devices": [
+    {
+      "kind": "device",
+      "id": "g30",
+      "env": "LAB_DEVICE",
+      "smoke": false,
+      "roots": [
+        "ne"
+      ],
+      "yang_dir": "temp/yang_modules/g30",
+      "read_subtree": "ne",
+      "write_subtree": "",
+      "notes": "Groove G30 optical transport, real shared lab device. libnetconf2/sysrepo backend: writable-running only, no candidate/startup/confirmed-commit/NMDA/yang-library, 118 coriant.com namespaces. Deviations: undeclared @cli-name attribute on data nodes; invalid XPath in etyn `when`; non-XSD pattern in coriant-rpc.",
+      "ignore_errors": [
+        "XPATH_SYNTAX_ERROR",
+        "PATTERN_ERROR"
+      ],
+      "read_path": [
+        "shelf"
+      ]
+    },
+    {
+      "kind": "device",
+      "id": "srl",
+      "env": "SRL_DEVICE",
+      "smoke": false,
+      "roots": [],
+      "yang_dir": "temp/yang_modules/srl-live",
+      "read_subtree": "system",
+      "write_subtree": "system",
+      "notes": "Nokia SR Linux in containerlab (LAB ONLY). NMDA + candidate, confirmed-commit advertised, shared candidate datastore: auto_commit must stay False.",
+      "ignore_errors": [],
+      "read_path": []
+    }
   ]
 }

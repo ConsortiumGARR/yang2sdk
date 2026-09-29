@@ -8,8 +8,22 @@ import re
 
 NETCONF_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
 
-class NetconfXmlModel(BaseXmlModel):
-    """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml."""
+class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
+    """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml.
+
+    search_mode='unordered' is inherited by every generated model
+    (pydantic-xml model.py: __xml_search_mode__ falls back to the parent
+    class). The default STRICT search is a single forward-only cursor with
+    exact tag equality, so the *first* child the model does not know stalls
+    the cursor and turns every later sibling into `extra_forbidden` — a
+    single if-feature mismatch produced 127 phantom errors on SR Linux.
+    A client must not depend on the order in which a server emits sibling
+    data nodes: RFC 7950 Sec 7.7.1 lets the server sort list entries "in any
+    reasonable order", and RFC 6241 Sec 5.2 treats the <config> contents as
+    opaque data. UNORDERED consumes each match out of order while keeping
+    the consumed prefix contiguous, so `_check_extra` still detects genuine
+    unknown elements.
+    """
     
     @classmethod
     def from_xml(cls, source: str | bytes, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:

@@ -59,4 +59,6 @@ exclude = ["temp", ".venv", ".ruff_cache"]
 # temp/ output is excluded; Python version comes from .python-version/.venv.
 
 [tool.pyrefly]
-project-excludes = ["temp/**", ".venv/**"]
+# tests/srl/clab-*/ is containerlab runtime state (node config, broken
+# symlinks into the container FS) — ephemeral, never committed.
+project-excludes = ["temp/**", ".venv/**", "tests/srl/clab-*/**"]
