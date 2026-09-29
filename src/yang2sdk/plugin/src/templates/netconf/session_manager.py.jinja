@@ -8,6 +8,31 @@ from ncclient.operations import RPCError
 from lxml import etree
 
 log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
+
+_SENSITIVE_KEYS = ("password", "passwd", "secret", "token", "auth", "community", "private-key")
+
+
+def _redact(obj: Any, _depth: int = 0) -> Any:
+    """Redact sensitive values and truncate payloads for safe logging."""
+    if _depth > 4:
+        return "...[truncated depth]"
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and any(s in k.lower() for s in _SENSITIVE_KEYS):
+                out[k] = "***redacted***"
+            else:
+                out[k] = _redact(v, _depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_redact(v, _depth + 1) for v in obj][:50]
+    if isinstance(obj, str) and len(obj) > 2000:
+        return obj[:2000] + f"...[truncated {len(obj) - 2000} chars]"
+    if isinstance(obj, bytes) and len(obj) > 2000:
+        return obj[:2000] + f"...[truncated {len(obj) - 2000} bytes]".encode()
+    return obj
+
 
 def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, str]) -> etree._Element:
     """Declare xmlns for module-name prefixes used in identityref/instance-identifier values.
@@ -29,15 +54,42 @@ def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, s
     return element
 
 class NetconfClient:
-    """Production-ready NETCONF API client wrapping ncclient."""
+    """Production-ready NETCONF API client wrapping ncclient.
 
-    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = False, timeout: int = 60, auto_commit: bool = True, **kwargs):
+    Swappable with RestconfClient: core kwargs (loopback_ip, management_ip,
+    port, username, password, verify, log_bodies, timeout) share names and
+    secure defaults; protocol extras live in **kwargs (auto_commit here,
+    scheme on RESTCONF).
+    """
+
+    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = True, log_bodies: bool = False, **kwargs):
+        # Back-compat alias: older generated code / call sites used
+        # hostkey_verify explicitly. `verify` wins when both are given.
+        if "hostkey_verify" in kwargs:
+            import warnings
+
+            alias_val = kwargs.pop("hostkey_verify")
+            warnings.warn("hostkey_verify is deprecated; use verify", DeprecationWarning, stacklevel=2)
+            if verify is True and alias_val is False:
+                verify = False
+        if "scheme" in kwargs:
+            # Swallow RESTCONF-only kwarg for swap parity.
+            log.debug("Ignoring protocol-specific kwarg for NETCONF: scheme")
+            kwargs.pop("scheme")
         self.host = loopback_ip or management_ip
         self.port = port
-        self.username = username or os.environ.get("DEVICE_USER")
-        self.password = password or os.environ.get("DEVICE_PASS")
+        self.username = username or os.environ.get("DEVICE_USER") or os.environ.get("DEVICE_USERNAME")
+        self.password = password or os.environ.get("DEVICE_PASS") or os.environ.get("DEVICE_PASSWORD")
         self.auto_commit = auto_commit
-        
+        self.log_bodies = log_bodies
+        if kwargs:
+            log.debug("Ignoring unknown kwargs for NETCONF: %s", sorted(kwargs))
+
+        if not verify:
+            log.warning("NETCONF hostkey_verify=False (verify=False) is an explicit lab-only opt-out; never use in production.")
+        if log_bodies:
+            log.warning("NETCONF log_bodies=True may log config/secrets; debug use only, never in production.")
+
         if not self.host:
             raise ValueError("Either loopback_ip or management_ip must be provided")
 
@@ -107,6 +159,8 @@ class NetconfClient:
     def _handle_rpc(self, func, *args, **kwargs) -> Any:
         """Centralized error handling for ncclient operations."""
         try:
+            # AGENTS.md Safety: payloads never at INFO; DEBUG opt-in only.
+            log.info("NETCONF dispatch: %s", getattr(func, "__name__", "rpc"))
             return func(*args, **kwargs)
         except RPCError as e:
             # Transform ncclient XML exceptions into standard Python runtime exceptions
@@ -201,6 +255,8 @@ class NetconfClient:
                 conf.append(config_xml)
 
             bind_module_prefixes(rpc, self.module_namespaces)
+            if self.log_bodies:
+                log.debug("NETCONF edit-data: %s", _redact(etree.tostring(rpc)))
             reply = self._handle_rpc(self._manager.dispatch, rpc)
             success = reply.ok
 
@@ -222,6 +278,8 @@ class NetconfClient:
                 conf.append(config_xml)
 
             bind_module_prefixes(rpc, self.module_namespaces)
+            if self.log_bodies:
+                log.debug("NETCONF edit-config: %s", _redact(etree.tostring(rpc)))
             reply = self._handle_rpc(self._manager.dispatch, rpc)
             success = reply.ok
 
@@ -242,5 +300,7 @@ class NetconfClient:
 
     def rpc(self, rpc_xml: etree._Element) -> etree._Element:
         bind_module_prefixes(rpc_xml, self.module_namespaces)
+        if self.log_bodies:
+            log.debug("NETCONF rpc: %s", _redact(etree.tostring(rpc_xml)))
         reply = self._handle_rpc(self._manager.dispatch, rpc_xml)
         return reply.ele

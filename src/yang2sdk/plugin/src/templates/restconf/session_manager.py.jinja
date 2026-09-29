@@ -48,8 +48,38 @@ class TCPKeepAliveAdapter(HTTPAdapter):
         return options
 
 
+_SENSITIVE_KEYS = ("password", "passwd", "secret", "token", "auth", "community", "private-key")
+
+
+def _redact(obj: Any, _depth: int = 0) -> Any:
+    """Redact sensitive values and truncate bodies for safe logging.
+
+    Never logs credentials; bodies only at DEBUG behind log_bodies opt-in.
+    """
+    if _depth > 4:
+        return "...[truncated depth]"
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and any(s in k.lower() for s in _SENSITIVE_KEYS):
+                out[k] = "***redacted***"
+            else:
+                out[k] = _redact(v, _depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_redact(v, _depth + 1) for v in obj][:50]
+    if isinstance(obj, str) and len(obj) > 2000:
+        return obj[:2000] + f"...[truncated {len(obj) - 2000} chars]"
+    return obj
+
+
 class RestconfClient:
-    """Restconf API client."""
+    """Restconf API client.
+
+    Swappable with NetconfClient: core kwargs (loopback_ip, management_ip,
+    port, username, password, verify, log_bodies, timeout) share names and
+    secure defaults; protocol extras live in **kwargs (scheme here).
+    """
 
     def __init__(
         self,
@@ -60,9 +90,16 @@ class RestconfClient:
         password: str | None = None,
         verify: bool = True,
         scheme: str = "https",
+        log_bodies: bool = False,
+        timeout: tuple[int, int] | int = (10, 2400),
+        **kwargs: Any,
     ):
         self.url = None
         self.fallback_url = None
+        self.log_bodies = log_bodies
+        if kwargs:
+            # Swallow NETCONF-only kwargs (e.g. auto_commit) for swap parity.
+            log.debug("Ignoring protocol-specific kwargs for RESTCONF: %s", sorted(kwargs))
 
         if scheme not in ("http", "https"):
             raise ValueError("scheme must be 'http' or 'https'")
@@ -70,6 +107,10 @@ class RestconfClient:
             # Explicit plaintext opt-out for lab/simulators (e.g. notconf
             # exposes RESTCONF over plain HTTP on port 80). Never the default.
             log.warning("RESTCONF using plaintext HTTP (verify/TLS disabled by scheme). Lab/simulator use only.")
+        if not verify:
+            log.warning("RESTCONF verify=False is an explicit opt-out for lab/self-signed use; never use in production.")
+        if log_bodies:
+            log.warning("RESTCONF log_bodies=True may log config/secrets; debug use only, never in production.")
 
         self.urls = []
         if loopback_ip:
@@ -86,12 +127,12 @@ class RestconfClient:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
-        self._session.verify = verify  # Warning: production risk if False
+        self._session.verify = verify
         self._session.trust_env = verify  # Disable env vars if TLS verification is off
         self._session.headers.update({"Content-Type": "application/yang-data+json"})
 
-        user = username or os.environ.get("DEVICE_USERNAME")
-        pw = password or os.environ.get("DEVICE_PASSWORD")
+        user = username or os.environ.get("DEVICE_USERNAME") or os.environ.get("DEVICE_USER")
+        pw = password or os.environ.get("DEVICE_PASSWORD") or os.environ.get("DEVICE_PASS")
         if not user or not pw:
             raise UserWarning("Authentication credentials missing.")
         self._session.auth = (user, pw)
@@ -100,6 +141,7 @@ class RestconfClient:
 
         self.data = Data(self, "/data", "")
         self.operations = Operations(self, "/operations", "")
+        self._timeout = timeout
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         """Make authenticated API request."""
@@ -108,12 +150,16 @@ class RestconfClient:
         for base_url in self.urls:
             url = base_url + path
             try:
-                msg = f"Request: {method} {url} {kwargs}"
-                log.info(msg)
-                response = self._session.request(method, url, timeout=(10, 2400), **kwargs)
+                # AGENTS.md Safety: full bodies never at INFO in production
+                # paths; method+URL+status at INFO, bodies at DEBUG opt-in.
+                log.info("Request: %s %s", method, url)
+                if self.log_bodies:
+                    log.debug("Request body: %s", _redact(kwargs.get("json")))
+                response = self._session.request(method, url, timeout=self._timeout, **kwargs)
 
-                msg = f"Response ({response.status_code}): {response.text}"
-                log.info(msg)
+                log.info("Response: %s", response.status_code)
+                if self.log_bodies:
+                    log.debug("Response body: %s", _redact(response.text))
                 response.raise_for_status()
                 return response.json() if response.text.strip() else {}
 
@@ -124,11 +170,11 @@ class RestconfClient:
                 continue  # Try the next URL in self.urls
 
             except requests.HTTPError as e:
-                # Capture the response body for debugging before crashing
                 status = e.response.status_code
-                text = e.response.text
-                msg = f"HTTP {status} Error: {text}"
-                log.exception(msg)
+                log.warning("HTTP %s on %s %s", status, method, url)
+                if self.log_bodies:
+                    log.debug("HTTP %s body: %s", status, _redact(e.response.text))
+                msg = f"HTTP {status} Error: {e.response.text}"
                 raise requests.HTTPError(msg, response=e.response) from e
 
         # If we get here, all URLs failed

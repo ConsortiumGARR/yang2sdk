@@ -86,6 +86,7 @@ class IRModule:
     name: str
     py_name: str
     namespace: str = ""
+    revision: str = ""
     imports_nsmap: dict[str, str] = field(default_factory=dict)
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
@@ -126,10 +127,12 @@ class IRBuilder:
                         imports_nsmap[prefix_stmt.arg] = ns_stmt.arg
         # ----------------------------------------------------------------------
 
+        rev = module.search_one("revision")
         self.ir = IRModule(
             name=module.arg,
             py_name=module.arg.replace("-", "_"),
             namespace=ns.arg if ns else "urn:unknown",
+            revision=rev.arg if rev else "",
             imports_nsmap=imports_nsmap,  # Pass the map to the IR
         )
 

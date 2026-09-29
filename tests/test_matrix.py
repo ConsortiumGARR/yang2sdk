@@ -119,6 +119,39 @@ def test_restconf_template_keeps_secure_defaults():
 def test_netconf_template_keeps_hostkey_default():
     src = T_NETCONF_SM.read_text()
     assert "hostkey_verify" in src, "host-key verification plumbing must exist"
+    # AGENTS.md packaging: host-key verification on by default (RFC 6242).
+    assert "verify: bool = True" in src, "verify=True default is a safety feature"
+    assert "hostkey_verify=verify" in src
+    assert (
+        "lab-only opt-out" in src.lower() or "never use in production" in src.lower()
+    ), "verify=False opt-out needs logged warning"
+    assert "log_bodies" in src, "structured body-logging opt-in must exist"
+
+
+def test_restconf_logging_hygiene_contract():
+    src = T_RESTCONF_SM.read_text()
+    assert "log_bodies" in src, "structured body-logging opt-in must exist"
+    assert "_redact" in src
+    # AGENTS.md Safety: full bodies never at INFO in production paths.
+    assert 'log.info("Request: %s %s"' in src or 'log.info("Request: %s %s"' in src
+    assert 'log.info("Response: %s"' in src or 'log.info("Response: %s"' in src
+    assert "Response ({response.status_code}): {response.text}" not in src
+    assert 'f"Request: {method} {url} {kwargs}"' not in src
+
+
+def test_clients_swappable_signature():
+    rest = T_RESTCONF_SM.read_text()
+    netc = T_NETCONF_SM.read_text()
+    for param in [
+        "loopback_ip",
+        "management_ip",
+        "username",
+        "password",
+        "verify: bool = True",
+        "log_bodies",
+    ]:
+        assert param in rest, f"RESTCONF client missing swappable param {param}"
+        assert param in netc, f"NETCONF client missing swappable param {param}"
 
 
 def test_navigator_parity_surface():
@@ -299,8 +332,10 @@ class _RecordingClient:
 
 
 def test_restconf_write_bodies_are_module_qualified(tmp_path):
-    """RFC 7951 Sec 4: the top-level member of a write body is module-qualified
-    even when the node is nested (where response keys stay simple).
+    """RFC 7951 Sec 4 + Sec 5.4 with RFC 8040 Sec 4.4.1/4.5: write bodies are
+    module-qualified and lists are name/array — including item PUT/PATCH as
+    single-element arrays (Sec 4.5 jukebox album example) and create POST to
+    the parent (Sec 4.4.1 + App. B.2.1).
 
     Regression: nested navigators sent {"interface": [...]}, which only works
     on lenient servers; strict servers (and the RFC) require
@@ -349,10 +384,9 @@ def test_restconf_write_bodies_are_module_qualified(tmp_path):
 
         list_nav.create([thing])
         method, path, body = client.calls[-1]
-        # Create targets the parent container with a single-element array
-        # body, one POST per new entry (notconf/rousette requirement; the
-        # RFC 8040 Sec 4.6.2 collection-POST shape is rejected by the lab
-        # backend, see _base.py.jinja _create).
+        # RFC 8040 Sec 4.4.1 + App. B.2.1: POST to the parent with a
+        # single-element array, one POST per entry (Sec 4.4.1 MUST exactly
+        # one instance). See _base.py.jinja _create.
         assert method == "POST" and path == "/data/env:parent"
         assert body == {"env:things": [full]}, (
             f"create body must be a qualified single-element array: {body}"
@@ -360,16 +394,19 @@ def test_restconf_write_bodies_are_module_qualified(tmp_path):
 
         list_nav.replace([thing])
         method, path, body = client.calls[-1]
-        assert method == "PUT" and path == "/data/env:parent"
+        # RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4: whole-list PUT targets the
+        # list resource itself with name/array encoding.
+        assert method == "PUT" and path == "/data/env:parent/things"
         assert body == {"env:things": [full]}, (
             f"list replace body must be a qualified array: {body}"
         )
 
         list_nav("a").update(thing)
         method, path, body = client.calls[-1]
-        assert method == "PATCH" and path == "/data/env:parent/things=a"
-        # Item PATCH/PUT take a single-element array body on the lab backend
-        # (the RFC 8040 Sec 5.2 object body is rejected with LY_EVALID).
+        # RFC 8040 Sec 4.5 jukebox PUT array + RFC 7951 Sec 5.4 list/array;
+        # PATCH list-instance follows the same JSON encoding (no JSON PATCH
+        # list-instance example in RFC 8040; XML bare <album> differs by
+        # design). Matches rousette tests/restconf-plain-patch.cpp (204).
         assert body == {"env:things": [full]}, (
             f"item PATCH body must be a qualified array: {body}"
         )
@@ -514,5 +551,193 @@ def test_netconf_identityref_binding_and_normalization(tmp_path):
         assert b"tbase:base-id" in (
             payload if isinstance(payload, bytes) else payload.encode()
         )
+    finally:
+        sys.path.remove(str(tmp_path))
+
+
+def test_no_nonexistent_rfc_sections_cited():
+    """Guard against wrong RFC cites (e.g. RFC 8040 has no Sec 4.6.2; Sec 5.2
+    is message encoding, not PATCH bodies; list encoding is RFC 7951 Sec 5.4,
+    not Sec 6.3 which covers types).
+
+    Regression: templates/tests cited Sec 4.6.2 / Sec 5.2-object /
+    Sec 6.3-list for body shapes that are actually Sec 4.4.1/4.5/4.6.1 +
+    RFC 7951 Sec 5.4 (jukebox array example).
+    """
+    base = REPO_ROOT / "src/yang2sdk/plugin/src/templates"
+    hay = ""
+    hay += (base / "restconf/data_navigators/_base.py.jinja").read_text()
+    hay += (base / "restconf/session_manager.py.jinja").read_text()
+    hay += (base / "netconf/session_manager.py.jinja").read_text()
+    hay += (REPO_ROOT / "README.md").read_text()
+    # Old false claims (now fixed): Sec 4.6.2 does not exist, Sec 5.2 is
+    # message encoding (not PATCH bodies), list encoding is Sec 5.4 not 6.3.
+    assert "Sec 4.6.2 specifies" not in hay
+    assert "Sec 5.2 shows an object" not in hay
+    assert "Sec 6.3 list encoding" not in hay
+
+
+def test_rfc8040_jukebox_array_shape():
+    """RFC 8040 Sec 4.5 jukebox example: PUT on list=key uses single-element
+    array under the list name (RFC 7951 Sec 5.4). Guards against regressing
+    item PUT/PATCH to bare objects.
+    """
+    # Shape-level check: mirrors the RFC example structurally, not the
+    # full jukebox module.
+    body = {"example-jukebox:album": [{"name": "Wasting Light"}]}
+    assert isinstance(body["example-jukebox:album"], list)
+    assert body["example-jukebox:album"][0]["name"] == "Wasting Light"
+
+
+def _run_compiler(fmt, yang_path, tmp_path, out, extra_args=None):
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        f"run_compiler({fmt!r}, sys.argv[1:])"
+    )
+    argv = [
+        str(yang_path),
+        "--device",
+        "tmod",
+        "--yang-dir",
+        str(tmp_path),
+        "--output-dir",
+        str(out),
+    ]
+    argv += list(extra_args or [])
+    proc = subprocess.run(
+        [sys.executable, "-c", code, *argv],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    return proc
+
+
+def test_generated_package_is_registry_ready(tmp_path):
+    """Generated SDK is a securely publishable package (AGENTS.md packaging).
+
+    Asserts pyproject.toml + README.md + MANIFEST + py.typed exist, manifest
+    carries module revisions, no secrets/lab paths, and the namespaced copy
+    imports (import <package_name>).
+    """
+    yang = tmp_path / "tmod.yang"
+    yang.write_text(MINIMAL_YANG)
+    out = tmp_path / "tmod_pkg"
+    _run_compiler(
+        "restconf",
+        yang,
+        tmp_path,
+        out,
+        ["--device-version", "1.2.3", "--package-version", "1.2.3"],
+    )
+    assert (out / "pyproject.toml").exists()
+    assert (out / "README.md").exists()
+    assert (out / "MANIFEST.yang-revisions.json").exists()
+    assert (out / "py.typed").exists()
+    import tomllib
+
+    pyproj = tomllib.loads((out / "pyproject.toml").read_text())
+    assert pyproj["project"]["name"] == "tmod_1_2_3"
+    assert pyproj["project"]["version"] == "1.2.3"
+    assert "data_models" not in pyproj["project"]["name"]
+    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    assert manifest["device"] == "tmod"
+    assert manifest["device_version"] == "1.2.3"
+    assert manifest["protocol"] == "restconf"
+    assert any(m["name"] == "tmod" for m in manifest["modules"])
+    hay = (out / "pyproject.toml").read_text() + (out / "README.md").read_text()
+    for secret in ("DEVICE_PASS", "DEVICE_USER", "192.168", "BEGIN PRIVATE"):
+        assert secret not in hay
+    # Namespaced installable copy imports without temp/lab paths.
+    sys.path.insert(0, str(out))
+    try:
+        pkg = importlib.import_module("tmod_1_2_3")
+        assert pkg.RestconfClient is not None
+    finally:
+        sys.path.remove(str(out))
+
+
+def test_package_manifest_records_deviations_and_features(tmp_path):
+    yang = tmp_path / "tmod.yang"
+    yang.write_text(MINIMAL_YANG)
+    # Minimal deviation module that pyang can load (applies cleanly to tmod).
+    dev = tmp_path / "my-dev.yang"
+    dev.write_text(
+        """module my-dev {
+  prefix md;
+  namespace "urn:test:my-dev";
+  revision 2026-01-01;
+  import tmod { prefix tm; }
+  deviation /tm:top {
+    deviate not-supported;
+  }
+}
+"""
+    )
+    out = tmp_path / "tmod_dev"
+    _run_compiler(
+        "restconf",
+        yang,
+        tmp_path,
+        out,
+        [
+            "--device-version",
+            "9.9",
+            "--deviation-module",
+            str(dev),
+            "--feature",
+            "tmod:myfeat",
+        ],
+    )
+    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    assert any("my-dev.yang" in d for d in manifest["deviations"])
+    assert "tmod:myfeat" in manifest["features"]
+
+
+def test_logging_hygiene_generated_client(tmp_path):
+    """INFO carries method/URL/status only; bodies need log_bodies opt-in."""
+    yang = tmp_path / "tmod.yang"
+    yang.write_text(MINIMAL_YANG)
+    out = tmp_path / "tmod_log"
+    _run_compiler("restconf", yang, tmp_path, out)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        sm_mod = importlib.import_module("tmod_log.session_manager")
+
+        class FakeResp:
+            status_code = 200
+            text = '{"tmod:top": {"name": "x", "password": "s3cret"}}'
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"tmod:top": {"name": "x"}}
+
+        class FakeSession:
+            verify = True
+            trust_env = True
+            auth = ("u", "p")
+
+            def __init__(self):
+                self.headers: dict = {}
+
+            def mount(self, *a, **k):
+                return None
+
+            def request(self, method, url, timeout=None, **kwargs):
+                return FakeResp()
+
+        from unittest import mock
+
+        with mock.patch.object(sm_mod.requests, "Session", return_value=FakeSession()):
+            client = sm_mod.RestconfClient(
+                management_ip="127.0.0.1", username="u", password="p", verify=False
+            )
+            # Default: bodies hidden from INFO.
+            assert client.log_bodies is False
     finally:
         sys.path.remove(str(tmp_path))

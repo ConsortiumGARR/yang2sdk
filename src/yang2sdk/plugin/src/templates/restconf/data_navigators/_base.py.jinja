@@ -229,11 +229,13 @@ class ItemNode:
             for k, v in kwargs.items()
             if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
         }
-        # The target backend (notconf/rousette) requires a single-element
-        # array body for item PATCH/PUT (evidence:
-        # ghcr.io/notconf/notconf-ietf:latest, 2026-09-28); a bare object
-        # body is rejected with LY_EVALID. RFC 8040 Sec 5.2 shows an object
-        # body, so this is a documented device deviation.
+        # RFC 8040 Sec 4.5 PUT list-instance JSON is a single-element array
+        # (jukebox album example); RFC 7951 Sec 5.4 encodes a list as
+        # name/array of objects and Sec 3 requires a top-level object.
+        # PATCH on a list instance has no JSON example in RFC 8040 (only XML
+        # bare <album>); the array form follows the same JSON encoding and
+        # matches rousette tests/restconf-plain-patch.cpp (204). XML is bare
+        # <album> — JSON/XML differ here by design, not by deviation.
         data = {self._envelope_name: [kwargs]}
         return self._client._request("PATCH", self._path, json=data)
 
@@ -243,6 +245,7 @@ class ItemNode:
             for k, v in kwargs.items()
             if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
         }
+        # Same encoding as _update: RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4.
         data = {self._envelope_name: [kwargs]}
         return self._client._request("PUT", self._path, json=data)
 
@@ -354,27 +357,27 @@ class ListNode(Generic[TNode]):
         return data_list
 
     def _create(self, data_list: list[dict[str, Any]]) -> None:
-        # One POST per new entry, targeting the parent container with a
-        # single-element array body. Evidence (notconf/rousette,
-        # ghcr.io/notconf/notconf-ietf:latest, 2026-09-28): POST to the
-        # collection resource is rejected (400 "requires 1 keys"), a
-        # multi-entry body is rejected ("MUST contain exactly one instance"),
-        # and POST to the parent with a one-element array returns 201.
-        # RFC 8040 Sec 4.6.2 specifies POST to the collection resource with
-        # one entry, so this is a documented device deviation.
+        # RFC 8040 Sec 4.4.1: POST targets the parent (collection holder) and
+        # the body MUST contain exactly one instance. Appendix B.2.1 shows
+        # POST .../library -> {"example-jukebox:artist": [{"name": ...}]}.
+        # Hence one POST per entry to the parent URL with a single-element
+        # array (RFC 7951 Sec 5.4). Key-mismatch / multi-entry rejections
+        # ("requires N keys", "MUST contain exactly one instance",
+        # "List key mismatch") enforce RFC 8040 Sec 3.5.3 / Sec 4.5.
         url = self._path.removesuffix(f"/{self._name}")
         for item in data_list:
             self._client._request("POST", url, json={self._envelope_name: [item]})
 
     def _replace(self, data_list: list[dict[str, Any]]) -> None:
-        # Whole-list replace: PUT to the parent container with the RFC 7951
-        # Sec 6.3 list encoding. Note: notconf/rousette rejects this list-keyed
-        # body (LY_EVALID, 2026-09-28 probe); it only accepts a container-encoded
-        # body, which would also replace sibling children. So this bulk op is
-        # not exercised by the item-level CRUD tests.
-        url = self._path.removesuffix(f"/{self._name}")
+        # Whole-list replace: PUT targets the list resource itself with the
+        # RFC 7951 Sec 5.4 list encoding (RFC 8040 Sec 4.5: body MUST represent
+        # the target resource). PUT to the parent container with a list-keyed
+        # body is malformed (target is the container, body must be the
+        # container) and correctly yields LY_EVALID — that prior shape was a
+        # client bug, not a server deviation. Bulk replace is not exercised
+        # by the item-level CRUD tests.
         envelope = {self._envelope_name: data_list}
-        return self._client._request("PUT", url, json=envelope)
+        return self._client._request("PUT", self._path, json=envelope)
 
     def delete(self) -> None:
         return self._client._request("DELETE", self._path)

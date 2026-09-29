@@ -38,6 +38,11 @@ class Compiler:
         yangs_dir: Path,
         yang_modules: list[Path],
         config_only: bool = False,
+        device: str = "",
+        device_version: str = "",
+        package_version: str = "",
+        deviation_modules: list[Path] | None = None,
+        features: list[str] | None = None,
     ) -> None:
         self.format: Literal["restconf", "netconf"] = format_type
         self.output_dir: Path = Path(output_dir)
@@ -45,6 +50,13 @@ class Compiler:
         self.yangs_dir: Path = Path(yangs_dir)
         self.yang_modules: list[Path] = [Path(m) for m in yang_modules]
         self.config_only: bool = config_only
+        self.device: str = device
+        self.device_version: str = device_version
+        self.package_version: str = package_version
+        self.deviation_modules: list[Path] = [
+            Path(m) for m in (deviation_modules or [])
+        ]
+        self.features: list[str] = list(features or [])
 
     def compile(self) -> None:
         """Executes the compiler inside a safely isolated sys.argv context block."""
@@ -63,6 +75,18 @@ class Compiler:
 
         if self.config_only:
             injected_args.append("--sdk-config-only")
+        if self.device:
+            injected_args.extend(["--sdk-device", self.device])
+        if self.device_version:
+            injected_args.extend(["--sdk-device-version", self.device_version])
+        if self.package_version:
+            injected_args.extend(["--sdk-package-version", self.package_version])
+        for dev in self.deviation_modules:
+            # Native pyang deviation application + provenance recording.
+            injected_args.extend(["--deviation-module", str(dev)])
+            injected_args.extend(["--sdk-deviation-module", str(dev)])
+        for feat in self.features:
+            injected_args.extend(["--sdk-feature", feat])
 
         injected_args.extend(str(module_path) for module_path in self.yang_modules)
 
@@ -110,6 +134,30 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         help="Configure output schemas to serialize and validate config-only nodes.",
     )
     parser.add_argument(
+        "--device-version",
+        default=os.environ.get("DEVICE_VERSION", ""),
+        help="Device OS version for package provenance (MANIFEST + package name).",
+    )
+    parser.add_argument(
+        "--package-version",
+        default="",
+        help="PEP440 package version (defaults to device version).",
+    )
+    parser.add_argument(
+        "--deviation-module",
+        dest="deviation_modules",
+        action="append",
+        default=[],
+        help="Deviation module applied by pyang (repeatable, recorded in MANIFEST).",
+    )
+    parser.add_argument(
+        "--feature",
+        dest="features",
+        action="append",
+        default=[],
+        help="Enabled feature as mod:feature (repeatable, recorded in MANIFEST).",
+    )
+    parser.add_argument(
         "yang_modules",
         nargs="+",
         help="Target YANG file paths to parse and convert.",
@@ -154,6 +202,11 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         yangs_dir=yangs_dir,
         yang_modules=[Path(m) for m in parsed_args.yang_modules],
         config_only=parsed_args.config_only,
+        device=parsed_args.device,
+        device_version=parsed_args.device_version,
+        package_version=parsed_args.package_version,
+        deviation_modules=[Path(m) for m in parsed_args.deviation_modules],
+        features=list(parsed_args.features),
     )
     compiler.compile()
 
