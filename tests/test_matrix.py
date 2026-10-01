@@ -2282,24 +2282,37 @@ def test_restconf_client_close_is_symmetric_with_netconf(tmp_path):
 def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
     """No generated client may be constructible without credentials.
 
-    Credentials resolve from caller args, else DEVICE_USER ->
-    DEVICE_USERNAME / DEVICE_PASS -> DEVICE_PASSWORD. RESTCONF used to
-    `raise UserWarning` -- a Warning subclass used as an exception, so
-    `except ValueError` never saw it -- while NETCONF did not raise at all
-    and handed None to `manager.connect()`, failing later with an opaque SSH
-    error. Both now fail at construction with ValueError, in the same
-    resolution order (the two templates used to read the pairs in opposite
-    order, so a host exporting both names authenticated as two identities
-    depending on the transport).
+    Credentials resolve from caller args, else DEVICE_USER / DEVICE_PASS --
+    the same names `.env.example`, `cli/downloader.py`, `cli/tester.py` and
+    the lab matrix already read, so one `.env` serves every consumer.
+
+    Two defects are pinned here. RESTCONF used to `raise UserWarning` -- a
+    Warning subclass used as an exception, so `except ValueError` never saw
+    it -- while NETCONF did not raise at all and handed None to
+    `manager.connect()`, failing later with an opaque SSH error. Both now fail
+    at construction with ValueError.
+
+    The retired long form is asserted *inert* below rather than merely
+    removed: it used to be the only name this template read, so a generated
+    client could not use the `.env` the project told you to copy. A
+    two-name alias was added, then the two templates resolved the pairs in
+    opposite order, so a host exporting both authenticated as two different
+    identities depending on transport. One name removes the hazard, and the
+    `delenv` below keeps it from creeping back unnoticed.
 
     `monkeypatch.delenv` is what makes this hermetic: conftest loads an
     untracked local `.env` into os.environ at import, and without clearing
-    these names the assertions below would pass on a developer machine and
-    fail in CI -- exactly the bug this test pins down.
+    these names the assertions would pass on a developer machine and fail in
+    CI -- exactly the bug this test pins down.
     """
     from unittest import mock
 
-    for var in ("DEVICE_USER", "DEVICE_USERNAME", "DEVICE_PASS", "DEVICE_PASSWORD"):
+    for var in (
+        "DEVICE_USER",
+        "DEVICE_PASS",
+        "DEVICE_USERNAME",
+        "DEVICE_PASSWORD",
+    ):
         monkeypatch.delenv(var, raising=False)
 
     rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tcred")
@@ -2312,11 +2325,9 @@ def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="credentials"):
         netc.NetconfClient(management_ip="127.0.0.1")
 
-    # The documented env fallback still works, and the short name wins.
+    # The documented env fallback works on both protocols...
     monkeypatch.setenv("DEVICE_USER", "envuser")
-    monkeypatch.setenv("DEVICE_USERNAME", "longform")
     monkeypatch.setenv("DEVICE_PASS", "envpass")
-    monkeypatch.setenv("DEVICE_PASSWORD", "longformpass")
     client = rest.RestconfClient(management_ip="127.0.0.1", port=8181)
     assert client._session.auth == ("envuser", "envpass")
 
@@ -2338,3 +2349,40 @@ def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
         management_ip="127.0.0.1", port=8181, username="arguser", password="argpass"
     )
     assert arg_client._session.auth == ("arguser", "argpass")
+
+
+def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
+    """DEVICE_USERNAME / DEVICE_PASSWORD must not authenticate a client.
+
+    These names are retired, not aliased. If a generated client ever starts
+    honouring them again, a host that happens to export both the retired and
+    the current names authenticates as whichever the template reaches first --
+    the exact two-identities hazard the alias created.
+    """
+    from unittest import mock
+
+    for var in ("DEVICE_USER", "DEVICE_PASS", "DEVICE_USERNAME", "DEVICE_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DEVICE_USERNAME", "retired")
+    monkeypatch.setenv("DEVICE_PASSWORD", "retiredpass")
+
+    rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tlong")
+    rest = _import(rout, "session_manager")
+    with pytest.raises(ValueError, match="credentials"):
+        rest.RestconfClient(management_ip="127.0.0.1", port=8181)
+
+    nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tlong")
+    netc = _import(nout, "session_manager")
+    with pytest.raises(ValueError, match="credentials"):
+        netc.NetconfClient(management_ip="127.0.0.1")
+
+    # And the current names win outright when both are exported.
+    monkeypatch.setenv("DEVICE_USER", "current")
+    monkeypatch.setenv("DEVICE_PASS", "currentpass")
+    client = rest.RestconfClient(management_ip="127.0.0.1", port=8181)
+    assert client._session.auth == ("current", "currentpass")
+    with mock.patch.object(
+        netc.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ):
+        nclient = netc.NetconfClient(management_ip="127.0.0.1")
+    assert (nclient.username, nclient.password) == ("current", "currentpass")

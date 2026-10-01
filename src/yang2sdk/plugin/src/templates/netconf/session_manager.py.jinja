@@ -161,20 +161,21 @@ class NetconfClient:
             kwargs.pop("scheme")
         self.host = loopback_ip or management_ip
         self.port = port
-        self.username = username or os.environ.get("DEVICE_USER") or os.environ.get("DEVICE_USERNAME")
-        self.password = password or os.environ.get("DEVICE_PASS") or os.environ.get("DEVICE_PASSWORD")
         # Same resolution order and same fail-closed rule as the RESTCONF
-        # client: caller args, then DEVICE_USER -> DEVICE_USERNAME and
-        # DEVICE_PASS -> DEVICE_PASSWORD. NETCONF used to keep None here and
-        # hand it straight to manager.connect(), so a client built with no
-        # credentials anywhere attempted an unauthenticated SSH session and
-        # failed later with an opaque transport error. Raising before the
-        # connect keeps the two protocols symmetrical and fails closed.
+        # client: caller args, else DEVICE_USER / DEVICE_PASS -- the names the
+        # rest of this project already reads, so one `.env` serves the
+        # downloader, the tester and both clients. NETCONF used to keep None
+        # here and hand it straight to manager.connect(), so a client built
+        # with no credentials anywhere attempted an unauthenticated SSH
+        # session and failed later with an opaque transport error. Raising
+        # before the connect keeps the two protocols symmetrical and fails
+        # closed.
+        self.username = username or os.environ.get("DEVICE_USER")
+        self.password = password or os.environ.get("DEVICE_PASS")
         if not self.username or not self.password:
             raise ValueError(
                 "Authentication credentials missing: pass username/password, "
-                "or set DEVICE_USER/DEVICE_USERNAME and "
-                "DEVICE_PASS/DEVICE_PASSWORD in the environment."
+                "or set DEVICE_USER and DEVICE_PASS in the environment."
             )
         self.auto_commit = auto_commit
         self.log_bodies = log_bodies

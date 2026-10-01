@@ -141,20 +141,24 @@ class RestconfClient:
         self._session.headers.update({"Content-Type": "application/yang-data+json"})
 
         # Credentials come from caller args or the environment at runtime;
-        # nothing is baked into generated code. Resolution order is
-        # DEVICE_USER -> DEVICE_USERNAME / DEVICE_PASS -> DEVICE_PASSWORD,
-        # and it is identical in the NETCONF template: the two protocols used
-        # to read the pairs in opposite order, so a host exporting both
-        # names authenticated as two different identities depending on the
-        # transport. Failing closed is deliberate -- an unauthenticated
-        # RESTCONF session would silently 401 on the first call.
-        user = username or os.environ.get("DEVICE_USER") or os.environ.get("DEVICE_USERNAME")
-        pw = password or os.environ.get("DEVICE_PASS") or os.environ.get("DEVICE_PASSWORD")
+        # nothing is baked into generated code. One pair of names,
+        # DEVICE_USER / DEVICE_PASS, because that is what every other part of
+        # the project reads: `.env.example`, `cli/downloader.py`,
+        # `cli/tester.py` and the lab matrix in `tests/conftest.py`. This
+        # template used to read only DEVICE_USERNAME / DEVICE_PASSWORD, so the
+        # `.env` file the project told you to copy did not work here at all;
+        # the two-name alias that briefly papered over the mismatch made it
+        # worse, since the two protocols resolved the pairs in opposite order
+        # and a host exporting both authenticated as two different identities
+        # depending on transport. Failing closed is deliberate -- an
+        # unauthenticated RESTCONF session would silently 401 on the first
+        # call, so raise before any transport work happens.
+        user = username or os.environ.get("DEVICE_USER")
+        pw = password or os.environ.get("DEVICE_PASS")
         if not user or not pw:
             raise ValueError(
                 "Authentication credentials missing: pass username/password, "
-                "or set DEVICE_USER/DEVICE_USERNAME and "
-                "DEVICE_PASS/DEVICE_PASSWORD in the environment."
+                "or set DEVICE_USER and DEVICE_PASS in the environment."
             )
         self._session.auth = (user, pw)
 

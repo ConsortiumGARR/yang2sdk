@@ -8,6 +8,37 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ### Fixed
 
+- **A generated client could not authenticate with the `.env` the project tells
+  you to copy, and the two protocols failed differently when it had none.**
+  *Symptom:* `cp .env.example .env` gives you `DEVICE_USER` / `DEVICE_PASS`.
+  `yang-downloader` and `tester` read those names; a generated client read
+  `DEVICE_USERNAME` / `DEVICE_PASSWORD`, so the documented setup left every
+  client unauthenticated. With no credentials at all the two protocols also
+  failed in two different, both-opaque ways: RESTCONF did
+  `raise UserWarning(...)`, and a `Warning` subclass used as an exception is
+  invisible to `except ValueError`, while NETCONF raised nothing at all and
+  handed `None` straight to `manager.connect()`.
+  *Root cause:* the templates were the only place in the project that ever used
+  the long form, and RESTCONF was the only one of the two that attempted a
+  check. The failure was invisible because the credentials path had no test.
+  *Fix:* both templates now resolve `username` / `password` from the constructor
+  args, else `DEVICE_USER` / `DEVICE_PASS` — the names `.env.example`,
+  `cli/downloader.py`, `cli/tester.py` and the lab matrix in
+  `tests/conftest.py` have always used — and raise `ValueError` when a value is
+  missing, before any transport work. One `.env` now serves every consumer.
+  *Removed:* `DEVICE_USERNAME` / `DEVICE_PASSWORD` are **retired, not aliased**.
+  A two-name alias was tried first and was strictly worse: the two templates
+  resolved the pairs in *opposite* order, so a host exporting both names
+  authenticated as two different identities depending on which transport was
+  used. One name makes that hazard unrepresentable.
+  *Tests:* `test_both_protocols_fail_closed_without_credentials` (args beat env,
+  env fallback works, both protocols fail closed) and
+  `test_retired_long_form_credential_names_are_ignored` (the long form is inert,
+  and the current names win when both are exported). Both `monkeypatch.delenv`
+  all four names — `tests/conftest.py` loads an untracked local `.env` into
+  `os.environ`, so a test that did not clear them passed on a developer machine
+  and failed in CI.
+
 The RPC/action path had **no test coverage at all** — the only rpc-related
 test asserted the degenerate rpc-*free* case. Verifying it against the primary
 RFC text (`rfc-editor.org`, not the `RFCs/*.md` summaries) exposed seven
