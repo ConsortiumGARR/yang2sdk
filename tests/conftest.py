@@ -283,6 +283,10 @@ def lab_device(request):
         "ignore_errors": entry.get("ignore_errors", []),
         "write_subtree": entry.get("write_subtree", ""),
         "write_leaf": entry.get("write_leaf", ""),
+        # Without this the write gate in tests/test_lab_device_netconf.py
+        # could never pass, so the repo's only commit/rollback test always
+        # skipped no matter what the matrix said.
+        "write_value": entry.get("write_value", ""),
     }
 
 

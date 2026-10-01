@@ -37,10 +37,12 @@ def main():
         password = os.environ["DEVICE_PASS"]
         device_name = os.environ["DEVICE_NAME"]
     except KeyError as e:
-        print(f"Environment configuration missing key: {e}")
-        return
+        # A gate that cannot even find its configuration must fail.
+        print(f"Environment configuration missing key: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Add active working directory to sys.path to locate transient generated structures
+    failures: list[tuple[str, str]] = []
     sys.path.insert(0, str(Path.cwd()))
     module_path = f"temp.restconf_clients.{device_name}"
 
@@ -74,16 +76,31 @@ def main():
             logger.info(f"Testing validation sequence on: {navigator._path}")
 
             try:
-                pydantic_instance = navigator.retrieve(
-                    content="config", depth="unbounded"
-                )
-                print(f"  [OK] Parsed model: {pydantic_instance.__class__.__name__}")
-                logger.info(
-                    f"  [OK] Parsed model: {pydantic_instance.__class__.__name__}"
-                )
+                # Bounded depth: an unbounded read of a top-level container is exactly
+                # the request AGENTS.md warns can trigger a watchdog reboot.
+                result = navigator.retrieve(content="config", depth=2)
+                # A list navigator returns a plain Python list, so the old
+                # `result.__class__.__name__` reported "list" and every list
+                # navigator passed unconditionally -- the check validated
+                # nothing. Validate each item's class instead.
+                items = result if isinstance(result, list) else [result]
+                classes = {type(i).__name__ for i in items}
+                print(f"  [OK] Parsed {len(items)} model(s): {sorted(classes)}")
+                logger.info(f"  [OK] Parsed {len(items)} model(s): {sorted(classes)}")
             except Exception as e:
+                failures.append((navigator._path, f"{type(e).__name__}: {e}"))
                 logger.exception(f"  [FAIL] {navigator._path}")
                 print(f"  [FAIL] {navigator._path} - Error: {e}")
+
+    if failures:
+        # A validation gate that always exits 0 cannot gate anything.
+        print(
+            f"\n[FAIL] {len(failures)} navigator(s) failed validation:", file=sys.stderr
+        )
+        for path, err in failures:
+            print(f"  {path}: {err}", file=sys.stderr)
+        sys.exit(1)
+    print("\n[OK] every navigator validated against the device")
 
 
 if __name__ == "__main__":

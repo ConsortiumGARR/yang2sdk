@@ -191,6 +191,11 @@ class Compiler:
                     file=sys.stderr,
                 )
                 sys.exit(e.code)
+        except SyntaxError as e:
+            # core._validate_generated: the emitted Python does not parse.
+            # Never report success for a client that cannot be imported.
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         except Exception as e:  # noqa: BLE001 -- pyang run() raises arbitrary errors; CLI crash guard must not escape
             print(f"Compilation engine crashed unexpectedly: {e}", file=sys.stderr)
             sys.exit(1)

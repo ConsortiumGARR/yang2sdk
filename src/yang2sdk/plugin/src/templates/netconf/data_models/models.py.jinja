@@ -5,7 +5,7 @@ from pydantic import ConfigDict, Field, AfterValidator
 from pydantic_xml import element, attr
 from enum import Enum
 
-from ._base import NetconfBaseModel, NetconfXmlModel, Decimal64, Uint64, Int64, check_pattern
+from ._base import NetconfBaseModel, NetconfXmlModel, Decimal64, Uint64, Int64, Empty, check_pattern
 
 {% for enum in module.enums %}
 class {{ enum.name }}(str, Enum):

@@ -9,6 +9,9 @@ if TYPE_CHECKING:
 
 class Data(Node):
     """Navigator for data nodes."""
+    {% if not data_props %}
+    pass
+    {% endif %}
     {% for prop in data_props %}
     
     @property

@@ -51,6 +51,98 @@ def _prune_at_max_depth(data: Any, target_depth: int, current_depth: int = 1) ->
     return data
 
 
+def _maybe_prune(data: Any, depth: int | str) -> Any:
+    """Drop empty boundary containers, but never deeper than the caller asked.
+
+    RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling, so a
+    container returned empty at that boundary is a truncation artefact rather
+    than a real value, and strict models should not be asked to validate it.
+
+    Two things were wrong before: the *observed* depth of the response was
+    used and the *requested* depth was ignored entirely, so `depth=2` and
+    `depth=30` behaved identically and the result depended on what the device
+    happened to return; and a legitimately empty container at the deepest
+    returned level was deleted from the caller's data with no warning.
+
+    `depth="unbounded"` (the RFC default) has no boundary, so nothing is
+    touched. Otherwise the boundary is min(requested, observed): a server that
+    honours the request truncates at exactly `depth`, and one that returns
+    less is truncating at whatever it returned.
+    """
+    if isinstance(depth, bool):
+        return data
+    requested: int | None = None
+    if isinstance(depth, int):
+        requested = depth
+    elif isinstance(depth, str) and depth.isdigit():
+        requested = int(depth)
+    if requested is None:
+        return data
+    observed = _get_max_depth(data)
+    return _prune_at_depth(data, min(requested, observed))
+
+
+def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
+    """Refuse a PUT that would silently delete unset fields.
+
+    RFC 8040 Sec 4.5: the body of a PUT MUST represent the complete target
+    resource, so every node missing from the body is removed on the device.
+    A hand-built model -- or one produced by `retrieve(depth=N)` when the real
+    configuration is deeper than N -- omits fields, and the previous code
+    sent it anyway, quietly deleting them. A round-trip
+    (retrieve -> modify -> replace) is unaffected because every field the
+    device returned is "set".
+    """
+    if allow_partial:
+        return
+    # `config false` (state) fields never appear in a config body and cannot be
+    # deleted by an edit, so counting them reported every state leaf of a
+    # partially-read interface as "would be deleted". Only config nodes are
+    # at risk.
+    unset = [
+        name
+        for name, info in data.model_fields.items()
+        if name not in data.model_fields_set
+        and (info.json_schema_extra or {}).get("is_config") is not False
+    ]
+    if not unset:
+        return
+    shown = ", ".join(sorted(unset)[:12])
+    more = f" (+{len(unset) - 12} more)" if len(unset) > 12 else ""
+    raise ValueError(
+        f"replace() on {type(data).__name__} would DELETE {len(unset)} field(s) "
+        f"that are not set, because a PUT body must represent the complete "
+        f"resource (RFC 8040 Sec 4.5): {shown}{more}. "
+        f"Use update() to merge, retrieve the node at full depth first, or pass "
+        f"allow_partial=True if deleting them is what you intend."
+    )
+
+
+def _prune_at_depth(data: Any, target_depth: int, current_depth: int = 1) -> Any:
+    """Drop empty containers/lists that sit exactly at `target_depth`.
+
+    RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling, so an
+    empty container at that boundary carries no information and strict
+    models should not be asked to validate it. The boundary is the depth the
+    caller *asked for* -- the previous code passed the depth it *observed* in
+    the response, which made the pruning depend on what the device happened
+    to return and deleted legitimately empty containers on the way.
+    """
+    if isinstance(data, dict):
+        return {
+            k: _prune_at_depth(v, target_depth, current_depth + 1)
+            for k, v in data.items()
+            if not (isinstance(v, (dict, list)) and not v and current_depth + 1 == target_depth)
+        }
+    if isinstance(data, list):
+        return [
+            _prune_at_depth(item, target_depth, current_depth + 1)
+            for item in data
+            if not (isinstance(item, (dict, list)) and not item and current_depth + 1 == target_depth)
+        ]
+    return data
+
+
 class Node:
     __slots__ = ("_client", "_name", "_path", "_envelope_name")
 
@@ -112,9 +204,7 @@ class Node:
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        if depth != "unbounded":
-            observed_max = _get_max_depth(payload)
-            payload = _prune_at_max_depth(payload, observed_max)
+        payload = _maybe_prune(payload, depth)
 
         return payload
 
@@ -217,9 +307,7 @@ class ItemNode:
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        if depth != "unbounded":
-            observed_max = _get_max_depth(payload)
-            payload = _prune_at_max_depth(payload, observed_max)
+        payload = _maybe_prune(payload, depth)
 
         return payload
 
@@ -350,9 +438,7 @@ class ListNode(Generic[TNode]):
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        if depth != "unbounded":
-            observed_max = _get_max_depth(data_list)
-            data_list = _prune_at_max_depth(data_list, observed_max)
+        data_list = _maybe_prune(data_list, depth)
 
         return data_list
 

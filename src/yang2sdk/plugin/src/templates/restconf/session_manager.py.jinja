@@ -48,7 +48,16 @@ class TCPKeepAliveAdapter(HTTPAdapter):
         return options
 
 
-_SENSITIVE_KEYS = ("password", "passwd", "secret", "token", "auth", "community", "private-key")
+# Substring match against lower-cased keys. `passphrase` is the important
+# addition: it contains neither "password" nor "passwd", so NTP/TACACS/RADIUS
+# authenticator passphrases were written to the log in cleartext whenever
+# log_bodies was enabled. Bare "key" is deliberately absent -- a `key` leaf is
+# far more often a primary key than a secret.
+_SENSITIVE_KEYS = (
+    "password", "passwd", "passphrase", "secret", "token", "auth", "community",
+    "private-key", "privatekey", "psk", "pre-shared", "preshared", "credential",
+    "credentials", "md5", "username",
+)
 
 
 def _redact(obj: Any, _depth: int = 0) -> Any:
@@ -143,8 +152,37 @@ class RestconfClient:
         self.operations = Operations(self, "/operations", "")
         self._timeout = timeout
 
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool.
+
+        Protocol parity with `NetconfClient.close()`: a generated client is a
+        long-lived object holding a `requests.Session`, and without this the
+        only way to drop its keep-alive sockets is to let the garbage
+        collector do it, which keeps a TLS session and its fds alive well
+        past the last call. Idempotent, and safe to call from `__del__`.
+        """
+        session, self._session = getattr(self, "_session", None), None
+        if session is not None:
+            session.close()
+
+    def __enter__(self) -> "RestconfClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001, S110 - interpreter shutdown
+            pass
+
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         """Make authenticated API request."""
+        if getattr(self, "_session", None) is None:
+            raise RuntimeError(
+                "RESTCONF session is closed; construct a new RestconfClient."
+            )
         errors = []
 
         for base_url in self.urls:
@@ -174,8 +212,24 @@ class RestconfClient:
                 log.warning("HTTP %s on %s %s", status, method, url)
                 if self.log_bodies:
                     log.debug("HTTP %s body: %s", status, _redact(e.response.text))
-                msg = f"HTTP {status} Error: {e.response.text}"
-                raise requests.HTTPError(msg, response=e.response) from e
+                # The body carries device config and credentials, and every
+                # caller logs the exception it receives. Report the status and
+                # the YANG error-tag (RFC 8040 Sec 7); the body stays behind
+                # the log_bodies opt-in, which is what the logging-hygiene
+                # contract in AGENTS.md actually requires.
+                detail = ""
+                try:
+                    errors = e.response.json().get("ietf-restconf:errors") or {}
+                    first = (errors.get("error") or [{}])[0]
+                    tag = first.get("error-tag") or first.get("error-message")
+                    if tag:
+                        detail = f" ({tag})"
+                except Exception:  # noqa: BLE001 - non-JSON error page
+                    detail = ""
+                raise requests.HTTPError(
+                    f"HTTP {status}{detail} on {method} {url}",
+                    response=e.response,
+                ) from e
 
         # If we get here, all URLs failed
         msg = f"All connection attempts to {self.urls} have failed."

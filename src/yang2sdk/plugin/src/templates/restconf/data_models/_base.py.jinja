@@ -81,7 +81,13 @@ class YangBaseModel(BaseModel):
             if key not in data:
                 continue
             extra = field_info.json_schema_extra
-            is_config = extra.get("is_config", True) if isinstance(extra, dict) else True
+            # Only an explicit False means state data. A missing/None
+            # is_config means config-ness is not defined for this node
+            # (rpc/action/notification subtrees); treating that as False
+            # pruned real parameters out of a content="config" dump.
+            is_config = True
+            if isinstance(extra, dict) and extra.get("is_config") is False:
+                is_config = False
             match = (content == "config") == bool(is_config)
             value = data[key]
             sub = _child_yang_model(field_info.annotation)

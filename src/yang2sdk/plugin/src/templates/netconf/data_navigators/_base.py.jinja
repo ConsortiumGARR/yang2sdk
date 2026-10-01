@@ -54,6 +54,65 @@ def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max
             elif is_complex:
                 prune_xml_tree_to_depth(child_node, child_cls, max_depth, current_depth + 1)
 
+def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
+    """Refuse an `nc:operation="replace"` that would delete unset fields.
+
+    RFC 6241 Sec 8.2.1: with nc:operation="replace" on a node, the server
+    replaces that node's *entire* contents, so any child absent from the
+    payload is removed. A hand-built model -- or one read at a shallower depth
+    -- omits fields, and the previous code sent it anyway, quietly deleting
+    them. A round-trip (retrieve -> modify -> replace) is unaffected because
+    every field the device returned is "set".
+    """
+    if allow_partial:
+        return
+    if not hasattr(data, "model_fields"):
+        # `replace()` accepts a dict or an XML/JSON string exactly as readily
+        # as a model, and the caller coerces it *after* this guard runs. Left
+        # uncoerced, a plain dict raised an opaque
+        # `AttributeError: 'dict' object has no attribute 'model_fields'`, which
+        # is both a bad error and a silent bypass of the safety check for the
+        # most convenient input form. Coerce with the same rules `update()`
+        # uses, so the check always sees a model.
+        if data is None:
+            raise ValueError("replace() needs a model, dict, or XML/JSON string.")
+        if model_cls is None:
+            raise TypeError(
+                f"replace() cannot inspect {type(data).__name__}; pass the model "
+                f"instance, or allow_partial=True to skip the completeness check."
+            )
+        if isinstance(data, dict):
+            data = model_cls.model_validate(data)
+        elif isinstance(data, str) and data.strip().startswith("<"):
+            data = model_cls.from_xml(data)
+        else:
+            data = model_cls.model_validate_json(data)
+    # nc_operation is the nc:operation *attribute*, not a data node; it is
+    # never part of the resource contents.
+    # `config false` (state) fields never appear in a config body and cannot be
+    # deleted by an edit, so counting them reported every state leaf of a
+    # partially-read interface as "would be deleted". Only config nodes are at
+    # risk, and `nc_operation` is an attribute rather than a data node.
+    unset = [
+        name
+        for name, info in data.model_fields.items()
+        if name != "nc_operation"
+        and name not in data.model_fields_set
+        and (info.json_schema_extra or {}).get("is_config") is not False
+    ]
+    if not unset:
+        return
+    shown = ", ".join(sorted(unset)[:12])
+    more = f" (+{len(unset) - 12} more)" if len(unset) > 12 else ""
+    raise ValueError(
+        f"replace() on {type(data).__name__} would DELETE {len(unset)} field(s) "
+        f"that are not set, because nc:operation=\"replace\" replaces the whole "
+        f"node (RFC 6241 Sec 8.2.1): {shown}{more}. "
+        f"Use update() to merge, retrieve the node at full depth first, or pass "
+        f"allow_partial=True if deleting them is what you intend."
+    )
+
+
 def build_filter_tree(path_tuples: list[tuple[str, str, dict[str, Any]]], model_cls: type | None = None, fields: list[str] | None = None) -> etree._Element:
     """Builds a precise RFC 6241 selection node without sending exhaustive trees."""
     root = current = None

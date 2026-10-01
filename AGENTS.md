@@ -90,7 +90,7 @@ When adding a YANG feature: extend `IRBuilder` first, then templates. Never emit
 - Public navigator API must stay symmetrical: `retrieve(depth, content, fields/with-defaults)`, `update` (PATCH/merge), `replace` (PUT), `create` (POST), `delete`, RPC dispatch.
 - Transports intentionally differ:
   - RESTCONF: `requests` + TCP keepalive, `loopback_ip/management_ip` failover, `application/yang-data+json`.
-  - NETCONF: `ncclient`, capability discovery (`:candidate`/`:writable-running`, `ietf-netconf-nmda`), NMDA vs legacy RPC routing, `lock`/`unlock`, `auto_commit` + `commit`/`discard_changes`, `RPCError → RuntimeError`.
+  - NETCONF: `ncclient`, capability discovery by **exact base capability URI** (`:candidate` / `:writable-running` / `:nmda:1.0` — never a module name, or a device that ships `ietf-netconf-nmda` without implementing NMDA routes every read to an unsupported `<get-data>`), NMDA vs legacy RPC routing, `lock`/`unlock`, opt-in `auto_commit` plus `validate()` + `commit`/`discard_changes`, `RPCError → RuntimeError` (attribute access must never raise from the error path).
 - Any deliberate divergence (e.g. client-side depth pruning, `{}`-for-`[]` RESTCONF quirk handling, `pydantic-xml` deferred-rebuild) must live in the protocol's `_base` template with a comment citing the RFC section or device evidence.
 
 ## Generated SDK packaging (normative)
@@ -163,7 +163,30 @@ There is a `pytest` suite plus CI. `tester.py` remains a manual lab harness, not
 - Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe).
 - Simulated backend: `https://github.com/notconf/notconf` (admin/admin, lab-only). CI: `.github/workflows/ci-pr.yaml` (lint → typecheck → offline → smoke shards) and `ci-nightly.yaml` (full 11-tag matrix + `workflow_dispatch`).
 - Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored; promoting them to checked-in, diff-compared fixtures (plus `canonicalize_ast.py` snapshot diffs) is still open.
-- Agents must not claim coverage beyond what the suite asserts (RESTCONF writes are `xfail`, vendor-image SDK writes are skipped, NMDA discrimination may skip on the factory-default race).
+- Agents must not claim coverage beyond what the suite asserts. Current reality: there is no `xfail`
+in the suite; RESTCONF and NETCONF CRUD round-trips make hard assertions (a `if-feature`
+mismatch or a missing `ietf-interfaces` navigator skips them); NMDA discrimination may skip on the
+documented factory-default race; and `tests/test_srl_netconf.py` / `tests/test_lab_device_netconf.py`
+are in no CI workflow, so anything they assert is not gating anything.
+- **A `skip` is not a pass.** The SDK suite skips deliberately and must say why: an image that
+implements no config modules, a node the simulator cannot read, a device without `:validate`. When a
+test covers zero nodes it must `pytest.skip`, never "succeed" vacuously.
+- **A generated client must be exercised through its own public API.** The NETCONF leg of
+`tests/test_sdk_generate.py` was previously unable to run at all, because it built the client
+without opting out of host-key verification and so the secure default refused the simulator's random
+key. Tests that construct a generated client against a simulator must pass `verify=False` explicitly
+and say why; never weaken the client default to make a test pass.
+- **Tests must not depend on a destructive default.** With `auto_commit=False`, an `edit()` to
+`candidate` is invisible in `running` until an explicit `<commit>`. Any test asserting a read-back
+of a NETCONF write must run edit → `validate` → `commit`, and must skip `validate` when `:validate`
+is not advertised (RFC 6241 §8.6.4.1 makes it optional).
+- Every capability flag (`has_validate`, `has_candidate`, `has_nmda`,
+  `has_writable_running`, `has_confirmed_commit`, `has_rollback_on_error`) is a
+  plain **bool attribute**, never a method or property. `getattr(client,
+  "has_validate", False)` therefore returns the real flag, and
+  `if client.has_validate:` is a correct test. One of these was briefly a method
+  while its five siblings were attributes, which made `if client.has_validate:`
+  always true and silently skipped validation — keep the six consistent.
 - Do not add tests that require a live production device.
 - Until golden fixtures land: verify template/IR changes by (a) generating a sample client, (b) running `ruff` + `ty` + `pyrefly`, (c) importing the sample and validating a live-simulator or lab-captured payload. State exactly what was and was not executed in the PR/summary.
 
@@ -174,6 +197,14 @@ There is a `pytest` suite plus CI. `tester.py` remains a manual lab harness, not
 - `temp/` is ephemeral and gitignored (only `.gitkeep` scaffolding is committed). Never import from `temp/` in shipped code; never commit generated clients, logs (`*.log`), or YANG dumps.
 - `*.env` / `.env` never committed. `DEVICE_PASS` in cleartext on disk is already a compromise — do not print, log, or propagate it. Full response bodies must not be committed to logs at INFO in production paths.
 - Timeouts, failover URL order, and `verify`/host-key defaults are safety features, not tuning knobs. Changing them requires explicit justification.
+- `auto_commit` defaults to **False** on the generated NETCONF client. It is a destructive
+  default and must stay opt-in; the safe sequence is `edit(target="candidate")` →
+  `validate(source="candidate")` → `commit()` (RFC 6241 §8.6.4.1, §8.3.4.1).
+- `replace()` refuses a model with unset fields (`allow_partial=True` overrides). A replace
+  body IS the complete resource (RFC 8040 §4.5; RFC 6241 §8.2.1), so a partial model silently
+  deletes the rest. Do not remove this guard without an equivalent loud failure.
+- The emitter compiles every generated `.py` before reporting success (`core._validate_generated`).
+  Never bypass it: a client that cannot be imported is not a deliverable.
 
 ## Contribution guardrails
 

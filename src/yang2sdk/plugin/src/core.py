@@ -146,6 +146,22 @@ def _package_context(ctx, modules, ir_modules, protocol: str) -> dict:
                 "namespace": getattr(ir, "namespace", ""),
             }
         )
+    # Reproducibility: a wall-clock stamp makes two compiles of identical YANG
+    # differ, so `diff -r` can never be clean and no generated output can ever
+    # be committed as a golden fixture. Honour SOURCE_DATE_EPOCH (the
+    # reproducible-builds convention) and omit the field entirely otherwise,
+    # so the default build is byte-identical run to run.
+    created_utc = ""
+    source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if source_date_epoch:
+        try:
+            created_utc = (
+                datetime.fromtimestamp(int(source_date_epoch), tz=UTC)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        except (ValueError, OverflowError, OSError):
+            created_utc = ""
     return {
         "package_name": pkg_name,
         "package_version": pkg_version,
@@ -157,7 +173,7 @@ def _package_context(ctx, modules, ir_modules, protocol: str) -> dict:
         "deviations": deviations,
         "features": features,
         "features_source": getattr(ctx.opts, "sdk_features_source", "none") or "none",
-        "created_utc": datetime.now(UTC).isoformat(),
+        "created_utc": created_utc,
     }
 
 
@@ -360,6 +376,31 @@ class Yang2Netconf(plugin.PyangPlugin):
         fd.write(f"Generated NETCONF SDK in: {output_dir}\n")
 
 
+def _validate_generated(output_dir: str) -> None:
+    """Fail the build if any emitted .py file does not parse.
+
+    A code generator that reports success while shipping a file Python cannot
+    import is worse than one that crashes: the failure surfaces in the
+    *consumer's* project as an opaque SyntaxError pointing at generated code.
+    A YANG `description` containing a triple quote or a trailing backslash used
+    to do exactly that. Validating here turns any future escaping bug into a
+    build-time error with the offending file and line.
+    """
+    errors: list[str] = []
+    for path in sorted(Path(output_dir).rglob("*.py")):
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        except SyntaxError as e:
+            errors.append(f"  {path}:{e.lineno}: {e.msg}")
+        except (OSError, UnicodeDecodeError) as e:  # pragma: no cover - IO guard
+            errors.append(f"  {path}: {e}")
+    if errors:
+        raise SyntaxError(
+            "Generated Python does not parse; refusing to ship a client that "
+            "cannot be imported:\n" + "\n".join(errors)
+        )
+
+
 def _write_package_files(
     env: Environment, out_dir: str, ctx, modules, ir_modules, protocol: str
 ) -> None:
@@ -411,10 +452,10 @@ def _write_package_files(
         f"version `{pkg['device_version']}`.\n\n"
         f"- Protocol: `{protocol}`\n"
         f"- Generator: `yang2sdk {pkg['generator_version']}`\n"
-        f"- Created (UTC): `{pkg['created_utc']}`\n"
         f"- Features: source `{pkg['features_source']}` "
         f"({len(pkg['features'])} enabled)\n"
-        "- Secure defaults: `verify=True` (explicit `verify=False` lab-only "
+        + (f"- Created (UTC): `{pkg['created_utc']}`\n" if pkg["created_utc"] else "")
+        + "- Secure defaults: `verify=True` (explicit `verify=False` lab-only "
         "with warning); RESTCONF `scheme=https` default.\n"
         "- No credentials, IPs, or CA bundles are embedded; pass auth at runtime.\n\n"
         "## Install\n\n"
@@ -461,3 +502,7 @@ def _write_package_files(
             shutil.copytree(src_d, dst_d)
     # py.typed marker inside package (PEP 561)
     (pkg_dir / "py.typed").write_text("", encoding="utf-8")
+
+    # Last step, covering both the flat lab copy and the namespaced copy: a
+    # client that cannot be imported is not a deliverable.
+    _validate_generated(str(out))

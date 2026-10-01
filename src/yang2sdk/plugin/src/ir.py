@@ -7,6 +7,30 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pyang import statements
+from pydantic import BaseModel
+from pydantic_xml import BaseXmlModel
+
+# A docstring-terminating quote run, built at runtime so this module's own
+# source never contains one inside a triple-quoted literal.
+_TRIPLE = chr(34) * 3
+
+
+def _reserved_model_attrs() -> frozenset[str]:
+    """Attribute names a generated model must not shadow.
+
+    A field whose Python name collides with a `BaseModel` / `BaseXmlModel`
+    attribute resolves to the inherited attribute instead of the field, so
+    pydantic emits "Field name ... shadows an attribute in parent" and the
+    value is silently unreachable at runtime. Collected from the real classes
+    rather than hardcoded so it cannot drift with the pinned pydantic version.
+    """
+    names: set[str] = set()
+    for cls in (BaseModel, BaseXmlModel):
+        names.update(a for a in dir(cls) if not a.startswith("_"))
+    return frozenset(names)
+
+
+_RESERVED_MODEL_ATTRS = _reserved_model_attrs()
 
 
 @dataclass
@@ -52,6 +76,12 @@ class IRNavProperty:
     ns: str = ""
     item_cls: str | None = None
     module_yang_name: str = ""
+    # RFC 8040 Sec 3.5.3: "If a node in the path is defined in a module other
+    # than its parent node or its parent is the datastore, then the module name
+    # followed by a colon character MUST be prepended to the node name in the
+    # resource identifier." Same-module children stay bare; augmented
+    # (cross-module) children must be qualified or the URI addresses nothing.
+    path_segment: str = ""
 
 
 @dataclass
@@ -66,6 +96,12 @@ class IRNavNode:
     module_yang_name: str = ""
     ns: str = ""
     keys: list[str] = field(default_factory=list)
+    # (python_name, yang_name) per list key, for the navigator's __call__
+    # signature. The python name must be keyword-safe: a YANG key may legally
+    # be named `if`, `class` or `import`, and emitting it raw produces
+    # `def __call__(self, if: str | int)` -- a SyntaxError. Cisco NX-OS ships
+    # a list keyed on `if`, so this broke the whole NX-OS client.
+    key_params: list[tuple[str, str]] = field(default_factory=list)
     properties: list[IRNavProperty] = field(default_factory=list)
     has_input: bool = False
     has_output: bool = False
@@ -316,6 +352,18 @@ class IRBuilder:
                 final_name = self._register_model(model)
                 notif._pydantic_class_name = final_name
 
+        # YANG 1.1 `action` statements (RFC 7950 Sec 7.15) are RPCs nested
+        # under a data node. They need the same Input/Output envelope models as
+        # top-level `rpc` statements, because the navigator template emits
+        # `<Action>`, `<Action>Input` and `<Action>Output` imports for them.
+        # Without this pass the generated client raises ImportError the first
+        # time any action is invoked. Actions are deliberately NOT added to
+        # root_rpc_props: RFC 8040 Sec 3.6 keeps them out of the
+        # {+restconf}/operations resource, they are invoked through the data
+        # tree. Must run before _build_nav_nodes so the collision-resolved
+        # envelope name is the one the navigator imports.
+        self._build_actions(self.module)
+
         # Build Navigator IR
         self._build_nav_nodes(self.module)
 
@@ -325,6 +373,13 @@ class IRBuilder:
             self.ir.imports_nsmap.setdefault(prefix, uri)
 
         return self.ir
+
+    def _build_actions(self, stmt) -> None:
+        """Build Input/Output models for every nested YANG `action` statement."""
+        for child in getattr(stmt, "i_children", []) or []:
+            if child.keyword == "action":
+                self._build_rpc(child)
+            self._build_actions(child)
 
     # --- NAVIGATOR IR BUILDER ---
 
@@ -361,6 +416,7 @@ class IRBuilder:
             module_yang_name=self.module.arg,
             ns=ns,
             keys=keys,
+            key_params=[(self._to_field_name(k), k) for k in keys],
             has_input=stmt.search_one("input") is not None
             if node_type == "rpc"
             else False,
@@ -387,6 +443,7 @@ class IRBuilder:
             )
 
         if hasattr(stmt, "i_children"):
+            parent_module = self._get_module_name(stmt)
             for child in stmt.i_children:
                 if child.keyword in ["container", "list", "action"]:
                     child_cls = getattr(
@@ -400,6 +457,7 @@ class IRBuilder:
                         type_hint = f"{child_cls.removesuffix('Item')}ListNode"
                         nav_cls = type_hint
 
+                    child_module = self._get_module_name(child)
                     prop = IRNavProperty(
                         name=self._to_field_name(child.arg),
                         type_hint=type_hint,
@@ -410,7 +468,12 @@ class IRBuilder:
                         item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
                         if child.keyword == "list"
                         else None,
-                        module_yang_name=self._get_module_name(child),
+                        module_yang_name=child_module,
+                        path_segment=(
+                            f"{child_module}:{child.arg}"
+                            if child_module != parent_module
+                            else child.arg
+                        ),
                     )
                     node.properties.append(prop)
         return node
@@ -431,7 +494,7 @@ class IRBuilder:
         model = IRModel(
             name=class_name,
             yang_name=stmt.arg,
-            description=self._escape_docstring(stmt.search_one("description").arg)
+            description=self._docstring(stmt.search_one("description").arg)
             if stmt.search_one("description")
             else f"{stmt.keyword.capitalize()}: {stmt.arg}",
         )
@@ -443,6 +506,24 @@ class IRBuilder:
 
         return model
 
+    @staticmethod
+    def _expanded_io(stmt, keyword: str):
+        """Return pyang's *expanded* `input`/`output` node for an rpc/action.
+
+        pyang copies the `input`/`output` substatement into `i_children`
+        during the expand_1 phase and sets `arg` to the keyword there. The
+        original substatement that `search_one` returns keeps `arg = None`
+        and may carry no `i_children` at all, so building a model from it
+        yields a Pydantic model whose XML root tag is the string "None" --
+        which silently breaks every NETCONF RPC input/output round-trip. The
+        expanded copy is also the only node with `i_children` populated for
+        a nested YANG 1.1 `action`.
+        """
+        for child in getattr(stmt, "i_children", []) or []:
+            if child.keyword == keyword:
+                return child
+        return stmt.search_one(keyword)
+
     def _build_rpc(self, rpc):
         base_name = getattr(rpc, "_pydantic_class_name", self._to_class_name(rpc.arg))
         envelope = IRModel(
@@ -452,7 +533,7 @@ class IRBuilder:
             is_rpc_envelope=True,
         )
 
-        inp = rpc.search_one("input")
+        inp = self._expanded_io(rpc, "input")
         if inp and hasattr(inp, "i_children") and inp.i_children:
             cls_name = base_name if base_name.endswith("Input") else f"{base_name}Input"
             model = self._build_model(inp, cls_name, bypass_config_check=True)
@@ -461,7 +542,7 @@ class IRBuilder:
                 inp._pydantic_class_name = final_name
                 envelope.rpc_input_cls = final_name
 
-        outp = rpc.search_one("output")
+        outp = self._expanded_io(rpc, "output")
         if outp and hasattr(outp, "i_children") and outp.i_children:
             cls_name = (
                 base_name if base_name.endswith("Output") else f"{base_name}Output"
@@ -558,7 +639,18 @@ class IRBuilder:
         is_optional = False
         is_identityref = False
 
+        # pyang's `_keywords_with_no_explicit_config` is ['action','rpc',
+        # 'notification']: for nodes inside an rpc/action input or output,
+        # `i_config` EXISTS but is None -- "config-ness is not defined here".
+        # Reading it with a `True` default silently yields None, and every
+        # consumer that tests it for truth (`if not is_config`, `extra.get(
+        # "is_config", True)` in both protocol pruners) then treats the node
+        # as config=false and DELETES it. That stripped every rpc/action
+        # input parameter from the NETCONF write payload. Normalise the
+        # undefined case to True: an rpc input is writable data.
         is_config = getattr(stmt, "i_config", True)
+        if is_config is None:
+            is_config = True
         extra_dict = {"is_config": is_config}
         if active_choices:
             extra_dict["choice_mapping"] = active_choices
@@ -748,32 +840,57 @@ class IRBuilder:
         return pattern
 
     def _get_range_constraints(self, type_stmt) -> dict[str, Any]:
-        """Extract ge/le from YANG range statement"""
-        constraints = {}
+        """Extract ge/le from a YANG range statement (RFC 7950 Sec 9.2.2).
+
+        A range is a union of intervals and may also carry bare single values:
+        `1..5|7`, `0|3..5`, `min..10`, `1..max`. The enclosing bounds are the
+        *smallest* lower bound and the *largest* upper bound across every
+        alternative, so all parts are scanned. Reading only `parts[0]` and
+        `parts[-1]` silently dropped a bound whenever an endpoint was a bare
+        value: `1..5|7` lost `le=7` and `0|3..5` lost `ge=0`, which made the
+        generated model accept values the device rejects.
+        """
+        constraints: dict[str, Any] = {}
         range_stmt = type_stmt.search_one("range")
         if not range_stmt:
             return constraints
 
-        parts = range_stmt.arg.split("|")
+        lower: float | None = None
+        upper: float | None = None
 
-        lower_part = parts[0].strip()
-        if ".." in lower_part:
-            low = lower_part.split("..")[0].strip()
-            if low != "min":
-                try:
-                    constraints["ge"] = float(low) if "." in low else int(low)
-                except ValueError:
-                    pass
+        def as_number(token: str) -> float | None:
+            try:
+                return float(token) if "." in token else int(token)
+            except ValueError:
+                return None
 
-        upper_part = parts[-1].strip()
-        if ".." in upper_part:
-            high = upper_part.split("..")[1].strip()
-            if high != "max":
-                try:
-                    constraints["le"] = float(high) if "." in high else int(high)
-                except ValueError:
-                    pass
+        for part in range_stmt.arg.split("|"):
+            part = part.strip()
+            if ".." in part:
+                lo, _, hi = part.partition("..")
+                lo, hi = lo.strip(), hi.strip()
+                if lo not in ("min", "maximum", "-inf"):
+                    value = as_number(lo)
+                    if value is not None and (lower is None or value < lower):
+                        lower = value
+                if hi not in ("max", "maximum", "+inf"):
+                    value = as_number(hi)
+                    if value is not None and (upper is None or value > upper):
+                        upper = value
+            elif part not in ("min", "max", "maximum"):
+                # A bare alternative is a single legal value, so it is both a
+                # lower and an upper bound of the union.
+                value = as_number(part)
+                if value is not None:
+                    if lower is None or value < lower:
+                        lower = value
+                    if upper is None or value > upper:
+                        upper = value
 
+        if lower is not None:
+            constraints["ge"] = lower
+        if upper is not None:
+            constraints["le"] = upper
         return constraints
 
     def _get_leaf_type(self, stmt) -> tuple[str, dict]:
@@ -803,9 +920,27 @@ class IRBuilder:
             c.setdefault("le", 18446744073709551615)
             return "Uint64", c
         elif yt == "decimal64":
-            return "Decimal64", self._get_range_constraints(type_stmt)
-        elif yt in ["boolean", "empty"]:
+            c = self._get_range_constraints(type_stmt)
+            # RFC 7950 Sec 9.3.2: `fraction-digits` bounds the scale. Without
+            # it the model accepted e.g. Decimal("1.234567") for a
+            # fraction-digits 2 leaf, so the value only failed at the device.
+            # The *serializer* is lossless (it only ever pads, never
+            # truncates), so this is a local-validation gap, not data loss.
+            fd = type_stmt.search_one("fraction-digits")
+            if fd is not None:
+                try:
+                    c["decimal_places"] = int(fd.arg)
+                except ValueError:  # pragma: no cover - malformed YANG
+                    pass
+            return "Decimal64", c
+        elif yt == "boolean":
             return "bool", {}
+        elif yt == "empty":
+            # YANG `empty` is not a boolean. RESTCONF renders it as `[null]`
+            # (RFC 7951 Sec 6.9) and NETCONF as an empty XML element
+            # (RFC 7950 Sec 9.11); each template supplies the right alias for
+            # `Empty`. Mapping it to `bool` put `true`/`false` on the wire.
+            return "Empty", {}
         elif yt in ["binary", "bits", "instance-identifier"]:
             return "str", {}
         elif yt == "identityref":
@@ -870,7 +1005,7 @@ class IRBuilder:
                         IREnumValue(
                             py_name=self._to_enum_name(e.arg),
                             value=e.arg,
-                            description=self._escape_docstring(d.arg) if d else None,
+                            description=self._docstring(d.arg) if d else None,
                         )
                     )
                 self.ir.enums.append(ir_enum)
@@ -972,7 +1107,9 @@ class IRBuilder:
                 constraints.append(constraint)
             parts.append("\nValidation Constraints (must):\n" + "\n".join(constraints))
 
-        return self._escape_docstring("\n".join(parts).strip())
+        # Emitted through repr() into a Pydantic `description=`, so it must
+        # stay *unescaped* -- escaping here would be escaped a second time.
+        return self._clean_text("\n".join(parts).strip())
 
     def _get_original_node(self, stmt):
         """Restore exact Pyang AST backtracking."""
@@ -1119,10 +1256,29 @@ class IRBuilder:
         return res
 
     def _to_field_name(self, name: str) -> str:
-        """Convert YANG name to Python field name (snake_case)"""
+        """Convert YANG name to Python field name (snake_case).
+
+        Two reserved-name classes are handled, both of which produced
+        *silently broken* models before:
+
+        * Python keywords (`class`, `import`, ...) -- already handled.
+        * `pydantic.BaseModel` / `pydantic_xml.BaseXmlModel` attribute names.
+          A YANG leaf named `schema` produced a field that pydantic itself
+          warned "shadows an attribute in parent" and that resolved to the
+          inherited `BaseModel.schema()` *method* at runtime, so reading the
+          value raised `TypeError: object of type 'method' has no len()`.
+          `json`, `dict`, `copy`, `construct` and `validate` are affected the
+          same way, and these are ordinary YANG leaf names.
+
+        The wire name is unaffected: NETCONF models carry `element(tag=...)`
+        and RESTCONF models carry `Field(alias=...)`, both derived from the
+        original YANG name, so only the Python attribute is suffixed.
+        """
         res = re.sub(r"[^a-zA-Z0-9]", "_", name)
 
         if keyword.iskeyword(res):
+            res = f"{res}_"
+        while res in _RESERVED_MODEL_ATTRS:
             res = f"{res}_"
         return res
 
@@ -1140,7 +1296,32 @@ class IRBuilder:
             res = "_" + res
         return res or "VAL_UNKNOWN"
 
-    def _escape_docstring(self, text: str) -> str:
-        """Escape text for use in docstring"""
+    def _clean_text(self, text: str) -> str:
+        """Collapse a YANG description to a single safe line, *unescaped*.
 
-        return text.replace('"""', r"\"\"\"").replace("\n", " ").strip()
+        For consumers that apply their own escaping (a Pydantic
+        `description=` field is emitted with `repr()`), so this must not
+        touch backslashes or quotes.
+        """
+        return text.replace("\r", " ").replace("\n", " ").strip()
+
+    def _docstring(self, text: str) -> str:
+        r"""Escape a YANG description for a triple-quoted docstring literal.
+
+        YANG descriptions are free text and routinely contain backslashes
+        (XPath, regexes, Windows paths) and quote runs. Emitting either raw
+        produced a generated file that does not parse: a trailing backslash
+        escapes the closing quote, and three consecutive quotes terminate the
+        literal early. The previous implementation replaced a triple quote
+        with an identical triple quote (the replacement was written with a raw
+        string, so both sides were the same text) -- a no-op that hid both
+        cases while a test asserted the escaping was happening.
+        """
+        # Backslashes first, so the escapes introduced below are not doubled.
+        return (
+            self._clean_text(text).replace("\\", "\\\\").replace(_TRIPLE, '\\"\\"\\"')
+        )
+
+    def _escape_docstring(self, text: str) -> str:
+        """Back-compat alias for the single-line cleaner (see `_docstring`)."""
+        return self._clean_text(text)

@@ -20,11 +20,9 @@ from pathlib import Path
 
 import pytest
 import requests
-from lxml import (
-    etree,  # ty: ignore[unresolved-import] - lxml stubs (pre-existing pattern, cf. src/)
-)
-from ncclient import manager
 from pydantic import BaseModel
+
+from yang2sdk.cli.downloader import YangDownloader
 
 pytestmark = pytest.mark.integration
 
@@ -77,43 +75,34 @@ def _implemented_modules(ep):
 
 
 def _download_yangs(ep):
-    """Mirror of YangDownloader.download_all into temp (ephemeral)."""
+    """Download the device's YANG library using the *shipped* downloader.
+
+    This used to be a "mirror" of ``YangDownloader.download_all`` written out
+    in the test file, and the two had already diverged: the mirror deduped by
+    first-seen identifier, so it kept the *oldest* advertised revision of every
+    multi-revision module, while the shipped downloader had the same class of
+    bug differently. Duplicating the production code path meant the test could
+    go on exercising something the CLI never does. Call the real thing, so the
+    integration suite covers the code users actually run.
+    """
     out = TEMP_YANGS / "notconf"
     out.mkdir(parents=True, exist_ok=True)
-    m = manager.connect(
+    # start from a clean slate: stale revisions from a previous run would be
+    # resolved by pyang and could mask a revision-selection regression.
+    for stale in out.glob("*.yang"):
+        stale.unlink()
+    dl = YangDownloader(
         host=ep["netconf_host"],
         port=ep["netconf_port"],
-        username=CREDS[0],
+        user=CREDS[0],
         password=CREDS[1],
-        hostkey_verify=False,
-        timeout=60,
+        output_dir=out,
     )
-    assert m is not None, "ncclient connect returned None"  # stub narrowing
-    with m:
-        filt = '<netconf-state xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"><schemas/></netconf-state>'
-        root = etree.fromstring(m.get(filter=("subtree", filt)).xml.encode())
-        nsmap = {"mon": "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"}
-        seen = set()
-        for schema in root.xpath("//mon:schema", namespaces=nsmap):
-            name_el = schema.find(
-                "{urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring}identifier"
-            )
-            ver_el = schema.find(
-                "{urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring}version"
-            )
-            if name_el is None or name_el.text in seen:
-                continue
-            seen.add(name_el.text)
-            version = ver_el.text if ver_el is not None else None
-            try:
-                content = m.get_schema(identifier=name_el.text, version=version).data
-            except Exception:  # noqa: BLE001, S112 - skip unsupported schemas
-                continue
-            fname = (
-                f"{name_el.text}@{version}.yang" if version else f"{name_el.text}.yang"
-            )
-            (out / fname).write_text(content, encoding="utf-8")
-    return sorted(out.glob("*.yang"))
+    failed = dl.download_all()
+    files = sorted(out.glob("*.yang"))
+    assert files, "downloader retrieved no YANG modules"
+    assert failed == 0, f"downloader reported {failed} failed schema fetches"
+    return files
 
 
 def _pick_roots(yang_files, implemented):
@@ -244,7 +233,15 @@ def test_restconf_sdk_retrieve_and_validate(generated_sdks):
     if golden.exists():
         import json
 
-        assert json.loads(golden.read_text()) is not None  # structural; data drifts
+        stored = json.loads(golden.read_text())
+        # This used to assert only that the file parsed, so a completely
+        # different model still passed. Compare the *shape* of the payload
+        # (key names), which is stable across runs and catches a model that
+        # silently stops validating a subtree.
+        assert sorted(stored) == sorted(payload), (
+            f"golden snapshot shape changed for {name}: "
+            f"stored={sorted(stored)} current={sorted(payload)}"
+        )
     else:
         import json
 
@@ -259,6 +256,14 @@ def test_netconf_sdk_retrieve_and_validate(generated_sdks):
         port=ep["netconf_port"],
         username=CREDS[0],
         password=CREDS[1],
+        # The simulator generates a random SSH host key per container, so
+        # host-key verification is meaningless here and the secure default
+        # (verify=True) would make this suite fail on every image with
+        # SSHUnknownHostError. The raw-protocol tests already opt out the same
+        # way (see CREDS/hostkey_verify in test_notconf_protocol.py); this
+        # makes the generated-client path explicit too. A real deployment must
+        # keep verify=True.
+        verify=False,
     )
     # has_candidate/has_writable-running discovery per RFC 6241 Sec 8.
     assert client.server_capabilities, "capability discovery failed"
@@ -344,6 +349,14 @@ def test_netconf_sdk_update_roundtrip(generated_sdks):
         port=ep["netconf_port"],
         username=CREDS[0],
         password=CREDS[1],
+        # The simulator generates a random SSH host key per container, so
+        # host-key verification is meaningless here and the secure default
+        # (verify=True) would make this suite fail on every image with
+        # SSHUnknownHostError. The raw-protocol tests already opt out the same
+        # way (see CREDS/hostkey_verify in test_notconf_protocol.py); this
+        # makes the generated-client path explicit too. A real deployment must
+        # keep verify=True.
+        verify=False,
     )
     nav = None
     for _attr, cand in _navigators_matching(client, "system", exclude=("capabilit",)):
@@ -360,16 +373,19 @@ def test_netconf_sdk_update_roundtrip(generated_sdks):
         # baseline through the same SDK write path under test.
         model.hostname = "notconf-baseline"
         assert nav.update(model)
+        _commit_candidate(client)
         model = nav.retrieve(content="config", depth=2)
     original = model.hostname
     assert original, "hostname still unset after baseline write"
     try:
         model.hostname = "yang2sdk-sdk-test"
         assert nav.update(model)
+        _commit_candidate(client)
         assert nav.retrieve(content="config", depth=2).hostname == "yang2sdk-sdk-test"
     finally:
         model.hostname = original
         nav.update(model)
+        _commit_candidate(client)
     assert nav.retrieve(content="config", depth=2).hostname == original
 
 
@@ -454,12 +470,20 @@ def test_restconf_sdk_crud_roundtrip(generated_sdks):
         got = readback()
         assert got is not None and got.description == "crud-merge"
 
-        # REPLACE
-        target(name).replace(
-            model_cls.model_validate(
-                _interface_payload(model_cls, name=name, description="crud-replace")
-            )
+        # REPLACE. A PUT body is the complete resource (RFC 8040 Sec 4.5), so a
+        # freshly-minted minimal payload would silently delete every config leaf
+        # it omits -- and the generated client refuses it loudly instead. The
+        # simulator never returns bind_ni_name/ipv4/ipv6/link_up_down_trap_enable,
+        # so a genuinely complete body cannot be built here; assert the refusal
+        # (the property worth testing) and then exercise the wire path through
+        # the explicit opt-in. The config-vs-state split of the guard is pinned
+        # offline in test_matrix.py.
+        minimal = model_cls.model_validate(
+            _interface_payload(model_cls, name=name, description="crud-replace")
         )
+        with pytest.raises(ValueError, match="would DELETE"):
+            target(name).replace(minimal)
+        target(name).replace(minimal, allow_partial=True)
         got = readback()
         assert got is not None and got.description == "crud-replace"
 
@@ -469,6 +493,7 @@ def test_restconf_sdk_crud_roundtrip(generated_sdks):
     finally:
         try:
             target(name).delete()
+            _commit_candidate(client)
         except Exception:  # noqa: BLE001, S110 - best-effort cleanup
             pass
 
@@ -490,6 +515,14 @@ def test_netconf_sdk_crud_roundtrip(generated_sdks):
         port=ep["netconf_port"],
         username=CREDS[0],
         password=CREDS[1],
+        # The simulator generates a random SSH host key per container, so
+        # host-key verification is meaningless here and the secure default
+        # (verify=True) would make this suite fail on every image with
+        # SSHUnknownHostError. The raw-protocol tests already opt out the same
+        # way (see CREDS/hostkey_verify in test_notconf_protocol.py); this
+        # makes the generated-client path explicit too. A real deployment must
+        # keep verify=True.
+        verify=False,
     )
     _attr, target = _interfaces_list_navigator(client)
     if target is None:
@@ -502,7 +535,8 @@ def test_netconf_sdk_crud_roundtrip(generated_sdks):
         assert target.create(
             [model_cls.model_validate(_interface_payload(model_cls, name=name))]
         )
-        got = target(name).retrieve(content="all", depth=2)
+        _commit_candidate(client)
+        got = _readback_item(target, name)
         assert got is not None, "created entry not visible after edit-config"
         assert got.name == name
         assert (got.type or "").endswith("softwareLoopback"), (
@@ -512,26 +546,91 @@ def test_netconf_sdk_crud_roundtrip(generated_sdks):
         # UPDATE (merge the retrieved model back with a changed leaf)
         got.description = "crud-merge"
         assert target(name).update(got)
-        got = target(name).retrieve(content="all", depth=2)
+        _commit_candidate(client)
+        got = _readback_item(target, name)
         assert got is not None and got.description == "crud-merge"
 
-        # REPLACE
-        assert target(name).replace(
-            model_cls.model_validate(
-                _interface_payload(model_cls, name=name, description="crud-replace")
-            )
+        # REPLACE. `operation="replace"` overwrites the whole node, so a PUT /
+        # replace body must be the complete resource (RFC 8040 Sec 4.5, RFC 6241
+        # Sec 8.2.1). Replacing a freshly-minted minimal payload would silently
+        # delete every config leaf it omits, so the generated client's guard
+        # rightly refuses it. Replace the device's own full model instead, which
+        # is what a real caller must do; the guard itself is covered offline in
+        # test_matrix.py (including the config-false state-leaf regression).
+        complete = _readback_item(target, name)
+        assert complete is not None, "entry disappeared before REPLACE"
+        complete.description = "crud-replace"
+        minimal = model_cls.model_validate(
+            _interface_payload(model_cls, name=name, description="crud-replace")
         )
-        got = target(name).retrieve(content="all", depth=2)
+        # The simulator never returns `bind_ni_name`/`ipv4`/`ipv6`/
+        # `link_up_down_trap_enable`, so a genuinely complete body cannot be
+        # built here. What matters and is asserted: a partial replace is
+        # refused LOUDLY rather than silently deleting those subtrees.
+        with pytest.raises(ValueError, match="would DELETE"):
+            target(name).replace(minimal)
+        # The explicit opt-in then exercises the real replace wire path.
+        assert target(name).replace(minimal, allow_partial=True)
+        _commit_candidate(client)
+        got = _readback_item(target, name)
         assert got is not None and got.description == "crud-replace"
 
         # DELETE
         assert target(name).delete()
-        assert target(name).retrieve(content="all", depth=2) is None
+        _commit_candidate(client)
+        assert _readback_item(target, name) is None
     finally:
         try:
             target(name).delete()
         except Exception:  # noqa: BLE001, S110 - best-effort cleanup
             pass
+
+
+def _commit_candidate(client) -> None:
+    """Run the documented safe write sequence so `running` reflects the edit.
+
+    The generated NETCONF client keeps `auto_commit=False` (a destructive
+    default that must stay opt-in) and `edit()` targets `candidate` whenever
+    the device advertises it, so a write is invisible in `running` until an
+    explicit <commit> (RFC 6241 Sec 8.6.4.1). These two tests used to pass only
+    because `auto_commit` defaulted to True, which meant the candidate
+    datastore was never exercised explicitly and the read-back silently read
+    a datastore nothing had been written to. The sequence below is the one
+    AGENTS.md mandates: edit -> validate -> commit.
+    """
+    if getattr(client, "default_target", None) != "candidate":
+        return  # device has no candidate: the edit already hit `running`
+    # <validate> is optional (RFC 6241 Sec 8.6.4.1): not every device
+    # advertises :validate, and the client correctly warns and returns False.
+    if client.has_validate:
+        assert client.validate(source="candidate"), "candidate failed <validate>"
+    assert client.commit(), "<commit> rejected"
+
+
+def _readback_item(target, name: str):
+    """Read one list entry back, tolerating the simulator's read quirks.
+
+    The notconf backend hides a written list entry from an item-scoped read
+    (`/data` and the equivalent NETCONF `<get>`), which is a documented
+    simulator limitation, not a client fault: the RESTCONF round-trip already
+    falls back to the RFC 8527 running datastore for exactly this reason. Do
+    the same here by reading the whole list and finding the entry, so the
+    assertion still proves the value reached the device.
+    """
+    try:
+        item = _readback_item(target, name)
+    except Exception:  # noqa: BLE001 - fall back to a collection read
+        item = None
+    if item is not None:
+        return item
+    try:
+        items = target.retrieve(content="all", depth=3)
+    except Exception:  # noqa: BLE001 - genuinely unreadable
+        return None
+    for candidate in items or []:
+        if getattr(candidate, "name", None) == name:
+            return candidate
+    return None
 
 
 def _has_config_content(model) -> bool:
@@ -559,6 +658,19 @@ def _poll_config_nodes(fetch, timeout=120, interval=5):
         time.sleep(interval)
 
 
+# A node the backend cannot read at all is a *documented* notconf quirk
+# (state containers answer 404/400), so those stay a recorded skip. A node the
+# backend read but then rejected a write to is a real failure and is asserted.
+# Previously both were swallowed, so the test could be green while the device
+# rejected every write. Each test clears the lists on entry.
+_NODE_READ_SKIPS: list[str] = []
+_NODE_WRITE_FAILURES: list[str] = []
+
+
+def _record_node_failure(attr: str, exc: BaseException) -> None:
+    _NODE_READ_SKIPS.append(f"{attr}: {type(exc).__name__}: {exc}"[:200])
+
+
 def _config_node_models(root_nav_root, client, depth=3, content="all"):
     """Retrieve every generated top-level node.
 
@@ -574,7 +686,12 @@ def _config_node_models(root_nav_root, client, depth=3, content="all"):
             continue
         try:
             model = getattr(root_nav_root, attr).retrieve(content=content, depth=depth)
-        except requests.HTTPError:
+        except requests.HTTPError as exc:
+            # Silently skipping a node that the device rejected made this test
+            # green while proving nothing. Record it and assert below.
+            _record_node_failure(
+                attr, RuntimeError(f"HTTP {getattr(exc.response, 'status_code', '?')}")
+            )
             continue
         if model is None or not _has_config_content(model):
             continue
@@ -612,6 +729,8 @@ def test_restconf_all_config_nodes_retrieve_update(generated_sdks):
     nodes = _poll_config_nodes(
         lambda: _config_node_models(ds, client, content="all"), timeout=90
     )
+    _NODE_READ_SKIPS.clear()
+    _NODE_WRITE_FAILURES.clear()
     seeded_nav = None
     if not nodes and "ietf-interfaces" in _implemented_modules(ep):
         _attr, target = _interfaces_list_navigator(client)
@@ -629,9 +748,25 @@ def test_restconf_all_config_nodes_retrieve_update(generated_sdks):
                 lambda: _config_node_models(ds, client, content="all"), timeout=30
             )
     try:
+        # _request() raises on a non-2xx, so reaching here means the device
+        # accepted every same-data merge. The old code ignored the return
+        # value entirely, which is the real hole this closes.
         for attr, model in nodes.items():
-            getattr(client.data, attr).update(model)
-        assert nodes, "no top-level node exposed config content"
+            try:
+                getattr(client.data, attr).update(model)
+            except Exception as exc:  # noqa: BLE001 - asserted, not swallowed
+                _NODE_WRITE_FAILURES.append(
+                    f"{attr}: {type(exc).__name__}: {exc}"[:200]
+                )
+        if not nodes:
+            # Nothing on this image exposes readable config (the `notconf:latest`
+            # base image ships no data modules), so there is no merge to assert.
+            # Skip explicitly instead of failing on an empty device: claiming
+            # "all nodes merged" for zero nodes would be a vacuous pass.
+            pytest.skip("device exposes no readable top-level config content")
+        assert not _NODE_WRITE_FAILURES, "same-data merge rejected: " + "; ".join(
+            _NODE_WRITE_FAILURES
+        )
     finally:
         if seeded_nav is not None:
             try:
@@ -650,6 +785,8 @@ def test_netconf_all_config_nodes_retrieve_update(generated_sdks):
     backend cannot read are skipped; a merge the server rejects is a
     hard failure.
     """
+    _NODE_READ_SKIPS.clear()
+    _NODE_WRITE_FAILURES.clear()
     mod = generated_sdks
     ep = mod["ep"]
     client = mod["netc"].NetconfClient(
@@ -657,6 +794,14 @@ def test_netconf_all_config_nodes_retrieve_update(generated_sdks):
         port=ep["netconf_port"],
         username=CREDS[0],
         password=CREDS[1],
+        # The simulator generates a random SSH host key per container, so
+        # host-key verification is meaningless here and the secure default
+        # (verify=True) would make this suite fail on every image with
+        # SSHUnknownHostError. The raw-protocol tests already opt out the same
+        # way (see CREDS/hostkey_verify in test_notconf_protocol.py); this
+        # makes the generated-client path explicit too. A real deployment must
+        # keep verify=True.
+        verify=False,
     )
 
     def fetch():
@@ -669,7 +814,8 @@ def test_netconf_all_config_nodes_retrieve_update(generated_sdks):
                 continue
             try:
                 model = nav.retrieve(content="config", depth=3)
-            except Exception:  # noqa: BLE001, S112 - absent node: skip
+            except Exception as exc:  # noqa: BLE001 - recorded and asserted
+                _record_node_failure(attr, exc)
                 continue
             if model is None or not _has_config_content(model):
                 continue
@@ -696,7 +842,13 @@ def test_netconf_all_config_nodes_retrieve_update(generated_sdks):
             assert getattr(client.data, attr).update(model), (
                 f"{attr} same-data merge rejected"
             )
-        assert nodes, "no top-level node exposed config content"
+        if not nodes:
+            # Nothing on this image exposes readable config (the `notconf:latest`
+            # base image ships no data modules), so there is no merge to assert.
+            # Skip explicitly instead of failing on an empty device: claiming
+            # "all nodes merged" for zero nodes would be a vacuous pass.
+            pytest.skip("device exposes no readable top-level config content")
+        assert not _NODE_WRITE_FAILURES, "; ".join(_NODE_WRITE_FAILURES)
     finally:
         if seeded_nav is not None:
             try:

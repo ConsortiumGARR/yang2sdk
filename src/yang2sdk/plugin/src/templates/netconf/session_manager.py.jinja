@@ -10,7 +10,59 @@ from lxml import etree
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
-_SENSITIVE_KEYS = ("password", "passwd", "secret", "token", "auth", "community", "private-key")
+# RFC 6241 Sec 8.1 / RFC 8526 Sec 3.1.1 base capability URIs. A capability is
+# a bare URI optionally followed by "?" parameters; a module capability is
+# "<namespace>?module=<name>&..." and must never be mistaken for a protocol
+# capability, hence the exact base comparison in _has_capability().
+_CAP_CANDIDATE = "urn:ietf:params:netconf:capability:candidate:1.0"
+_CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0"
+_CAP_NMDA = "urn:ietf:params:netconf:capability:nmda:1.0"
+_CAP_CONFIRMED_COMMIT = "urn:ietf:params:netconf:capability:confirmed-commit:1.1"
+_CAP_ROLLBACK_ON_ERROR = "urn:ietf:params:netconf:capability:rollback-on-error:1.0"
+_CAP_VALIDATE = "urn:ietf:params:netconf:capability:validate:1.0"
+
+
+def _has_capability(capabilities, uri: str) -> bool:
+    """True when `uri` is advertised as a base capability (exact match)."""
+    return any(cap.split("?", 1)[0].strip().lower() == uri for cap in capabilities)
+
+
+def _rpcerror_attr(err, name: str) -> str:
+    """Read an RPCError attribute without ever raising from the error path.
+
+    ncclient 0.7 models these as properties over `_tag`/`_type`/`_severity`,
+    which are absent when the error list holds plain strings, so `getattr`
+    on the public name can itself raise AttributeError.
+    """
+    try:
+        return str(getattr(err, name) or "")
+    except Exception:  # noqa: BLE001 - error reporting must not fail
+        try:
+            return str(getattr(err, f"_{name}") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def _rpcerror_text(err) -> str:
+    """Best-effort plain text for an RPCError, preferring the raw XML."""
+    try:
+        xml = getattr(err, "xml", None)
+        if xml is not None:
+            return " ".join(etree.tostring(xml).decode(errors="replace").split())
+    except Exception:  # noqa: BLE001 - error reporting must not fail
+        pass
+    return str(err)
+
+# Substring match against lower-cased keys. `passphrase` is the important
+# addition: it contains neither "password" nor "passwd", so NTP/TACACS/RADIUS
+# authenticator passphrases were written to the log in cleartext whenever
+# log_bodies was enabled. Bare "key" is deliberately absent -- a `key` leaf is
+# far more often a primary key than a secret.
+_SENSITIVE_KEYS = (
+    "password", "passwd", "passphrase", "secret", "token", "auth", "community",
+    "private-key", "privatekey", "psk", "pre-shared", "preshared", "credential",
+    "credentials", "md5", "username",
+)
 
 
 def _redact(obj: Any, _depth: int = 0) -> Any:
@@ -93,7 +145,7 @@ class NetconfClient:
     scheme on RESTCONF).
     """
 
-    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = True, log_bodies: bool = False, **kwargs):
+    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = False, log_bodies: bool = False, **kwargs):
         # Back-compat alias: older generated code / call sites used
         # hostkey_verify explicitly. `verify` wins when both are given.
         if "hostkey_verify" in kwargs:
@@ -120,6 +172,12 @@ class NetconfClient:
             log.warning("NETCONF hostkey_verify=False (verify=False) is an explicit lab-only opt-out; never use in production.")
         if log_bodies:
             log.warning("NETCONF log_bodies=True may log config/secrets; debug use only, never in production.")
+        if auto_commit:
+            # auto_commit commits the candidate after EVERY edit, so a
+            # multi-step change can never be reviewed, validated or rolled
+            # back. It is opt-in for that reason; prefer the explicit
+            # validate() -> commit() sequence.
+            log.warning("NETCONF auto_commit=True commits after every edit; prefer auto_commit=False plus validate() then commit().")
 
         if not self.host:
             raise ValueError("Either loopback_ip or management_ip must be provided")
@@ -137,9 +195,28 @@ class NetconfClient:
         
         # Capability Discovery (RFC 6241 Sec 8)
         self.server_capabilities = list(self._manager.server_capabilities)
-        self.has_candidate = any("urn:ietf:params:netconf:capability:candidate:1.0" in cap for cap in self.server_capabilities)
-        self.has_writable_running = any("urn:ietf:params:netconf:capability:writable-running:1.0" in cap for cap in self.server_capabilities)
-        self.has_nmda = any("ietf-netconf-nmda" in cap for cap in self.server_capabilities)
+        self.has_candidate = _has_capability(self.server_capabilities, _CAP_CANDIDATE)
+        self.has_writable_running = _has_capability(self.server_capabilities, _CAP_WRITABLE_RUNNING)
+        # RFC 8526 Sec 3.1.1: NMDA is signalled by an explicit base capability
+        # URI. Matching the *module* name is wrong: a device routinely
+        # advertises `.../yang:ietf-netconf-nmda?module=ietf-netconf-nmda&...`
+        # as a module capability while implementing no NMDA at all. SR Linux is
+        # exactly that case -- the previous substring test set has_nmda=True and
+        # routed every read to a <get-data> the device rejects with
+        # "unknown-element", so 100% of datastore reads failed.
+        self.has_nmda = _has_capability(self.server_capabilities, _CAP_NMDA)
+        self.has_confirmed_commit = _has_capability(self.server_capabilities, _CAP_CONFIRMED_COMMIT)
+        self.has_rollback_on_error = _has_capability(self.server_capabilities, _CAP_ROLLBACK_ON_ERROR)
+        # Plain attributes, not methods, for every capability flag: the five
+        # siblings above are attributes, and a lone method among them is a
+        # trap -- `if client.has_validate:` is always truthy (it tests a bound
+        # method), so validation would be silently skipped on a device that
+        # does not implement it.
+        self.has_validate = _has_capability(self.server_capabilities, _CAP_VALIDATE)
+        if self.has_nmda:
+            log.info("Device supports NMDA (RFC 8526): reads/writes routed via get-data/edit-data.")
+        else:
+            log.info("Device does not advertise NMDA; using legacy get/get-config/edit-config.")
 
         # RFC 6241 Sec 8.3: module capabilities are 'namespace?module=name&...'.
         # Maps module name -> namespace for identityref prefix binding on
@@ -167,25 +244,71 @@ class NetconfClient:
         self.operations = Operations(self, path=[])
 
     def __enter__(self) -> Self:
-        """Context manager for safe, locked transaction blocks."""
-        self.lock()
+        """Context manager: lock on entry, release the session on exit.
+
+        Preferred over a bare constructor because `close()` is guaranteed to
+        run. `manager.connect()` opens an SSH transport and a NETCONF session
+        that the device counts against its session limits; nothing released
+        them before this existed except garbage collection.
+        """
+        try:
+            self.lock()
+        except Exception:  # noqa: BLE001 - some devices refuse <lock> on :candidate
+            log.warning("Could not acquire a NETCONF lock; continuing unlocked.", exc_info=True)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None and self.has_candidate:
-            log.warning("Exception during transaction, discarding candidate changes.")
-            self.discard_changes()
-        self.unlock()
+        # Order matters: never let cleanup mask the original exception.
+        try:
+            if exc_type is not None:
+                log.warning("Exception during transaction, discarding candidate changes.")
+                try:
+                    self.discard_changes()
+                except Exception:  # noqa: BLE001 - best-effort rollback
+                    log.warning("discard_changes() failed; the candidate may hold partial changes.", exc_info=True)
+        finally:
+            try:
+                self.unlock()
+            except Exception:  # noqa: BLE001 - best-effort unlock
+                log.warning("unlock() failed; the lock may persist until the session drops.", exc_info=True)
+            self.close()
+
+    def close(self) -> None:
+        """Release the NETCONF session and its SSH transport. Idempotent."""
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return
+        try:
+            manager.close_session()
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            log.debug("close_session() raised during teardown", exc_info=True)
+        finally:
+            self._manager = None
+
+    def __del__(self) -> None:  # pragma: no cover - GC path
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def _mc(self):
+        """The live ncclient manager, or a clear error after close()."""
+        if getattr(self, "_manager", None) is None:
+            raise RuntimeError(
+                "NETCONF session is closed; construct a new NetconfClient."
+            )
+        return self._manager
 
     def lock(self, target: str | None = None) -> bool:
         target = target or self.default_target
         log.debug(f"Acquiring lock on {target} datastore.")
-        return self._handle_rpc(self._manager.lock, target=target).ok
+        return self._handle_rpc(self._mc.lock, target=target).ok
 
     def unlock(self, target: str | None = None) -> bool:
         target = target or self.default_target
         log.debug(f"Releasing lock on {target} datastore.")
-        return self._handle_rpc(self._manager.unlock, target=target).ok
+        return self._handle_rpc(self._mc.unlock, target=target).ok
 
     def _handle_rpc(self, func, *args, **kwargs) -> Any:
         """Centralized error handling for ncclient operations."""
@@ -194,12 +317,35 @@ class NetconfClient:
             log.info("NETCONF dispatch: %s", getattr(func, "__name__", "rpc"))
             return func(*args, **kwargs)
         except RPCError as e:
-            # Transform ncclient XML exceptions into standard Python runtime exceptions
-            error_msg = f"NETCONF RPC Error: {e.tag} (Type: {e.type}, Severity: {e.severity})"
-            if getattr(e, 'message', None):
-                error_msg += f" - {e.message}"
+            # Transform ncclient XML exceptions into standard Python runtime exceptions.
+            #
+            # ncclient's RPCError exposes `tag`/`type`/`severity` as *properties*
+            # over `_tag`/`_type`/`_severity`, which are only populated when
+            # ncclient parsed structured <rpc-error> elements. When it raises
+            # RPCError with a plain-string errlist (ncclient 0.7 does exactly
+            # this for a libyang "InvalidArgument"), `_tag` is never set and
+            # touching `e.tag` raises AttributeError -- so the previous handler
+            # crashed while formatting and the real device message was lost.
+            # Report whatever is available, never raise from the error path.
+            parts = [_rpcerror_attr(e, "tag"), f"Type: {_rpcerror_attr(e, 'type')}",
+                     f"Severity: {_rpcerror_attr(e, 'severity')}"]
+            detail = [_rpcerror_attr(e, "message")]
+            for item in getattr(e, "errlist", None) or []:
+                if item not in detail:
+                    detail.append(str(item))
+            if len(detail) == 1 and not detail[0]:
+                detail = [_rpcerror_text(e)]
+            error_msg = "NETCONF RPC Error: " + " ".join(p for p in parts if p)
+            extra = " - ".join(d for d in detail if d)
+            if extra:
+                error_msg += f" - {extra}"
             log.error(error_msg)
             raise RuntimeError(error_msg) from e
+        except (OSError, ValueError) as e:
+            # A transport or parse failure is not an RPC-level error and has no
+            # errlist; surface it unchanged rather than losing it.
+            log.error("NETCONF transport error: %s", e)
+            raise
 
     def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
         """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running."""
@@ -234,7 +380,7 @@ class NetconfClient:
                 md = etree.SubElement(rpc, "{" + NMDA_NS + "}max-depth")
                 md.text = str(depth)
                 
-            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            reply = self._handle_rpc(self._mc.dispatch, rpc)
 
             # RFC 8526 guarantees output payload wrapper inherits the module namespace.
             # _reply_root keeps ncclient<=0.6 (.ele) and >=0.7 (.xml) working.
@@ -256,9 +402,9 @@ class NetconfClient:
             
             # Legacy <get> does not support querying specific datastores natively, it queries state + running config
             if content in ("all", "nonconfig") or source == "operational":
-                reply = self._handle_rpc(self._manager.get, filter=filter_xml, **kwargs)
+                reply = self._handle_rpc(self._mc.get, filter=filter_xml, **kwargs)
             else:
-                reply = self._handle_rpc(self._manager.get_config, source=source, filter=filter_xml, **kwargs)
+                reply = self._handle_rpc(self._mc.get_config, source=source, filter=filter_xml, **kwargs)
             data_ele = getattr(reply, "data_ele", None)
             if data_ele is not None:
                 return data_ele
@@ -301,12 +447,12 @@ class NetconfClient:
             bind_module_prefixes(rpc, self.module_namespaces)
             if self.log_bodies:
                 log.debug("NETCONF edit-data: %s", _redact(etree.tostring(rpc)))
-            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            reply = self._handle_rpc(self._mc.dispatch, rpc)
             success = reply.ok
 
         else:
             # Fallback to natively constructed Legacy <edit-config> (RFC 6241)
-            # We strictly bypass self._manager.edit_config() to avert multiple-root crashes and tag double-wrapping
+            # We strictly bypass self._mc.edit_config() to avert multiple-root crashes and tag double-wrapping
             NC_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
             rpc = etree.Element("{" + NC_NS + "}edit-config", nsmap={None: NC_NS})
             tgt = etree.SubElement(rpc, "{" + NC_NS + "}target")
@@ -324,7 +470,7 @@ class NetconfClient:
             bind_module_prefixes(rpc, self.module_namespaces)
             if self.log_bodies:
                 log.debug("NETCONF edit-config: %s", _redact(etree.tostring(rpc)))
-            reply = self._handle_rpc(self._manager.dispatch, rpc)
+            reply = self._handle_rpc(self._mc.dispatch, rpc)
             success = reply.ok
 
         if success and target == "candidate" and self.auto_commit:
@@ -335,16 +481,50 @@ class NetconfClient:
         if not self.has_candidate:
             log.debug("Commit requested, but device lacks :candidate capability. Ignoring.")
             return True
-        reply = self._handle_rpc(self._manager.commit)
+        reply = self._handle_rpc(self._mc.commit)
         return reply.ok
+
+    def validate(self, source: str | None = None) -> bool:
+        """Validate datastore contents without touching the running config.
+
+        RFC 6241 Sec 8.6.4.1: the `<validate>` operation takes an optional
+        `<source>` naming the datastore to validate --
+
+            <validate><source><candidate/></source></validate>
+
+        There is NO `<validate-source>` RPC in RFC 6241; an earlier version of
+        this client invented one and every conformant server answered
+        "unknown-element". (The `:validate:1.1` capability instead extends
+        `<edit-config>` to validate an inline `<config>`, Sec 8.6.5.1.)
+
+        This is the safe sequence the generated `auto_commit=False` default
+        exists for:
+
+            client.edit(target="candidate", ...)
+            client.validate(source="candidate")
+            client.commit()
+        """
+        NC_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+        if not self.has_validate:
+            log.warning("Device does not advertise the :validate capability; cannot validate.")
+            return False
+
+        rpc = etree.Element("{" + NC_NS + "}validate", nsmap={None: NC_NS})
+        if source:
+            src = etree.SubElement(rpc, "{" + NC_NS + "}source")
+            etree.SubElement(src, "{" + NC_NS + "}" + source)
+        if self.log_bodies:
+            log.debug("NETCONF validate: %s", _redact(etree.tostring(rpc)))
+        reply = self._handle_rpc(self._mc.dispatch, rpc)
+        return bool(getattr(reply, "ok", True))
 
     def discard_changes(self) -> bool:
         if not self.has_candidate: return True
-        return self._handle_rpc(self._manager.discard_changes).ok
+        return self._handle_rpc(self._mc.discard_changes).ok
 
     def rpc(self, rpc_xml: etree._Element) -> etree._Element | None:
         bind_module_prefixes(rpc_xml, self.module_namespaces)
         if self.log_bodies:
             log.debug("NETCONF rpc: %s", _redact(etree.tostring(rpc_xml)))
-        reply = self._handle_rpc(self._manager.dispatch, rpc_xml)
+        reply = self._handle_rpc(self._mc.dispatch, rpc_xml)
         return _reply_root(reply)

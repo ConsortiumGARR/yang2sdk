@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from lxml import etree
-from ._base import Node, ListNode, ItemNode, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth
+from ._base import Node, ListNode, ItemNode, _require_complete_for_replace, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth
 
 if TYPE_CHECKING:
     from ..data_models import {{ module.py_name }}
@@ -37,7 +37,9 @@ class {{ node.class_name }}Node(ItemNode):
         
         return self._client.edit(config_xml=config_xml, target=target)
 
-    def replace(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str | None = None, **kwargs: Any) -> bool:
+    def replace(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str | None = None, allow_partial: bool = False, **kwargs: Any) -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
+        _require_complete_for_replace(data, allow_partial, {{ node.class_name }})
         return self.update(data, target=target, operation='replace', **kwargs)
 
     def delete(self, *, target: str | None = None) -> bool:
@@ -102,7 +104,9 @@ class {{ node.item_class_name }}Node(ItemNode):
         
         return self._client.edit(config_xml=config_xml, target=target)
 
-    def replace(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str | None = None, **kwargs: Any) -> bool:
+    def replace(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str | None = None, allow_partial: bool = False, **kwargs: Any) -> bool:
+        from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
+        _require_complete_for_replace(data, allow_partial, {{ node.class_name }})
         return self.update(data, target=target, operation='replace', **kwargs)
 
     def delete(self, *, target: str | None = None) -> bool:
@@ -138,8 +142,8 @@ class {{ node.item_class_name }}Node(ItemNode):
     {% endfor %}
 
 class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
-    def __call__(self, {% for k in node.keys %}{{ k.replace('-', '_') }}: str | int{% if not loop.last %}, {% endif %}{% endfor %}) -> {{ node.item_class_name }}Node:
-        keys_dict = { {% for k in node.keys %}'{{ k }}': {{ k.replace('-', '_') }}{% if not loop.last %}, {% endif %}{% endfor %} }
+    def __call__(self, {% for pyname, yangname in node.key_params %}{{ pyname }}: str | int{% if not loop.last %}, {% endif %}{% endfor %}) -> {{ node.item_class_name }}Node:
+        keys_dict = { {% for pyname, yangname in node.key_params %}'{{ yangname }}': {{ pyname }}{% if not loop.last %}, {% endif %}{% endfor %} }
         new_path = self._path[:-1] + [(self._path[-1][0], self._path[-1][1], keys_dict)]
         return {{ node.item_class_name }}Node(self._client, new_path)
 
@@ -227,8 +231,13 @@ class {{ node.class_name }}Node(Node):
         
         {% if node.has_output %}
         if resp_elem is not None and isinstance(resp_elem, etree._Element):
-            # Wrap the <rpc-reply> payload in an <output> element to align with the Pydantic root tag.
-            out_elem = etree.Element("output", nsmap={None: ns} if ns else None)
+            # RFC 7950 Sec 7.15.2: output parameters are encoded as *child
+            # elements of <rpc-reply>*, with no <output> wrapper. pydantic-xml
+            # needs the document root to match the model root tag, so wrap the
+            # children in one. The wrapper MUST carry the module namespace:
+            # the model's root element is namespaced ({ns}output), and an
+            # unqualified "output" fails pydantic-xml's root-element check.
+            out_elem = etree.Element("{" + ns + "}output" if ns else "output", nsmap={None: ns} if ns else None)
             for child in resp_elem:
                 out_elem.append(child)
             return {{ node.class_name }}Output.from_xml_tree(out_elem, module_namespaces=self._client.module_namespaces)
