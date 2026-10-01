@@ -76,13 +76,13 @@ runtime in the same order:
 If either value is still missing, the constructor raises `ValueError` before any
 transport work happens, so there is no such thing as an unauthenticated client
 that fails later with an opaque error. Two names, both protocols, no aliases —
-the same `.env` that `yang-downloader` and `tester` read also works for a
+the same `.env` that `yang-downloader` and `sdk-verify` read also works for a
 generated client.
 
 Transport security defaults are also identical, and both are secure:
 
 | Transport | Default | Opt-out |
-|---|---|---|
+| --- | --- | --- |
 | RESTCONF | `verify=True`, `scheme="https"` | `verify=False` (self-signed lab gear) or `scheme="http"` (plaintext simulator) |
 | NETCONF | host keys verified (`verify=True`) | `verify=False` (lab-only) |
 
@@ -161,7 +161,7 @@ client.data.ietf_interfaces_interface("ethernet-1/1").reset(delay=3)
 > to hit 100% CPU and trigger a watchdog reboot or an OOM kill. Read a subtree
 > with an explicit `depth`; the generated navigators default to `depth=2`.
 
----
+ --- 
 
 ## Quick Start
 
@@ -172,13 +172,13 @@ You need [`uv`](https://github.com/astral-sh/uv) and Python >= 3.12.
 ```bash
 git clone https://github.com/ConsortiumGARR/yang2sdk.git
 cd yang2sdk
-uv sync --locked --extra lab   # lab extra: downloader/tester tooling
+uv sync --locked --extra lab   # lab extra: downloader/sdk-verify tooling
 cp .env.example .env
 ```
 
 Modify and save `.env` with your device's information. `.env` is gitignored and
 must never be committed; the `DEVICE_*` names in it are what `yang-downloader`
-and `tester` read, and they are also the default source for the generated
+and `sdk-verify` read, and they are also the default source for the generated
 clients' credential lookup. `DEVICE_NAME` names the device and therefore the
 output directories; `DEVICE_VERSION` feeds `--device-version` and the generated
 package name.
@@ -187,8 +187,8 @@ Three more example files cover the other environments, all with placeholder
 values and no secrets:
 
 | File | Used by |
-|---|---|
-| `.env.example` | `yang-downloader`, `tester`, local compiles against real gear |
+| --- | --- |
+| `.env.example` | `yang-downloader`, `sdk-verify`, local compiles against real gear |
 | `.env.notconf.example` | the `notconf` simulator matrix (`NOTCONF_USER` / `NOTCONF_PASS` / `NOTCONF_RUN_INTEGRATION`) |
 | `.env.srl-lab.example` | the SR Linux containerlab lab (`SRL_DEVICE_*`) |
 | `.env.lab-device.example` | the real-lab-device NETCONF harness (`LAB_DEVICE_*`) |
@@ -210,7 +210,7 @@ revision of each module (RFC 6022 §3.1.2). Both matter for the next step.
 Identify the *root* modules you want to convert. This can help:
 
 ```bash
-uv run pyang -p temp/yang_modules/device_name/ -f tree temp/yang_modules/device_name/* > temp/yang_tree/device_name.txt
+uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/device_name.txt
 ```
 
 ### Compile to SDK
@@ -219,12 +219,12 @@ Both targets take the same arguments and produce the same navigator surface;
 only the transport differs.
 
 ```bash
-uv run yang2restconf temp/yang_modules/device_name/file1.yang temp/yang_modules/device_name/file2.yang
-uv run yang2netconf  temp/yang_modules/device_name/file1.yang temp/yang_modules/device_name/file2.yang
+uv run yang2restconf temp/yang_modules/<device>/file1.yang temp/yang_modules/<device>/file2.yang
+uv run yang2netconf  temp/yang_modules/<device>/file1.yang temp/yang_modules/<device>/file2.yang
 ```
 
 | Flag | Effect |
-|---|---|
+| --- | --- |
 | `--device` | target device name; defaults to `$DEVICE_NAME` |
 | `--yang-dir` | YANG search path; defaults to `temp/yang_modules/<device>` |
 | `--output-dir` | defaults to `temp/{restconf,netconf}_clients/<device>` |
@@ -245,22 +245,69 @@ is on and prunes subtrees the device actually implements, and the strict models
 device set on purpose, because narrowing is what produces a silently wrong
 model.
 
-### Acquisition of one instance of the model and models validation
+### Validating a generated SDK against a lab device
 
-Fetch the actual read-write configuration in JSON with RESTCONF using the generated client and load it into Pydantic models.
+The offline suite proves the *wire shape* is right. It cannot prove that *your*
+device speaks it. `sdk-verify` closes that gap: it walks the generated client's
+own navigator tree, calls the client's own methods, and records one row per
+(node, method).
 
 > [!WARNING]  
-> **DO NOT REQUEST THE ROOT PATH (`restconf/data/`) ON PRODUCTION.**
-> A large config can hit 100% CPU and trigger a watchdog reboot or OOM kill. Use lab equipment.
+> **Lab equipment only, and never production.** Every read is depth-bounded, but
+> a large config can still hit 100% CPU and trigger a watchdog reboot or OOM
+> kill. The write tiers edit the device; read them before using `--write`.
 
 ```bash
-uv run tester
+# Read every node and round-trip every RPC model. Nothing is modified.
+uv run sdk-verify --device <device> --protocol both --tiers read,rpc
+
+# Report as JSON, for CI or a spreadsheet.
+uv run sdk-verify --device <device> --json-out temp/verify/<device>.json
 ```
 
-`tester` walks every top-level navigator of a RESTCONF client, reads each at
-`content="config", depth=2`, and validates the payload against the generated
-models. It is RESTCONF-only, needs the `lab` extra, and exits non-zero if any
-navigator fails. It connects with `verify=False`, so point it at lab gear.
+It needs the `lab` extra, reads `DEVICE_IP`/`DEVICE_USER`/`DEVICE_PASS` (same
+contract as a generated client: args win, then the environment), and exits
+non-zero if any endpoint fails.
+
+Four tiers, split because "test every CRUD method" cannot be both total and safe:
+
+| Tier | What it does | Gate |
+| --- | --- | --- |
+| `read` | Recursive walk of the **entire** data tree at bounded depth, validating each payload. Automatic. | none |
+| `rpc` | Builds every RPC `Input` and serialises it (`model_dump(by_alias=)`, `to_xml_payload()`) **without sending**. Catches envelope bugs across the whole RPC surface. | none |
+| `rpc` + `--rpc-allowlist` | Actually dispatches the named RPCs, echoing each one first. | `--rpc-allowlist` |
+| `crud` | `retrieve → update → read back` per container, then a proven restore. Idempotent merge, so an interrupted run cannot leave a changed value. | `--write`, plus a second flag |
+
+Every skip carries its reason. A node that covers nothing is never reported as a
+pass, and a device rejection (HTTP 400/404/405, `invalid-value`, `access-denied`)
+is recorded as a skip with the RFC section, not as a client failure. A run in
+which **every** row is a skip exits non-zero with `no endpoint was exercised` —
+a validation tool that cannot fail is not a validation tool.
+
+#### The write gates
+
+`--write` is opt-in, and writing needs a *second* acknowledgement because the two
+transports are not equally reversible:
+
+| Situation | Extra flag | Why |
+| --- | --- | --- |
+| NETCONF with `:candidate` | — | edits stage in `candidate` and are dropped with `<discard-changes>` (RFC 6241 §8.3.5). |
+| NETCONF without `:candidate` | `--allow-running-writes` | edits land in **running** immediately (RFC 6241 §8.2). Only the snapshot can undo them. |
+| RESTCONF (any device) | `--allow-restconf-writes` | `PATCH`/`PUT`/`POST`/`DELETE` are live at once; RESTCONF has no candidate and no `<discard-changes>`. |
+
+Before any write the tool snapshots every node it will touch to
+`temp/verify/<device>-<protocol>-snapshot.json` and **refuses to proceed if that
+fails**. It holds a NETCONF lock for the duration — a lock failure aborts rather
+than warns, because RFC 6241 §8.5.1 makes the lock a precondition for safely
+writing running. Afterwards it compares a digest of the whole tree against the
+pre-test one and reports `RESTORE NOT PROVEN` loudly if they differ, naming the
+snapshot file.
+
+`create`/`delete` are **not** in the automated tier, and that is deliberate: a
+generic value synthesiser cannot satisfy arbitrary `must`/`when`/leafref/mandatory
+constraints, so testing every list would produce false failures against real
+device semantics and could write junk to live gear. The tool reports coverage it
+has rather than coverage it wishes it had.
 
 ### Usage
 
@@ -283,14 +330,16 @@ that cannot be imported is never handed to you.
 
 #### Scaling to Production (Multi-Vendor / Multi-Version)
 
-When managing real networks, it is inevitable to deal with multiple device models, vendors, and OS versions. An option is to structure the automation around a **Hardware Abstraction Layer (HAL)** and concrete **adapters**. 
+When managing real networks, it is inevitable to deal with multiple device models, vendors, and OS versions.
+An option is to structure the automation around a **Hardware Abstraction Layer (HAL)** and concrete **adapters**.
+
 - **HAL:** Exposes generic, vendor-agnostic entities and functions (e.g., `update_port_description(port, description)`).
 - **adapters:** Implements the HAL interfaces using the specific `yang2sdk` clients for a given device and OS version.
 
 One package per device *and* OS version, since different YANG revisions produce
 different models:
 
-```
+```txt
 multi_vendor_automation_project/
 ├── pyproject.toml
 ├── main.py
@@ -365,12 +414,13 @@ NOTCONF_SMOKE_ONLY=1 uv run pytest tests/ --integration   # one image per family
 ```
 
 | File | Needs | In CI |
-|---|---|---|
+| --- | --- | --- |
 | `tests/test_matrix.py` | nothing | yes, every PR |
 | `tests/test_notconf_protocol.py` | docker + `notconf` images | yes, smoke shards |
 | `tests/test_sdk_generate.py` | docker + `notconf` images | yes, smoke shards |
 | `tests/test_srl_netconf.py` | SR Linux containerlab lab | no, lab only |
 | `tests/test_lab_device_netconf.py` | a real lab device | no, lab only |
+| `uv run sdk-verify` | a lab device (or a simulator) | no, manual lab harness |
 
 CI lives in `.github/workflows/`: `ci-pr.yaml` runs lint → typecheck → the
 offline gate → one smoke image per family on every PR, and `ci-nightly.yaml` runs
@@ -420,6 +470,8 @@ Both generated SDKs are exercised against all 11 pre-built `notconf` simulator i
 
 The offline gate is `uv run pytest tests/test_matrix.py`, which runs on every PR with no device and no docker; it covers matrix coverage, the template secure defaults, navigator parity, and the RPC/action wire shapes. The live matrix is opt-in and splits across CI as described under [Development](#development): smoke shards per family on PRs, the full 11 images nightly. A test that covers zero nodes skips rather than passing vacuously — the image ships no config modules, the simulator cannot read the node, or the device has no `:validate`.
 
-Live runs against SR Linux (`get-schema`, `lock`/`commit`/`unlock`, create → validate → commit → delete) and the Groove G30 (`no-op`, `ping`) happen in `tests/test_srl_netconf.py` and `tests/test_lab_device_netconf.py`. **Neither is in any CI workflow**, so those results come from lab runs, not from a gate.
+Live runs against SR Linux (`get-schema`, `lock`/`commit`/`unlock`, create → validate → commit → delete) happen in `tests/test_srl_netconf.py` and `tests/test_lab_device_netconf.py`. **Neither is in any CI workflow**, so those results come from lab runs, not from a gate.
+
+For validating a generated client on real gear, `sdk-verify` (see [Validating a generated SDK against a lab device](#validating-a-generated-sdk-against-a-lab-device)) walks the client's whole navigator tree and records one row per endpoint. It is a lab harness, not a CI gate, and it is where a generator bug that only shows up against a real datastore gets caught.
 
 Known limits (each pinned to a test): write shapes follow strict RFC 8040 + RFC 7951 — `create` POSTs to the parent with a single-element array body (RFC 8040 §4.4.1 + App. B.2.1, exactly one instance) and item `update`/`replace` send single-element array bodies (RFC 8040 §4.5 jukebox album example + RFC 7951 §5.4 list as name/array; PATCH list-instance follows the same JSON encoding, cf. rousette `tests/restconf-plain-patch.cpp` 204); key-mismatch and `requires N keys` errors enforce RFC 8040 §3.5.3/§4.5. Whole-list `replace` PUTs the list resource itself (`tests/test_matrix.py`). Simulator read quirks (`/data` GETs hide written list entries; collection GETs 400; `/ds/...?content=config` 500s; `/ds` item GETs are root-wrapped) are isolated to test read-backs via the RFC 8527 running-datastore container, not baked into the SDK. Details in `tests/test_sdk_generate.py`.

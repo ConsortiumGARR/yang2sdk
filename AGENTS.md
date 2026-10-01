@@ -27,7 +27,7 @@ Concretely, production-grade means:
 yang-downloader (NETCONF get-schema)
   → pyang -f tree inspection (human picks root modules)
   → yang2restconf / yang2netconf (pyang plugin: AST → IR → Jinja)
-  → tester (live RESTCONF fetch + Pydantic validation, LAB ONLY)
+  → sdk-verify (full-tree read + RPC round-trip + gated CRUD, LAB ONLY)
   → publish generated client as versioned package
 ```
 
@@ -38,7 +38,7 @@ yang-downloader (NETCONF get-schema)
 | Compile | `src/yang2sdk/cli/compiler.py` (`yang2restconf`, `yang2netconf`) | In-process pyang invocation. Defaults: `--yang-dir temp/yang_modules/<device>`, `--output-dir temp/{restconf,netconf}_clients/<device>`. Flags: `--device`, `--yang-dir`, `--output-dir`, `--config-only`. |
 | IR | `src/yang2sdk/plugin/src/ir.py` (`IRBuilder`) | AST → `IRModule/IRModel/IREnum/IRNavNode/IRField` dataclasses. Load-bearing logic, see §5. |
 | Emit | `src/yang2sdk/plugin/src/core.py` (`Yang2Restconf`, `Yang2Netconf`) | IR → Jinja templates in `src/yang2sdk/plugin/src/templates/{restconf,netconf}/`. |
-| Validate | `src/yang2sdk/cli/tester.py` (`tester`) | Imports `temp.restconf_clients.<device>`, iterates `Data` properties, live `retrieve(content="config")`. LAB ONLY. |
+| Validate | `src/yang2sdk/cli/sdk_verify.py` (`sdk-verify`) | Walks the generated navigator tree and calls its own methods: `read` (full tree, bounded depth), `rpc` (serialise every Input, no send), `crud` (idempotent merge + proven restore). Both protocols. LAB ONLY. |
 | Debug helper | `src/yang2sdk/cli/canonicalize_ast.py` | AST canonicalizer for diffing generated code. |
 
 ### Generated SDK layout (both protocols)
@@ -82,6 +82,8 @@ The generator must handle, at minimum:
 - Types: `int8/16/32`, `int64`/`uint64` (RFC 7951 string form), `uint8/16/32`, `decimal64`, `boolean`/`empty` → `bool`, `string` (+ `length`/`pattern`, XSD→Python regex map), `enumeration` (`Literal` if ≤3 values else `Enum` with MD5-fingerprint dedup), `union`, `leafref` (resolve to target type, fallback `str`), `identityref`/`bits`/`binary`/`instance-identifier` → `str`.
 - Metadata: `mandatory`, `config true/false` (`--config-only` drops `config false`), `default` (type-aware), `when`/`must` (emitted into descriptions; `_is_mandatory` returns `False` when present — intentional until constraints become executable), `description` (escaped docstrings).
 - Naming: `YANG-name → PascalCase` classes / `snake_case` fields; iterative depth-based collision resolver + `_pydantic_class_name` propagation in `ir.py` are load-bearing. Do not "simplify" them without a regression corpus.
+- **Reserved Python names (three classes, all in `_to_field_name`):** keywords (`class`, `import`), `BaseModel`/`BaseXmlModel` attribute names (`schema`, `json`, `copy`, `dict` → `schema_`, `json_`, …), and the builtins the emitter itself writes bare inside a generated class body (`property`, `str`, `int`, `bool`, `list` → suffixed). The third class is what stops a node named `property` from generating an *unimportable* module (`TypeError: 'property' object is not callable`), which `_validate_generated` cannot catch because the output still parses. Keep that list to names the emitter actually emits: escaping all of `builtins` would rename ordinary YANG leaves `id`/`type`/`input`/`filter`/`range` for no benefit. `tests/test_matrix.py::test_builtin_named_nodes_do_not_break_the_generated_import` is the tripwire — widen the emitter's vocabulary without widening the set and it fails loudly.
+- `is_key` and the key-aware `ListNode.__call__` must be emitted on **both** transports. They were NETCONF-only, which left RESTCONF callers unable to address a list instance at all (the YANG `key` statement is not in an instance payload, so it cannot be recovered from device data). This is what makes the navigator surfaces symmetrical.
 
 When adding a YANG feature: extend `IRBuilder` first, then templates. Never emit unvalidated Python by string-concatenation outside Jinja.
 
@@ -103,12 +105,12 @@ Generated clients are **securely publishable Python packages**:
   - `uv add --editable path/to/<device>_<os-version>`
   - (and equivalents: git URL / registry once published).
 - **No secrets:** never embed usernames, passwords, tokens, IPs, or private CA bundles in generated code, templates, tests, or examples. Auth comes from caller args or environment at runtime only.
-- **Credential contract (both protocols, normative):** `username`/`password` args win; otherwise the client reads **`DEVICE_USER` and `DEVICE_PASS`** from the environment. Exactly two names, never more. `DEVICE_USERNAME`/`DEVICE_PASSWORD` are **retired, not aliased** — a generated client must ignore them even when they are the only ones exported. Rationale: every other consumer in this repo (`.env.example`, `cli/downloader.py`, `cli/tester.py`, the lab matrix in `tests/conftest.py`) has always used the short form, so the long form existed only in these templates and made the `.env` the project tells you to copy fail against a generated client. A two-name alias was tried and was worse: the two templates resolved the pairs in opposite order, so a host exporting both names authenticated as two different identities depending on transport. Do not reintroduce an alias — with one name that hazard cannot exist. If a value is missing, the constructor raises `ValueError` (never a `Warning` subclass used as an exception) *before* any transport work: RESTCONF and NETCONF both fail closed, so no client can exist that would attempt an unauthenticated session. Covered by `tests/test_matrix.py::test_both_protocols_fail_closed_without_credentials` (args beat env, env fallback works, both protocols fail closed) and `::test_retired_long_form_credential_names_are_ignored` (the retired names are inert). Both `monkeypatch.delenv` all four names: `tests/conftest.py` loads an untracked local `.env` into `os.environ`, so any test touching this path without clearing them passes locally and fails in CI.
+- **Credential contract (both protocols, normative):** `username`/`password` args win; otherwise the client reads **`DEVICE_USER` and `DEVICE_PASS`** from the environment. Exactly two names, never more. `DEVICE_USERNAME`/`DEVICE_PASSWORD` are **retired, not aliased** — a generated client must ignore them even when they are the only ones exported. Rationale: every other consumer in this repo (`.env.example`, `cli/downloader.py`, `cli/sdk_verify.py`, the lab matrix in `tests/conftest.py`) has always used the short form, so the long form existed only in these templates and made the `.env` the project tells you to copy fail against a generated client. A two-name alias was tried and was worse: the two templates resolved the pairs in opposite order, so a host exporting both names authenticated as two different identities depending on transport. Do not reintroduce an alias — with one name that hazard cannot exist. If a value is missing, the constructor raises `ValueError` (never a `Warning` subclass used as an exception) *before* any transport work: RESTCONF and NETCONF both fail closed, so no client can exist that would attempt an unauthenticated session. Covered by `tests/test_matrix.py::test_both_protocols_fail_closed_without_credentials` (args beat env, env fallback works, both protocols fail closed) and `::test_retired_long_form_credential_names_are_ignored` (the retired names are inert). Both `monkeypatch.delenv` all four names: `tests/conftest.py` loads an untracked local `.env` into `os.environ`, so any test touching this path without clearing them passes locally and fails in CI.
 - **Secure transport defaults (both protocols):**
   - RESTCONF: `verify=True` by default. `verify=False` is allowed **only** as an explicit opt-out with a logged warning (lab/self-signed use).
   - NETCONF: verify host keys by default (`hostkey_verify=True`). Opt-out allowed **only** explicitly with a logged warning.
   - Template changes must keep the secure default; reviewers must reject PRs that flip the default or silence the warning.
-- **Contents:** generated package includes client, models, navigators, and minimal README (device, OS version, source YANG revisions, protocol). No `tester`, no `.env`, no log files.
+- **Contents:** generated package includes client, models, navigators, and minimal README (device, OS version, source YANG revisions, protocol). No `sdk-verify`, no `.env`, no log files.
 
 ## Multi-vendor / multi-version (HAL vision)
 
@@ -128,13 +130,13 @@ Agents must not hardcode vendor quirks into the generic IR/templates. Device-spe
 Requires Python `>=3.12` (see `pyproject.toml`, `.python-version`).
 
 ```bash
-uv sync --locked --extra lab   # lab extra: downloader/tester + live-sim tests
+uv sync --locked --extra lab   # lab extra: downloader/sdk-verify + live-sim tests
 cp .env.example .env            # never commit .env
 uv run yang-downloader
-uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/* > temp/yang_tree/<device>.txt
+uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
 uv run yang2restconf <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
 uv run yang2netconf  <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
-uv run tester                   # LAB ONLY, see §11
+uv run sdk-verify --device <d>  # LAB ONLY, see §11
 ```
 
 ### Lint — `ruff` (blocking)
@@ -159,7 +161,34 @@ uvx pyrefly check
 
 ## Testing and CI
 
-There is a `pytest` suite plus CI. `tester.py` remains a manual lab harness, not a test gate.
+There is a `pytest` suite plus CI. `cli/sdk_verify.py` (`sdk-verify`) is the
+lab harness for full-SDK validation and is **not** a test gate; it was never in
+CI and must not be claimed as coverage.
+
+- `sdk-verify` tiers (LAB ONLY, both protocols, replaces the old `tester` script):
+  - `read` — recursive walk of the entire navigator tree at bounded depth,
+    validating each payload. Automatic; no flags.
+  - `rpc` — build every RPC `Input` and serialise it (`model_dump(by_alias=)`,
+    `to_xml_payload()`) **without sending**. Automatic. This is where envelope
+    and wire-name bugs surface across the whole RPC surface instead of on a
+    device at call time.
+  - `rpc` + `--rpc-allowlist` — actually dispatch, echoing each RPC first.
+  - `crud` — `retrieve → update → read back` per container, then a proven
+    restore. Requires `--write` **and** a second acknowledgement:
+    `--allow-running-writes` (no `:candidate`, so edits land in running) or
+    `--allow-restconf-writes` (RESTCONF writes are always live).
+  - Non-negotiable properties, all covered by its own code and comments: bounded
+    depth on every read (never a root read); snapshot to
+    `temp/verify/<device>-<protocol>-snapshot.json` before any write, and refuse
+    to write if that fails; hold the NETCONF lock and **abort** if `lock()` fails
+    (RFC 6241 §8.5.1 makes the lock a precondition for writing running); treat
+    a missing `:validate` as a skip, never a pass; prove restoration with a
+    whole-tree digest and report `RESTORE NOT PROVEN` loudly naming the snapshot.
+  - **A device rejection is not a client failure.** HTTP 400/404/405 and NETCONF
+    `invalid-value`/`access-denied` are recorded as skips with the RFC section.
+  - `create`/`delete` are deliberately **not** automated: no generic synthesiser
+    can satisfy `must`/`when`/leafref/mandatory, so claiming CRUD coverage would
+    be false. Report the coverage the tool has.
 
 - Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe).
 - Simulated backend: `https://github.com/notconf/notconf` (admin/admin, lab-only). CI: `.github/workflows/ci-pr.yaml` (lint → typecheck → offline → smoke shards) and `ci-nightly.yaml` (full 11-tag matrix + `workflow_dispatch`).
@@ -194,13 +223,20 @@ is not advertised (RFC 6241 §8.6.4.1 makes it optional).
 ## Safety and security (normative, non-negotiable)
 
 - **Never request root `restconf/data/` on production.** Large configs can spike to 100% CPU and trigger watchdog reboot / OOM kill. Lab equipment only (per `README.md` warning).
-- `tester.py` and `yang-downloader` run against lab devices only. Confirm `DEVICE_IP` in `.env` is a lab address before running.
+- `sdk-verify` and `yang-downloader` run against lab devices only. Confirm `DEVICE_IP` in `.env` is a lab address before running.
 - `temp/` is ephemeral and gitignored (only `.gitkeep` scaffolding is committed). Never import from `temp/` in shipped code; never commit generated clients, logs (`*.log`), or YANG dumps.
 - `*.env` / `.env` never committed. `DEVICE_PASS` in cleartext on disk is already a compromise — do not print, log, or propagate it. Full response bodies must not be committed to logs at INFO in production paths.
 - Timeouts, failover URL order, and `verify`/host-key defaults are safety features, not tuning knobs. Changing them requires explicit justification.
 - `auto_commit` defaults to **False** on the generated NETCONF client. It is a destructive
   default and must stay opt-in; the safe sequence is `edit(target="candidate")` →
   `validate(source="candidate")` → `commit()` (RFC 6241 §8.6.4.1, §8.3.4.1).
+- The NETCONF `edit()` emits `<error-option>rollback-on-error</error-option>` (RFC 6241 §7.2)
+  **only** when `target == "running"` and the device advertises `:rollback-on-error`. Three
+  deliberate restrictions, each with its own test: not on `candidate` (where `<discard-changes>`
+  is the right primitive, and §8.5.1 warns this option can revert another session's staged work);
+  not on the NMDA `<edit-data>` branch, whose error behaviour already corresponds to
+  rollback-on-error (RFC 8526 §3.1.2); and callers writing `running` are expected to hold a lock
+  first (§8.5.1). Do not "simplify" the gate to `if self.has_rollback_on_error`.
 - `replace()` refuses a model with unset fields (`allow_partial=True` overrides). A replace
   body IS the complete resource (RFC 8040 §4.5; RFC 6241 §8.2.1), so a partial model silently
   deletes the rest. Do not remove this guard without an equivalent loud failure.

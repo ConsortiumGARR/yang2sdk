@@ -73,19 +73,11 @@ class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
         return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
 
     @classmethod
-    def from_xml_tree(cls, root, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
-        rebuild_model_and_dependencies(cls)
-        if module_namespaces:
-            normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
-        return super().from_xml(source, *args, **kwargs)
-
-    @classmethod
     def from_xml_tree(cls, root: etree._Element, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
         rebuild_model_and_dependencies(cls)
         if module_namespaces:
             normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(root, *args, **kwargs)
+        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
 
     def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
         rebuild_model_and_dependencies(self.__class__)

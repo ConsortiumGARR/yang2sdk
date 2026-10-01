@@ -474,7 +474,28 @@ class NetconfClient:
             
             def_op = etree.SubElement(rpc, "{" + NC_NS + "}default-operation")
             def_op.text = default_operation
-            
+
+            # RFC 6241 Sec 7.2: <error-option>rollback-on-error makes the server
+            # stop at the first error-severity <rpc-error> and restore the
+            # datastore to its complete state at the start of THIS edit-config,
+            # turning a half-applied write into an error and a clean datastore.
+            #
+            # Deliberately restricted to target == "running":
+            #   * On candidate the correct primitive is <discard-changes>, and
+            #     Sec 8.5.1 warns this option "can cause other configuration
+            #     changes (for example, via other NETCONF sessions) to be
+            #     inadvertently altered or removed" in a shared datastore --
+            #     candidate is exactly where humans stage work.
+            #   * Sec 8.5.1 makes a held lock a precondition for that safety on
+            #     shared datastores; callers writing to running are expected to
+            #     lock first (the verify CLI refuses to write unlocked).
+            # NMDA needs none of this: <edit-data> has no error-option and its
+            # error behaviour already corresponds to rollback-on-error
+            # (RFC 8526 Sec 3.1.2).
+            if target == "running" and self.has_rollback_on_error:
+                err_opt = etree.SubElement(rpc, "{" + NC_NS + "}error-option")
+                err_opt.text = "rollback-on-error"
+
             if config_xml.tag.endswith("config"):
                 rpc.append(config_xml)
             else:

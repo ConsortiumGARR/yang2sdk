@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 from ._base import Node, ListNode, ItemNode, _require_complete_for_replace
 
 if TYPE_CHECKING:
@@ -113,6 +114,26 @@ class {{ node.item_class_name }}Node(ItemNode):
 class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
     """Navigator for list {{ node.yang_name }}"""
     
+    {% if node.key_params %}
+    def __call__(self, {% for pyname, yangname in node.key_params %}{{ pyname }}: str | int{% if not loop.last %}, {% endif %}{% endfor %}) -> {{ node.item_class_name }}Node:
+        # RFC 8040 Sec 3.5.3: the list instance resource is addressed by
+        # appending "=<key>[,<key>]*" to the collection path. Naming the keys
+        # makes the arity self-checking -- `ListNode.__call__(*keys)` in _base
+        # would silently accept the wrong number and build a bad URL. Mirrors
+        # the NETCONF navigator so both transports expose the same surface.
+        # The trailing comma after the key list is load-bearing: with a single key,
+        # "(name)" is just the string "name", and the generator would then
+        # percent-quote each *character* of it.
+        return self._item_cls(
+            self._client,
+            f"{self._path}="
+            + ",".join(
+                quote(str(k), safe="") for k in ({{ node.key_params | map(attribute=0) | join(", ") }},)
+            ),
+            self._name,
+            envelope_name=self._envelope_name,
+        )
+    {% endif %}
     def retrieve(self, *, content: str = "all", with_defaults: str = "report-all", depth: int | str = 2, fields: list[str] | None = None) -> list[{{ node.pydantic_module }}.{{ node.item_class_name }}]:
         from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
         resp = self._retrieve(content=content, with_defaults=with_defaults, depth=depth, fields=fields)

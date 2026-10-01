@@ -33,6 +33,59 @@ def _reserved_model_attrs() -> frozenset[str]:
 _RESERVED_MODEL_ATTRS = _reserved_model_attrs()
 
 
+def _generated_code_builtins() -> frozenset[str]:
+    """Builtins the emitter writes as bare names *inside a class body*.
+
+    A field or navigator property named after one of these is not merely
+    unidiomatic -- it breaks the module at import time, because the class
+    body rebinds the name before a later statement reads it:
+
+        class C(Node):
+            str: str | None = Field(...)   # binds C.str = FieldInfo
+            u: str | None = Field(...)     # annotation reads FieldInfo | None
+
+    `models.py.jinja` emits no `from __future__ import annotations`, so those
+    annotations are evaluated eagerly and the second line raises
+    `TypeError: unsupported operand type(s) for |: 'FieldInfo' and 'NoneType'`.
+    NETCONF leaf-list/list fields emit a bare `list[...]` annotation, so the
+    same shadowing yields `'FieldInfo' object is not subscriptable`.
+    Navigators additionally decorate child nodes with `@property`, so a
+    container/list/leaf-list named `property` makes every *later* decorator in
+    that class body resolve to the property object:
+    `TypeError: 'property' object is not callable`.
+
+    Deliberately NOT all of `builtins`. Escaping every builtin would rename
+    ordinary YANG leaves such as `id`, `type`, `input`, `filter` and `range` to
+    `id_`, `type_`, ...: a breaking change to the public API of every generated
+    SDK, and one that fixes nothing, because the emitter never writes those
+    names bare. (Measured against the 1470 vendor YANG files in
+    `temp/yang_modules/`, `id`/`type`/`input`/`filter` appear 3-4 orders of
+    magnitude more often than `property`.)
+
+    Each member was confirmed by generating a module that uses it as a node
+    name and watching the import fail:
+
+        container property -> TypeError: 'property' object is not callable
+        leaf str            -> TypeError: unsupported operand type(s) for |:
+                                'FieldInfo' and 'NoneType'
+        leaf int / bool     -> same
+        leaf-list list      -> TypeError: 'FieldInfo' object is not
+                                subscriptable   (NETCONF only: it emits a bare
+                                `list[...]` annotation where RESTCONF emits
+                                `RestconfList[...]`)
+
+    Keep this list to names the emitter actually emits. `test_builtin_named_
+    nodes_do_not_break_the_generated_import` is the tripwire: it generates a
+    module using each of these as a node name and asserts it imports, so
+    widening the emitter's vocabulary without widening this set fails loudly
+    rather than silently shipping an unimportable client.
+    """
+    return frozenset({"property", "str", "int", "bool", "list"})
+
+
+_GENERATED_CODE_BUILTINS = _generated_code_builtins()
+
+
 @dataclass
 class IRField:
     name: str
@@ -781,6 +834,14 @@ class IRBuilder:
             assign = f"element({', '.join(field_params)})"
 
         else:
+            # RESTCONF. `is_key` was emitted only on the NETCONF branch, so a
+            # RESTCONF list item model carried nothing identifying which of its
+            # fields are the list keys. That is what `ListNode.__call__` needs
+            # to build the `/list=k1,k2` URL segment (RFC 8040 Sec 3.5.3), and a
+            # generic caller has no other way to learn the key names -- they are
+            # a YANG `key` statement, not part of the instance payload. Emitting
+            # it here makes the two protocols symmetrical.
+            extra_dict["is_key"] = getattr(stmt, "i_is_key", False)
             field_params = [f"json_schema_extra={extra_dict!r}"]
             if desc:
                 field_params.append(f"description={desc!r}")
@@ -1258,8 +1319,8 @@ class IRBuilder:
     def _to_field_name(self, name: str) -> str:
         """Convert YANG name to Python field name (snake_case).
 
-        Two reserved-name classes are handled, both of which produced
-        *silently broken* models before:
+        Three reserved-name classes are handled, all of which produced
+        *silently broken* -- or unimportable -- models before:
 
         * Python keywords (`class`, `import`, ...) -- already handled.
         * `pydantic.BaseModel` / `pydantic_xml.BaseXmlModel` attribute names.
@@ -1269,6 +1330,12 @@ class IRBuilder:
           value raised `TypeError: object of type 'method' has no len()`.
           `json`, `dict`, `copy`, `construct` and `validate` are affected the
           same way, and these are ordinary YANG leaf names.
+        * Builtins the emitter itself writes bare inside a class body -- see
+          `_generated_code_builtins()`. A YANG leaf named `str` or a
+          container named `property` made the generated module fail to
+          *import* at all (`TypeError: 'property' object is not callable`),
+          which the emitter's own `_validate_generated` parse check cannot
+          catch because the file is syntactically valid.
 
         The wire name is unaffected: NETCONF models carry `element(tag=...)`
         and RESTCONF models carry `Field(alias=...)`, both derived from the
@@ -1278,7 +1345,9 @@ class IRBuilder:
 
         if keyword.iskeyword(res):
             res = f"{res}_"
-        while res in _RESERVED_MODEL_ATTRS:
+        # `while`, not `if`: a YANG leaf literally named `str_` must not
+        # collide with the escaped form of `str`.
+        while res in _RESERVED_MODEL_ATTRS or res in _GENERATED_CODE_BUILTINS:
             res = f"{res}_"
         return res
 

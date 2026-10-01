@@ -31,7 +31,9 @@ yang2restconf = "yang2sdk.cli.compiler:restconf"
 yang2netconf = "yang2sdk.cli.compiler:netconf"
 # Lab-only (require `yang2sdk[lab]`); kept as scripts for the documented dev workflow.
 yang-downloader = "yang2sdk.cli.downloader:main"
-tester = "yang2sdk.cli.tester:main"
+# Full-SDK validation against a lab device. Supersedes `tester`, which only read
+# the top-level navigators of a RESTCONF client and never touched writes or RPCs.
+sdk-verify = "yang2sdk.cli.sdk_verify:main"
 
 [dependency-groups]
 dev = [

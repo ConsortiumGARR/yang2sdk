@@ -28,29 +28,6 @@ def _get_max_depth(data: Any, current_depth: int = 1) -> int:
     return current_depth
 
 
-def _prune_at_max_depth(data: Any, target_depth: int, current_depth: int = 1) -> Any:
-    """Deletes empty dicts only if they are located at the target_depth."""
-    if isinstance(data, dict):
-        # If we reached target depth and it's an empty dict, this is a candidate for deletion
-        # However, the parent call handles the deletion. Here we filter children.
-        return {
-            k: _prune_at_max_depth(v, target_depth, current_depth + 1)
-            for k, v in data.items()
-            if not (isinstance(v, dict) and not v and current_depth + 1 == target_depth)
-        }
-    if isinstance(data, list):
-        return [
-            _prune_at_max_depth(item, target_depth, current_depth + 1)
-            for item in data
-            if not (
-                isinstance(item, (dict, list))
-                and not item
-                and current_depth + 1 == target_depth
-            )
-        ]
-    return data
-
-
 def _maybe_prune(data: Any, depth: int | str) -> Any:
     """Drop empty boundary containers, but never deeper than the caller asked.
 
@@ -58,16 +35,19 @@ def _maybe_prune(data: Any, depth: int | str) -> Any:
     container returned empty at that boundary is a truncation artefact rather
     than a real value, and strict models should not be asked to validate it.
 
-    Two things were wrong before: the *observed* depth of the response was
-    used and the *requested* depth was ignored entirely, so `depth=2` and
-    `depth=30` behaved identically and the result depended on what the device
-    happened to return; and a legitimately empty container at the deepest
-    returned level was deleted from the caller's data with no warning.
+    The payload handed in starts *below* the URI target node (the target itself
+    is the response envelope), so a node at distance d below the target sits at
+    recursion level d + 1. A compliant server truncates at exactly `depth`,
+    which means empty boundary containers sit exactly at level `depth + 1` --
+    and the response reaches that level if and only if it was truncated there
+    (`observed == depth + 1`). If the tree ends sooner (`observed < depth + 1`)
+    nothing was truncated and every empty container is real data; if a server
+    returns deeper than asked (`observed > depth + 1`) it ignored `depth`
+    entirely and there are no truncation artefacts at all. Only the truncated
+    case prunes, and only at the boundary.
 
     `depth="unbounded"` (the RFC default) has no boundary, so nothing is
-    touched. Otherwise the boundary is min(requested, observed): a server that
-    honours the request truncates at exactly `depth`, and one that returns
-    less is truncating at whatever it returned.
+    touched.
     """
     if isinstance(depth, bool):
         return data
@@ -79,7 +59,9 @@ def _maybe_prune(data: Any, depth: int | str) -> Any:
     if requested is None:
         return data
     observed = _get_max_depth(data)
-    return _prune_at_depth(data, min(requested, observed))
+    if observed != requested + 1:
+        return data
+    return _prune_at_depth(data, requested + 1)
 
 
 def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:

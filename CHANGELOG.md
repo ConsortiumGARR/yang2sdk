@@ -6,12 +6,141 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`sdk-verify`: full-SDK validation against a lab device.** The old `tester`
+  script issued one to four `GET`s: it was RESTCONF-only, read only the
+  top-level `Data` properties at `depth=2`, never touched a write method, and
+  never touched `client.operations`, so every RPC and every nested node in a real
+  client was untested. It also had two vacuous passes (an empty list reported
+  `[OK] Parsed 0 model(s)`, and a client with no data properties reported
+  `[OK] every navigator validated`).
+  `sdk-verify` walks the generated navigator tree and calls the client's own
+  methods, recording one row per `(node, method)`:
+  - `read` — recursive walk of the entire data tree, bounded depth, automatic.
+  - `rpc` — builds every RPC `Input` and serialises it (`model_dump(by_alias=)`,
+    `to_xml_payload()`) **without sending**, so envelope bugs surface across the
+    whole RPC surface instead of at call time on a device. `--rpc-allowlist`
+    dispatches named RPCs, echoing each first.
+  - `crud` — `retrieve → update → read back` per container with an idempotent
+    merge, a pre-write snapshot, a held NETCONF lock, and a final whole-tree
+    digest that reports `RESTORE NOT PROVEN` loudly. Gated behind `--write` plus
+    a second acknowledgement: `--allow-running-writes` (no `:candidate`, so
+    edits land in running) or `--allow-restconf-writes` (RESTCONF writes are
+    always live — there is no candidate and no `<discard-changes>`).
+  Device rejections (HTTP 400/404/405, NETCONF `invalid-value`/`access-denied`)
+  are recorded as skips citing the RFC section, not as client failures. Every
+  skip carries its reason, and a node covering nothing is never a pass.
+  `create`/`delete` are deliberately not automated: no generic synthesiser can
+  satisfy arbitrary `must`/`when`/leafref/mandatory constraints, so claiming
+  full CRUD coverage would be false.
+  `tester` is removed; `sdk-verify` replaces it.
+
 ### Fixed
+
+- **`retrieve(depth=N)` on a RESTCONF client returned data its own strict model
+  rejected.** RFC 8040 §4.8.2 makes `depth` a server-side ceiling: a compliant
+  server returns nodes up to the requested depth, and containers sitting
+  exactly on that boundary come back *empty* (children truncated). The payload
+  the client prunes starts below the URI target node, so those boundary
+  containers sit at recursion level `depth + 1` — but the pruner targeted
+  `min(requested, observed)`, one level too shallow. A real G30 made it
+  concrete: a `depth=2` read of `ne:ne/system/networking/interface` came back
+  with `ethernet: {}` on every entry, and the strict model failed on the
+  mandatory `eth-resource-ref` behind the empty container; the same read of
+  `routing-protocol` failed on `ospf.router-id`. The off-by-one went the other
+  way too: a complete tree read with a deep request had its legitimately empty
+  deepest containers *deleted* instead of kept.
+  *Fix:* the pruner now removes empty containers only at level `depth + 1`, and
+  only when the response actually reaches that level (`observed == depth + 1`,
+  the truncation signature); a shallower tree was not truncated, and a server
+  that returns deeper than asked ignored `depth` — in both cases nothing is
+  deleted. This also removes the dead `_prune_at_max_depth` duplicate. Found by
+  running `sdk-verify` against the lab G30;
+  `tests/test_matrix.py::test_read_pruning_is_bounded_by_the_requested_depth`
+  is the tripwire, with the G30's exact truncated-list shape.
+
+- **`sdk-verify` ignored the `.env` the README points at.** A fresh
+  `uv sync --locked --extra lab && uv run sdk-verify --device <d>` died with
+  `credentials missing` even though the repo `.env` — the file the workflow
+  configures — sat in the working directory: `yang-downloader` calls
+  `load_dotenv()`, `sdk-verify` read `os.environ` raw. Both lab tools now load
+  it; exported variables still win (`load_dotenv` never overrides).
+
+- **`sdk-verify --protocol both` validated the RESTCONF client twice.** Both
+  generated clients are packages named after the device
+  (`temp/restconf_clients/g30`, `temp/netconf_clients/g30`), so the second
+  `importlib.import_module(client_dir.name)` returned the first protocol's
+  module from `sys.modules`, and the run reported `exposes no netconf client
+  class`. Clients are now imported under a per-protocol module name.
+
+- **`sdk-verify --json-out` with `--protocol both` wrote one report over the
+  other.** With more than one protocol, the report is now written per protocol
+  (`<stem>_<protocol><suffix>`), and each path is printed.
+
+- **A NACM `access-denied` on a *write* was a red `FAIL`.** The device's
+  refusal policy is per-node: the lab G30's NACM denies `edit-config` to the
+  test user under `/ne/system` (security, ssh, console, ipsec) while allowing
+  the rest, so the crud tier reported nine failures that are policy answers,
+  not client defects. The update and read-back paths now classify device
+  rejections like the read path does (skip, with the RFC 8341 NACM citation).
+
+- **A YANG node named after a Python builtin could produce an unimportable
+  client.** `container property` generated `@property def property(...)`, and
+  because the class body had bound the name `property` to the property object,
+  every *later* decorator in that body resolved to it:
+  `TypeError: 'property' object is not callable` at import. A leaf named `str`,
+  `int` or `bool` failed the same way one line later
+  (`FieldInfo | None`), because `models.py.jinja` emits no
+  `from __future__ import annotations` and the annotation is evaluated eagerly; a
+  leaf-list named `list` broke NETCONF only, whose annotations are a bare
+  `list[...]`. The emitter's `_validate_generated` cannot catch this — the output
+  is valid Python, so it parsed and shipped.
+  *Fix:* `_to_field_name` now also escapes the builtins the emitter writes bare
+  inside a class body (`_generated_code_builtins`). Deliberately not all of
+  `builtins`: measured across the 1470 vendor YANG files in `temp/yang_modules/`,
+  `id`/`type`/`input`/`filter` appear three to four orders of magnitude more
+  often than `property`, and escaping them would rename ordinary leaves for no
+  benefit.
+  `tests/test_matrix.py::test_builtin_named_nodes_do_not_break_the_generated_import`
+  is the tripwire for widening the emitter's vocabulary.
+
+- **RESTCONF lists hid their keys, making list items unaddressable.** `is_key`
+  was emitted only on the NETCONF branch, and the RESTCONF list `__call__` was
+  the shared positional `ListNode.__call__(*keys)`. A RESTCONF client therefore
+  told a caller nothing about which fields keyed a list — and keys are a YANG
+  `key` statement, not part of an instance payload, so they cannot be recovered
+  by inspecting device data. Arity was unchecked too: the wrong number of keys
+  built a wrong URL and failed only at the device.
+  *Fix:* RESTCONF models now carry `is_key`, and RESTCONF list navigators emit a
+  named `__call__(self, id, kind)` mirroring NETCONF. Both surfaces are now
+  symmetrical.
+
+- **Dead code after `return` shadowed the NETCONF XML parsers.** The NETCONF
+  `data_models/_base.py.jinja` template ended with three stacked
+  `from_xml`/`from_xml_tree` definitions; the middle one had
+  `return super().from_xml_tree(...)` followed by `return super().from_xml(source, ...)`,
+  and the last definition silently won. That last one did not call
+  `_drop_unbound_attributes`, so the undeclared-attribute stripping the G30
+  workaround depends on was bypassed for any payload parsed through
+  `from_xml_tree`. Removed the unreachable code.
+
+- **NETCONF `<edit-config>` never requested `rollback-on-error`.** The capability
+  was discovered (`has_rollback_on_error`) and then ignored, so a failure part
+  way through an edit on a device without `:candidate` could leave partial config
+  in `running`. The option is now emitted — as the
+  `<error-option>rollback-on-error</error-option>` **element** (RFC 6241 §7.2) —
+  only when `target == "running"` and the capability is advertised. Three
+  deliberate restrictions: not on `candidate`, where `<discard-changes>` is the
+  right primitive and §8.5.1 warns this option can revert another session's
+  staged work; not on the NMDA `<edit-data>` branch, whose error behaviour already
+  corresponds to rollback-on-error (RFC 8526 §3.1.2); and §8.5.1 makes a held lock
+  a precondition, so `sdk-verify` refuses to write running without one.
 
 - **A generated client could not authenticate with the `.env` the project tells
   you to copy, and the two protocols failed differently when it had none.**
   *Symptom:* `cp .env.example .env` gives you `DEVICE_USER` / `DEVICE_PASS`.
-  `yang-downloader` and `tester` read those names; a generated client read
+  `yang-downloader` and `sdk-verify` read those names; a generated client read
   `DEVICE_USERNAME` / `DEVICE_PASSWORD`, so the documented setup left every
   client unauthenticated. With no credentials at all the two protocols also
   failed in two different, both-opaque ways: RESTCONF did
@@ -23,7 +152,7 @@ All notable changes to `yang2sdk` are documented here. Format follows
   check. The failure was invisible because the credentials path had no test.
   *Fix:* both templates now resolve `username` / `password` from the constructor
   args, else `DEVICE_USER` / `DEVICE_PASS` — the names `.env.example`,
-  `cli/downloader.py`, `cli/tester.py` and the lab matrix in
+  `cli/downloader.py`, `cli/sdk_verify.py` and the lab matrix in
   `tests/conftest.py` have always used — and raise `ValueError` when a value is
   missing, before any transport work. One `.env` now serves every consumer.
   *Removed:* `DEVICE_USERNAME` / `DEVICE_PASSWORD` are **retired, not aliased**.
@@ -478,7 +607,7 @@ none of them were reachable from the existing suite.
   `lxml`, `ncclient`, `python-dotenv` moved out of default dependencies.
   `yang2sdk.cli.compiler` (production path) no longer loads `.env`
   (`$DEVICE_NAME` fallback still works via plain environment).
-  `downloader`/`tester` fail fast with a `[lab]` hint when the extra is
+  `downloader`/`sdk-verify` fail fast with a `[lab]` hint when the extra is
   missing and log a warning for their lab-only insecure defaults
   (`hostkey_verify=False`, `verify=False`).
 - `gitingest` moved from runtime dependencies to the `dev` group (zero

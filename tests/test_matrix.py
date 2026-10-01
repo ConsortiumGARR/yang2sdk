@@ -2,6 +2,7 @@
 
 import compileall
 import importlib
+import inspect
 import json
 import subprocess
 import sys
@@ -1622,22 +1623,61 @@ def test_replace_refuses_to_silently_delete_unset_fields(tmp_path):
 def test_read_pruning_is_bounded_by_the_requested_depth(tmp_path):
     """RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling.
 
-    Regression: the pruner was handed the depth *observed* in the response and
-    ignored the requested one entirely, so `depth=2` and `depth=30` behaved
-    identically and the caller's data depended on what the device happened to
-    return. `depth="unbounded"` (the RFC default) must prune nothing at all.
+    A compliant server includes nodes up to the requested depth; containers
+    sitting exactly on that boundary come back empty (children truncated).
+    The payload the pruner sees starts *below* the URI target node (the target
+    itself is the response envelope), so the boundary empties sit at recursion
+    level `depth + 1`, and a truncated response reaches exactly that level
+    (`observed == depth + 1`). A tree that ends sooner was not truncated, and
+    a server that returns deeper than asked ignored `depth` -- in both cases
+    there are no truncation artefacts and nothing may be deleted.
+
+    Regression (lab G30): `retrieve(depth=2)` on the `interface` list came
+    back with `ethernet: {}` on every entry, and the old boundary math
+    (`min(requested, observed)`) pruned one level too shallow, so the strict
+    model failed on the mandatory `eth-resource-ref` behind the empty
+    container -- and a complete tree read with a deep request had its
+    legitimately empty deepest containers deleted instead.
     """
     out, _ = _gen(tmp_path, "restconf", REPLACE_YANG, "trep")
     base = _import(out, "data_navigators._base")
-    payload = {"a": {}, "b": {"c": {}, "d": "x"}}
 
+    # `depth="unbounded"` (the RFC default) has no boundary: nothing touched.
+    payload = {"a": {}, "b": {"c": {}, "d": "x"}}
     assert base._maybe_prune(payload, "unbounded") == payload, (
         "unbounded prunes nothing"
     )
-    # A 2-level response: the boundary empties go, the deeper one is kept.
-    assert base._maybe_prune(payload, 2) == {"b": {"c": {}, "d": "x"}}
-    # A shallower request must not prune deeper than asked.
-    assert base._maybe_prune(payload, 1) == payload
+
+    # Truncated at depth 2: the boundary empties (level 3) go; the shallower
+    # empty container (level 2) is real data and stays.
+    d2 = {"a": {}, "b": {"c": {}, "d": "x"}}
+    assert base._maybe_prune(d2, 2) == {"a": {}, "b": {"d": "x"}}
+
+    # Truncated at depth 1: both children sit on the boundary.
+    assert base._maybe_prune({"a": {}, "b": {}}, 1) == {}
+
+    # Complete tree returned for a deep request: nothing was truncated, so
+    # every empty container is real data and must survive.
+    assert base._maybe_prune(d2, 10) == d2
+
+    # The G30 shape: a depth-2 read of a list truncates every entry at the
+    # same level, leaving empty containers on the boundary.
+    truncated_entries = [
+        {"if-name": "eth1", "ethernet": {}},
+        {"if-name": "eth2", "ethernet": {}},
+    ]
+    assert base._maybe_prune(truncated_entries, 2) == [
+        {"if-name": "eth1"},
+        {"if-name": "eth2"},
+    ]
+
+    # ...and a complete read (some entry deeper than the boundary) is not a
+    # truncated shape, so a genuinely empty container is kept.
+    full_entries = [
+        {"if-name": "eth1", "ethernet": {}},
+        {"if-name": "eth2", "ethernet": {"eth-resource-ref": "/ne:ne/x"}},
+    ]
+    assert base._maybe_prune(full_entries, 2) == full_entries
 
 
 def test_logging_redacts_passphrase_and_never_leaks_the_error_body(tmp_path):
@@ -1874,8 +1914,43 @@ SCHEMA_COLLISION_YANG = """module tcoll {
     leaf copy { type string; }
     leaf name { type string; }
   }
-}
-"""
+}"""
+
+
+# Names the emitter writes bare inside a generated class body. A YANG node named
+# after one of these is not merely unidiomatic: the class body rebinds the name
+# before a later statement reads it, and the generated module then fails to
+# *import*. `_validate_generated` only parses, and the output is syntactically
+# valid, so nothing offline caught it. Regenerate if the emitter's vocabulary
+# widens -- this test is the tripwire (see `_generated_code_builtins`).
+BUILTIN_COLLISION_YANG = """module tbi {
+  prefix tb;
+  namespace "urn:test:tbi";
+  revision 2026-01-01;
+  container root {
+    container property {
+      leaf a { type string; }
+    }
+    container holder {
+      leaf str { type string; }
+      leaf int { type int32; }
+      leaf bool { type boolean; }
+      leaf after { type string; }
+      leaf-list list { type uint8; }
+      list nested { key id; leaf id { type string; } }
+    }
+    container sibling-after { leaf b { type string; } }
+  }
+  rpc do-it {
+    input {
+      leaf str { type string; }
+      leaf target { type string; }
+    }
+    output {
+      leaf ok { type boolean; }
+    }
+  }
+}"""
 
 
 def test_fields_never_shadow_a_pydantic_attribute(tmp_path):
@@ -1916,6 +1991,138 @@ def test_fields_never_shadow_a_pydantic_attribute(tmp_path):
     )
     assert out_model.schema_ == "<module/>"
     assert b"<schema>&lt;module/&gt;</schema>" in out_model.to_xml()
+
+
+def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
+    """A YANG node named after a builtin the emitter writes bare must still import.
+
+    Regression: a container named `property` generated
+
+        @property
+        def property(self) -> PropertyNode: ...
+
+    and because the class body had bound the name `property` to the property
+    object, every *later* decorator in that body resolved to it. The generated
+    module raised `TypeError: 'property' object is not callable` **at import** --
+    an unimportable client. The emitter's `_validate_generated` only parses, and
+    the file is valid Python, so this reached `temp/` unnoticed.
+
+    The same mechanism breaks models: `models.py.jinja` emits no
+    `from __future__ import annotations`, so a field named `str` rebinds the name
+    before the next annotation reads it (`FieldInfo | None`), and NETCONF
+    leaf-list fields emit a bare `list[...]` annotation, which is then not
+    subscriptable.
+
+    Both protocols, because the failing constructs differ: `property` and
+    `list` fail on one transport only.
+    """
+    for fmt in ("restconf", "netconf"):
+        out, compiled = _gen(tmp_path, fmt, BUILTIN_COLLISION_YANG, "tbi")
+        assert compiled, f"{fmt}: generated code failed to compile"
+
+        # 1. It must actually import -- that is what the bug prevented.
+        models = _import(out, "data_models.tbi")
+        navigators = _import(out, "data_navigators.tbi")
+
+        # 2. The Python attribute is escaped; the YANG name is untouched.
+        #    RESTCONF expresses that as `Field(alias=...)`, NETCONF as
+        #    `element(tag=...)` -- both derived from the original YANG name.
+        root = models.Root.model_fields
+        assert "property_" in root, sorted(root)
+        if fmt == "restconf":
+            assert root["property_"].alias == "property"
+        else:
+            assert root["property_"].json_schema_extra["tag"] == "property"
+        holder = models.Holder.model_fields
+        for escaped, wire in (
+            ("str_", "str"),
+            ("int_", "int"),
+            ("bool_", "bool"),
+            ("list_", "list"),
+        ):
+            assert escaped in holder, (fmt, sorted(holder))
+            extra = holder[escaped].json_schema_extra or {}
+            if fmt == "restconf":
+                assert holder[escaped].alias == wire, (fmt, escaped)
+            else:
+                assert extra["tag"] == wire, (fmt, escaped, extra)
+
+        # 3. Navigator children on both sides of the shadowing property must
+        #    work: before the fix, the *later* decorator raised TypeError.
+        #    The two transports construct their root navigator differently
+        #    (RESTCONF takes a URL path string, NETCONF a path tuple list).
+        if fmt == "restconf":
+            root_nav = navigators.RootNode(None, "/data/tbi:root", "root")
+        else:
+            root_nav = navigators.RootNode(None, [])
+        assert root_nav.property_ is not None
+        assert root_nav.sibling_after is not None
+
+        # 4. The value round-trips through the escaped attribute.
+        inst = models.Holder.model_validate(
+            {"str": "a", "int": 2, "bool": True, "list": [1, 2], "after": "z"}
+        )
+        assert inst.str_ == "a" and inst.int_ == 2 and inst.bool_ is True
+        assert inst.list_ == [1, 2] and inst.after == "z"
+
+        # 5. An rpc input leaf is escaped too -- this is the `get-schema` shape.
+        do_it_in = models.DoItInput.model_fields
+        assert "str_" in do_it_in, sorted(do_it_in)
+        if fmt == "restconf":
+            assert do_it_in["str_"].alias == "str"
+        else:
+            assert (do_it_in["str_"].json_schema_extra or {})["tag"] == "str"
+
+
+def test_netconf_edit_config_rollback_on_error_is_running_only(tmp_path):
+    """`<error-option>rollback-on-error` is emitted only for a running target.
+
+    RFC 6241 Sec 7.2 makes the server restore the datastore to its complete
+    state at the start of *this* `<edit-config>` when any error-severity
+    `<rpc-error>` occurs. Two deliberate restrictions, both from Sec 8.5.1,
+    which warns the option "can cause other configuration changes (for example,
+    via other NETCONF sessions) to be inadvertently altered or removed" in a
+    shared datastore unless a lock is held:
+
+    * NOT on `candidate`. The correct primitive there is `<discard-changes>`,
+      and candidate is exactly where humans stage work.
+    * NMDA needs none of it -- `<edit-data>` has no `error-option` and its error
+      behaviour already corresponds to rollback-on-error (RFC 8526 Sec 3.1.2).
+    """
+    out, _ = _gen(tmp_path, "netconf", COMPOSITE_KEY_YANG, "tro")
+    session = _import(out, "session_manager").NetconfClient
+    assert session is not None
+    source = inspect.getsource(session.edit)
+
+    assert 'target == "running" and self.has_rollback_on_error' in source
+    # The NMDA branch must be untouched: it has no error-option parameter.
+    nmda_only, marker, legacy = source.partition("Fallback to natively constructed")
+    assert marker, "the legacy <edit-config> branch marker moved"
+    # RFC 8526 Sec 3.1.2: <edit-data> has no error-option parameter and its
+    # error behaviour already corresponds to rollback-on-error, so the NMDA
+    # branch must not emit one.
+    assert "error-option" not in nmda_only
+    # The legacy branch emits it as a child element, gated on running + cap.
+    assert "}error-option" in legacy and 'err_opt.text = "rollback-on-error"' in legacy
+    # Guard the fallback that would silently disable the safety net.
+    assert "has_rollback_on_error" in source, (
+        "the capability flag exists but is no longer consulted"
+    )
+
+
+COMPOSITE_KEY_YANG = """module tro {
+  prefix t;
+  namespace "urn:test:tro";
+  revision 2026-01-01;
+  container root {
+    list items {
+      key "id kind";
+      leaf id { type string; }
+      leaf kind { type string; }
+      leaf v { type uint8; }
+    }
+  }
+}"""
 
 
 # --- regression home for two bugs found only on real lab devices ------------
@@ -2013,6 +2220,25 @@ def test_undeclared_xml_attributes_are_dropped_but_elements_are_not(tmp_path):
     with pytest.raises(ValidationError):
         Strict.from_xml(ok_xml)
 
+    # `from_xml_tree` must strip attributes too. It used to be shadowed by a
+    # dead third definition that did not, so the NETCONF navigators -- which parse
+    # with `from_xml_tree` -- lost the G30 `cli-name` workaround entirely while
+    # this `from_xml` test stayed green.
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    tree = models.R.from_xml_tree(etree.fromstring(ok_xml))
+    assert tree.disjoint_hi == 3 and tree.wide == 7, tree
+    with pytest.raises(ValidationError):
+        Strict.from_xml_tree(etree.fromstring(ok_xml))
+
+    # And exactly one definition of each survives in the generated base, so a
+    # future edit cannot silently reintroduce the shadowing.
+    base_src = (out / "data_models" / "_base.py").read_text()
+    assert base_src.count("def from_xml(cls") == 1, base_src.count("def from_xml(cls")
+    assert base_src.count("def from_xml_tree(cls") == 1, base_src.count(
+        "def from_xml_tree(cls"
+    )
+
 
 # --- the replace() guard must only count *config* nodes ---------------------
 
@@ -2109,11 +2335,11 @@ def test_list_key_named_like_python_keyword(tmp_path):
             # ...while the wire key name stays `if` in the path keys dict.
             assert "'if': if_" in src, "netconf: wire key name 'if' not preserved"
         else:
-            # RESTCONF addresses keys positionally (`__call__(*keys)`, defined
-            # once in the shared _base), so it never puts a YANG name in a
-            # Python identifier position.
-            base = (out / "data_navigators" / "_base.py").read_text()
-            assert "def __call__(self, *keys: str | int)" in base
+            # RESTCONF now emits a key-aware __call__ too, so the transport
+            # surfaces match and the key names are discoverable from Python.
+            assert "def __call__(self, if_: str | int, addr: str | int)" in src, (
+                "restconf: keyword-safe __call__ signature not emitted"
+            )
         # the model attribute is also keyword-safe
         models = (
             (out / "data_models" / "tkw.py").read_text()
@@ -2124,6 +2350,80 @@ def test_list_key_named_like_python_keyword(tmp_path):
             f"{proto}: model field for key 'if' is not keyword-safe"
         )
         assert "class_: str" in models or "class_: " in models
+
+
+KEY_DISCOVERY_YANG = """module tkd {
+  prefix td;
+  namespace "urn:test:tkd";
+  revision 2026-01-01;
+  container root {
+    list item {
+      key "id kind";
+      leaf id { type string; }
+      leaf kind {
+        type enumeration { enum alpha; enum beta; }
+      }
+      leaf payload { type uint8; }
+    }
+  }
+}"""
+
+
+@pytest.mark.parametrize("proto", ["restconf", "netconf"])
+def test_list_keys_are_discoverable_and_named_on_call(tmp_path, proto):
+    """Both transports must expose the YANG `key` names, not just `*keys`.
+
+    RESTCONF emitted `is_key` only on the NETCONF branch, and its list
+    `__call__` was the shared `ListNode.__call__(*keys)`. So a RESTCONF client
+    told a caller *nothing* about which fields keyed a list -- and the keys are
+    a YANG `key` statement, not part of an instance payload, so they cannot be
+    recovered by inspecting device data. Combined with the positional
+    `*keys`, arity was unchecked: passing the wrong number built a wrong URL and
+    failed only at the device.
+
+    Now both transports carry `is_key` in `json_schema_extra` and take named
+    parameters, which is what makes the two navigator surfaces symmetrical
+    (AGENTS.md "RESTCONF <-> NETCONF parity").
+    """
+    out, _ = _gen(tmp_path, proto, KEY_DISCOVERY_YANG, "tkd")
+    models = _import(out, "data_models.tkd")
+    nav = _import(out, "data_navigators.tkd")
+
+    # 1. is_key identifies the key fields on the item model.
+    keys = [
+        name
+        for name, fi in models.ItemItem.model_fields.items()
+        if (fi.json_schema_extra or {}).get("is_key")
+    ]
+    assert sorted(keys) == ["id", "kind"], keys
+    assert not (models.ItemItem.model_fields["payload"].json_schema_extra or {}).get(
+        "is_key"
+    )
+
+    # 2. __call__ takes them by name, so arity is checked by Python.
+    sig = inspect.signature(nav.ItemListNode.__call__)
+    assert list(sig.parameters) == ["self", "id", "kind"], list(sig.parameters)
+
+    # 3. Both keys reach the URL segment, percent-quoted per RFC 8040 Sec 3.5.3.
+    listnav = nav.ItemListNode.__new__(nav.ItemListNode)
+    listnav._client = None
+    listnav._name = "item"
+    listnav._envelope_name = "tkd:item"
+    listnav._item_cls = nav.ItemItemNode
+    if proto == "restconf":
+        listnav._path = "/data/tkd:item"
+    else:
+        listnav._path = [("urn:test:tkd", "item", {})]
+    item = listnav("eth 0", "a/b")
+    if proto == "restconf":
+        assert item._path == "/data/tkd:item=eth%200,a%2Fb", item._path
+    else:
+        # NETCONF carries keys in the path tuple, not a URL segment.
+        assert item._path[-1][2] == {"id": "eth 0", "kind": "a/b"}, item._path[-1]
+
+    # 4. Too few keys is a TypeError at the call site, not a bad URL on the wire.
+    with pytest.raises(TypeError):
+        listnav("only-one")
 
 
 DECIMAL64_YANG = """module tdec {
