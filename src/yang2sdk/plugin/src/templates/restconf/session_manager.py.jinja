@@ -140,10 +140,22 @@ class RestconfClient:
         self._session.trust_env = verify  # Disable env vars if TLS verification is off
         self._session.headers.update({"Content-Type": "application/yang-data+json"})
 
-        user = username or os.environ.get("DEVICE_USERNAME") or os.environ.get("DEVICE_USER")
-        pw = password or os.environ.get("DEVICE_PASSWORD") or os.environ.get("DEVICE_PASS")
+        # Credentials come from caller args or the environment at runtime;
+        # nothing is baked into generated code. Resolution order is
+        # DEVICE_USER -> DEVICE_USERNAME / DEVICE_PASS -> DEVICE_PASSWORD,
+        # and it is identical in the NETCONF template: the two protocols used
+        # to read the pairs in opposite order, so a host exporting both
+        # names authenticated as two different identities depending on the
+        # transport. Failing closed is deliberate -- an unauthenticated
+        # RESTCONF session would silently 401 on the first call.
+        user = username or os.environ.get("DEVICE_USER") or os.environ.get("DEVICE_USERNAME")
+        pw = password or os.environ.get("DEVICE_PASS") or os.environ.get("DEVICE_PASSWORD")
         if not user or not pw:
-            raise UserWarning("Authentication credentials missing.")
+            raise ValueError(
+                "Authentication credentials missing: pass username/password, "
+                "or set DEVICE_USER/DEVICE_USERNAME and "
+                "DEVICE_PASS/DEVICE_PASSWORD in the environment."
+            )
         self._session.auth = (user, pw)
 
         from .data_navigators import Data, Operations

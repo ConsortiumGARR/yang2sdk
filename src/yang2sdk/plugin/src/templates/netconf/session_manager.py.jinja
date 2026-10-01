@@ -163,6 +163,19 @@ class NetconfClient:
         self.port = port
         self.username = username or os.environ.get("DEVICE_USER") or os.environ.get("DEVICE_USERNAME")
         self.password = password or os.environ.get("DEVICE_PASS") or os.environ.get("DEVICE_PASSWORD")
+        # Same resolution order and same fail-closed rule as the RESTCONF
+        # client: caller args, then DEVICE_USER -> DEVICE_USERNAME and
+        # DEVICE_PASS -> DEVICE_PASSWORD. NETCONF used to keep None here and
+        # hand it straight to manager.connect(), so a client built with no
+        # credentials anywhere attempted an unauthenticated SSH session and
+        # failed later with an opaque transport error. Raising before the
+        # connect keeps the two protocols symmetrical and fails closed.
+        if not self.username or not self.password:
+            raise ValueError(
+                "Authentication credentials missing: pass username/password, "
+                "or set DEVICE_USER/DEVICE_USERNAME and "
+                "DEVICE_PASS/DEVICE_PASSWORD in the environment."
+            )
         self.auto_commit = auto_commit
         self.log_bodies = log_bodies
         if kwargs:

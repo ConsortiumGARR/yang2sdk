@@ -2254,13 +2254,17 @@ def test_restconf_client_close_is_symmetric_with_netconf(tmp_path):
     out, _ = _gen(tmp_path, "restconf", REPLACE_YANG, "trep")
     sm = _import(out, "session_manager")
 
-    client = sm.RestconfClient(management_ip="127.0.0.1", port=8181)
+    client = sm.RestconfClient(
+        management_ip="127.0.0.1", port=8181, username="u", password="p"
+    )
     client.close()
     client.close()  # idempotent
     with pytest.raises(RuntimeError, match="session is closed"):
         client._request("GET", "/data")
 
-    with sm.RestconfClient(management_ip="127.0.0.1", port=8181) as ctx:
+    with sm.RestconfClient(
+        management_ip="127.0.0.1", port=8181, username="u", password="p"
+    ) as ctx:
         assert ctx is not None
     # leaving the context closed the client
     with pytest.raises(RuntimeError, match="session is closed"):
@@ -2273,3 +2277,64 @@ def test_restconf_client_close_is_symmetric_with_netconf(tmp_path):
     for name in ("close", "__enter__", "__exit__"):
         assert hasattr(netconf.NetconfClient, name), f"NetconfClient lacks {name}"
         assert hasattr(sm.RestconfClient, name), f"RestconfClient lacks {name}"
+
+
+def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
+    """No generated client may be constructible without credentials.
+
+    Credentials resolve from caller args, else DEVICE_USER ->
+    DEVICE_USERNAME / DEVICE_PASS -> DEVICE_PASSWORD. RESTCONF used to
+    `raise UserWarning` -- a Warning subclass used as an exception, so
+    `except ValueError` never saw it -- while NETCONF did not raise at all
+    and handed None to `manager.connect()`, failing later with an opaque SSH
+    error. Both now fail at construction with ValueError, in the same
+    resolution order (the two templates used to read the pairs in opposite
+    order, so a host exporting both names authenticated as two identities
+    depending on the transport).
+
+    `monkeypatch.delenv` is what makes this hermetic: conftest loads an
+    untracked local `.env` into os.environ at import, and without clearing
+    these names the assertions below would pass on a developer machine and
+    fail in CI -- exactly the bug this test pins down.
+    """
+    from unittest import mock
+
+    for var in ("DEVICE_USER", "DEVICE_USERNAME", "DEVICE_PASS", "DEVICE_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+
+    rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tcred")
+    rest = _import(rout, "session_manager")
+    with pytest.raises(ValueError, match="credentials"):
+        rest.RestconfClient(management_ip="127.0.0.1", port=8181)
+
+    nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tcred")
+    netc = _import(nout, "session_manager")
+    with pytest.raises(ValueError, match="credentials"):
+        netc.NetconfClient(management_ip="127.0.0.1")
+
+    # The documented env fallback still works, and the short name wins.
+    monkeypatch.setenv("DEVICE_USER", "envuser")
+    monkeypatch.setenv("DEVICE_USERNAME", "longform")
+    monkeypatch.setenv("DEVICE_PASS", "envpass")
+    monkeypatch.setenv("DEVICE_PASSWORD", "longformpass")
+    client = rest.RestconfClient(management_ip="127.0.0.1", port=8181)
+    assert client._session.auth == ("envuser", "envpass")
+
+    with mock.patch.object(
+        netc.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ):
+        nclient = netc.NetconfClient(management_ip="127.0.0.1")
+    assert (nclient.username, nclient.password) == ("envuser", "envpass")
+
+    # Explicit args still beat the environment on both protocols.
+    with mock.patch.object(
+        netc.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ):
+        nclient = netc.NetconfClient(
+            management_ip="127.0.0.1", username="arguser", password="argpass"
+        )
+    assert (nclient.username, nclient.password) == ("arguser", "argpass")
+    arg_client = rest.RestconfClient(
+        management_ip="127.0.0.1", port=8181, username="arguser", password="argpass"
+    )
+    assert arg_client._session.auth == ("arguser", "argpass")
