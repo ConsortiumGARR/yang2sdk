@@ -61,6 +61,11 @@ exclude = ["temp", ".venv", ".ruff_cache"]
 # temp/ output is excluded; Python version comes from .python-version/.venv.
 
 [tool.pyrefly]
+# "src" resolves the shipped package; "." resolves `tests.*` so cross-module
+# helpers (e.g. tests/srl/lab.py imported by tests/test_srl_netconf.py) are
+# type-checked as real imports instead of needing a suppression. Without the
+# second root pyrefly infers src/ alone and reports missing-import.
+search-path = ["src", "."]
 # tests/srl/clab-*/ is containerlab runtime state (node config, broken
 # symlinks into the container FS) — ephemeral, never committed.
 project-excludes = ["temp/**", ".venv/**", "tests/srl/clab-*/**"]

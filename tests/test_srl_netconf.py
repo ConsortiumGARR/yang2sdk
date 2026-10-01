@@ -6,12 +6,12 @@ the root datastore (README.md safety rule — a full read on a real device can
 spike CPU and trigger a watchdog reboot).
 
 Requires ``--integration`` / NOTCONF_RUN_INTEGRATION=1 *and* a reachable lab.
-Credentials come from ``SRL_DEVICE_*`` (see .env.srl-lab.example) with the
-published containerlab defaults as a fallback; values are never printed.
+Credentials and endpoint come from ``tests/srl/lab.py``, which reads the
+committed published containerlab defaults in ``tests/srl/.env.srl.example``;
+values are never printed.
 """
 
 import importlib
-import os
 import socket
 import sys
 import time
@@ -20,26 +20,16 @@ from typing import Any
 
 import pytest
 
+from tests.srl.lab import lab_connection
+
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLIENTS = REPO_ROOT / "temp" / "netconf_clients"
-SRL_EXAMPLE = REPO_ROOT / "tests" / "srl" / ".env.srl.example"
 # SR Linux constrains /system/name/host-name and interface names with YANG
 # patterns; both values below satisfy the shipped model.
 TEST_HOSTNAME = "yang2sdk-srl-test"
 TEST_INTERFACE = "lo99"
-
-
-def _srl_defaults() -> dict[str, str]:
-    """Published containerlab defaults (committed; not a secret)."""
-    out: dict[str, str] = {}
-    for line in SRL_EXAMPLE.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            out[key.strip()] = value.strip()
-    return out
 
 
 def _reachable(host: str, port: int) -> bool:
@@ -68,15 +58,11 @@ def _model_for(pkg_name: str, navigator: object) -> Any:
 def srl_client():
     if not (CLIENTS / "srl" / "__init__.py").is_file():
         pytest.skip("generated SRL client not found in temp/netconf_clients")
-    defaults = _srl_defaults()
-    host = os.environ.get("SRL_DEVICE_IP", defaults.get("DEVICE_IP", "127.0.0.1"))
-    port = int(
-        os.environ.get("SRL_DEVICE_NETCONF_PORT", defaults.get("NETCONF_PORT", "1830"))
-    )
-    user = os.environ.get("SRL_DEVICE_USER", defaults.get("DEVICE_USER", ""))
-    password = os.environ.get("SRL_DEVICE_PASS", defaults.get("DEVICE_PASS", ""))
+    host, port, user, password = lab_connection()
     if not (user and password):
-        pytest.skip("SRL credentials are not configured (see .env.srl-lab.example)")
+        pytest.skip(
+            "SRL credentials are not configured (see tests/srl/.env.srl.example)"
+        )
     if not _reachable(host, port):
         pytest.skip("SR Linux lab is not reachable on its NETCONF port")
 

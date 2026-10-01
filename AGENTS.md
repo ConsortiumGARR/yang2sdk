@@ -190,14 +190,19 @@ CI and must not be claimed as coverage.
     can satisfy `must`/`when`/leafref/mandatory, so claiming CRUD coverage would
     be false. Report the coverage the tool has.
 
-- Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe).
+- Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe, credentials parameterised per backend), `tests/srl/` (containerlab lab: topology, startup-config, pinned versions, and `lab.py` — the single source of truth for the committed defaults, used by both the test suite and the CI job).
 - Simulated backend: `https://github.com/notconf/notconf` (admin/admin, lab-only). CI: `.github/workflows/ci-pr.yaml` (lint → typecheck → offline → smoke shards) and `ci-nightly.yaml` (full 11-tag matrix + `workflow_dispatch`).
+- **NMDA coverage comes from SR Linux, not the simulators.** No `notconf` image advertises `urn:ietf:params:netconf:capability:nmda:1.0` and the G30 is writable-running only, so the `has_nmda` → `<get-data>`/`<edit-data>` branch had no live coverage until `.github/workflows/ci-srl.yaml`. That job deploys an SR Linux node via containerlab, pulls the node's own models over `get-schema`, compiles `temp/netconf_clients/srl`, then runs `tests/test_srl_netconf.py`. Three rules govern it:
+  - **Severity is split on purpose.** Deploy / readiness / `get-schema` / generate are **blocking** — zero coverage must never render as a green run. The pytest step is `continue-on-error: true`, so a generator regression is reported without gating a merge. Do not collapse these into one all-or-nothing step.
+  - **It must stay on a standard runner.** `ubuntu-24.04` (4 vCPU / 16 GB) is free for public repos; larger runners are billed even for public repos. SR Linux needs 2 vCPU / 4 GB, so the standard runner is sufficient.
+  - **Versions are pinned in `tests/srl/PINNED.md`** (image tag *and* digest, plus the containerlab version). Update tag and digest together. An unpinned containerlab release can change deploy behaviour overnight and redden the pipeline with no code change.
 - Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored; promoting them to checked-in, diff-compared fixtures (plus `canonicalize_ast.py` snapshot diffs) is still open.
 - Agents must not claim coverage beyond what the suite asserts. Current reality: there is no `xfail`
 in the suite; RESTCONF and NETCONF CRUD round-trips make hard assertions (a `if-feature`
 mismatch or a missing `ietf-interfaces` navigator skips them); NMDA discrimination may skip on the
-documented factory-default race; and `tests/test_srl_netconf.py` / `tests/test_lab_device_netconf.py`
-are in no CI workflow, so anything they assert is not gating anything.
+documented factory-default race; `tests/test_srl_netconf.py` runs in CI but is **non-blocking**, so it
+reports rather than gates; and `tests/test_lab_device_netconf.py` is in no CI workflow, so anything it
+asserts is not gating anything.
 - **A `skip` is not a pass.** The SDK suite skips deliberately and must say why: an image that
 implements no config modules, a node the simulator cannot read, a device without `:validate`. When a
 test covers zero nodes it must `pytest.skip`, never "succeed" vacuously.

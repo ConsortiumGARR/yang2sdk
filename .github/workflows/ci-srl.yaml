@@ -1,0 +1,176 @@
+name: ci-srl
+# SR Linux (Nokia) in containerlab — the repo's only NETCONF **NMDA** device.
+#
+# Why this exists: every notconf image in tests/notconf/matrix.json is
+# documented as NOT advertising `urn:ietf:params:netconf:capability:nmda:1.0`,
+# and the Groove G30 is writable-running only. So the NMDA branch of the
+# generated NETCONF session manager (`has_nmda` -> <get-data>/<edit-data>
+# routing) had no live coverage at all: not in ci-pr.yaml, not in
+# ci-nightly.yaml, and not in the real-lab harness (which needs hardware).
+# SR Linux in a container closes that gap.
+#
+# Cost: this repository is public, so standard GitHub-hosted runners are free.
+# Do NOT move this job to a `*-large` runner — larger runners are billed even
+# for public repositories.
+#
+# Severity is deliberately split:
+#   deploy / readiness / get-schema / generate -> BLOCKING. Zero coverage must
+#     never render as a green run, and each of these failing means the steps
+#     after it prove nothing.
+#   pytest                                       -> non-blocking
+#     (continue-on-error). Device boot timing and init races are real; a
+#     failure here is a signal to read, not a merge blocker.
+# Every blocking step must also pass for pytest to run at all (the default
+# `if: success()`), so a broken lab is never reported as "tests passed".
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-srl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  srl-containerlab:
+    # Standard runner, not a larger one: 4 vCPU / 16 GB RAM is above SR Linux's
+    # documented 2 vCPU / 4 GB minimum, and it keeps the job free for a public repo.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Deliberately no `needs:`. GitHub Actions cannot express dependencies
+    # across workflow files, so this cannot wait on ci-pr.yaml's lint-typecheck
+    # job — it runs in parallel with ci-pr instead, and does its own `uv sync`.
+    # Since the pytest step is non-blocking, ordering against the real gates
+    # would buy nothing anyway.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install containerlab (pinned)
+        # CLAB_VERSION is pinned for the same reason tests/srl/srl.clab.yml pins
+        # the SR Linux image: an unpinned containerlab release can change deploy
+        # or readiness behaviour overnight and turn a green pipeline red with no
+        # code change. Bump it deliberately, and note the bump in the PR.
+        # `install-containerlab` only — the runner already ships docker and has
+        # passwordless sudo, and "all" would try to install its own docker.
+        env:
+          CLAB_VERSION: "0.79.0"
+        run: |
+          curl -sL https://containerlab.dev/setup | sudo -E bash -s install-containerlab
+          containerlab version
+
+      - name: Install project
+        run: uv sync --locked --group dev --extra lab
+
+      - name: Deploy SR Linux lab
+        # `sudo -E` keeps $HOME so containerlab writes its lab state next to
+        # the topology file (tests/srl/clab-*/, already gitignored) instead of
+        # under /root. containerlab needs root for the privileged SR Linux node.
+        #
+        # Most likely failure mode on a new runner: SR Linux's DPDK-based XDP
+        # datapath needs the SSSE3 instruction set and containerlab *aborts*
+        # deploy without it. GitHub's AMD EPYC runners have SSSE3, but keep the
+        # full deploy output in the log so that diagnosis is one scroll away.
+        run: |
+          sudo -E containerlab deploy -t tests/srl/srl.clab.yml
+
+      - name: Wait for NETCONF readiness
+        # The lab is not usable the instant `deploy` returns: SR Linux takes
+        # minutes to bring up its management plane. tests/srl/lab.py polls the
+        # RFC 6241 Sec 8 hello with the lab's own credentials and exits
+        # non-zero on timeout, so a node that never boots fails here loudly
+        # rather than skipping every test below.
+        run: uv run python -m tests.srl.lab
+
+      - name: Download YANG from the node (get-schema)
+        # Same path the notconf suite uses: the shipped yang-downloader, so the
+        # integration suite exercises the code users actually run. It also
+        # writes features.json from the <hello> capability set, which
+        # yang2netconf picks up automatically as --features-file.
+        #
+        # Single source of truth for host/port/credentials: the committed
+        # tests/srl/.env.srl.example (published containerlab defaults, not
+        # secrets). It must be sourced *here* — every `run:` is a fresh shell,
+        # so exporting it in an earlier step would not survive. downloader.main()
+        # reads DEVICE_IP / NETCONF_PORT / DEVICE_USER / DEVICE_PASS /
+        # DEVICE_NAME from the environment and exits 2 if any is missing.
+        # DEVICE_NAME is what makes the output land in temp/yang_modules/srl.
+        #
+        # NOTE: downloader.main() discards download_all()'s failure count and
+        # still exits 0, so a partial extraction looks like success. Guard on
+        # the artefacts instead of trusting the exit code.
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          source tests/srl/.env.srl.example
+          set +a
+          echo "lab endpoint ${DEVICE_IP}:${NETCONF_PORT} as device '${DEVICE_NAME}'"
+          uv run yang-downloader
+          count=$(find temp/yang_modules/srl -name '*.yang' | wc -l)
+          echo "downloaded ${count} YANG modules"
+          if [ "$count" -lt 10 ]; then
+            echo "::error::get-schema returned only ${count} modules — refusing to compile"
+            exit 1
+          fi
+          test -f temp/yang_modules/srl/features.json \
+            || { echo "::error::features.json missing — <hello> capability parse failed"; exit 1; }
+
+      - name: Generate the NETCONF client from the node's own models
+        # Roots are the two the test navigates to: <system> (system/name/host-name,
+        # management, logging) and the interfaces list. The closure resolver
+        # pulls in every module that augments or is used by them, without which
+        # pyang emits base-only models that reject the device's fully-augmented
+        # replies under extra="forbid".
+        run: |
+          mapfile -t FILES < <(
+            uv run python -m yang2sdk.cli.closure \
+              srl_nokia-system srl_nokia-interfaces \
+              --yang-dir temp/yang_modules/srl --format files
+          )
+          echo "augment closure: ${#FILES[@]} modules"
+          if [ "${#FILES[@]}" -lt 2 ]; then
+            echo "::error::closure resolver found no modules — cannot compile"
+            exit 1
+          fi
+          uv run yang2netconf "${FILES[@]}" \
+            --device srl \
+            --yang-dir temp/yang_modules/srl \
+            --output-dir temp/netconf_clients/srl
+          test -f temp/netconf_clients/srl/__init__.py
+
+      - name: SR Linux NETCONF suite
+        # NON-BLOCKING on purpose. Everything above must pass for this step to
+        # even run (default `if: success()`), so a broken lab is still a red X.
+        # A failure *here* is a device/timing or generator-regression signal that
+        # should be read, not a merge blocker.
+        #
+        # Expect one skip: test_hostname_mutate_restore skips because SR Linux
+        # rejects the RFC 6241 Sec 7.5 <lock><target> encoding (documented at
+        # tests/test_srl_netconf.py). See that file for the full list.
+        id: srl-tests
+        continue-on-error: true
+        env:
+          NOTCONF_RUN_INTEGRATION: "1"
+        run: uv run pytest tests/test_srl_netconf.py -v
+
+      - name: Container logs
+        # `failure()` alone would MISS the case that matters most: a failing
+        # pytest step does not put the job in a failed state, because it is
+        # continue-on-error. Check that step's own outcome too, or a generator
+        # regression would be reported with no device logs to explain it.
+        # Runs before destroy, while the containers still exist.
+        if: failure() || steps.srl-tests.outcome == 'failure'
+        run: |
+          docker ps -a --format '{{.Names}}' | grep -e clab- || true
+          for c in $(docker ps -a --format '{{.Names}}' | grep -e clab- || true); do
+            echo "===== ${c} ====="
+            docker logs --tail 200 "$c" || true
+          done
+
+      - name: Destroy the lab
+        # Always: an abandoned privileged container keeps its port binding and
+        # its ~2 GB of disk until the runner is reclaimed.
+        if: always()
+        run: |
+          sudo -E containerlab destroy -t tests/srl/srl.clab.yml --cleanup || true
