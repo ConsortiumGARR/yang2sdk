@@ -1,0 +1,13 @@
+name: yang2sdk-srl
+# LAB ONLY — single SR Linux node for yang2sdk NETCONF SDK spike.
+# Pinned image (righteous plan): update tag + digest together in PINNED.md.
+# See README.md in this directory.
+topology:
+  nodes:
+    srl1:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:25.10.1
+      type: ixr-d2l
+      ports:
+        - 127.0.0.1:1830:830
+      startup-config: srl-startup.cli

@@ -1,0 +1,243 @@
+from typing import Annotated, Any, Generic, TypeVar
+from lxml import etree
+from pydantic import BaseModel
+from ..session_manager import NetconfClient
+
+def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max_depth: int, current_depth: int = 1):
+    """Recursively prunes the XML tree, completely removing complex nodes at the depth boundary.
+    
+    This is needed because in RFC 6241 NETCONF servers do not support depth filtering, so we have to filter here.
+    """
+    if model_cls is None:
+        return
+    if hasattr(model_cls, "model_rebuild"):
+        from ..data_models._base import rebuild_model_and_dependencies
+        rebuild_model_and_dependencies(model_cls)
+    if not hasattr(model_cls, "model_fields"):
+        return
+
+    from typing import get_args, get_origin, Union, Annotated
+    import types
+    from pydantic import BaseModel
+
+    def extract_base_model(annot):
+        if annot is None: return None
+        origin = get_origin(annot)
+        if origin in (Union, types.UnionType):
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif origin is list or origin is Annotated:
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
+        return None
+
+    for field_name, field_info in list(model_cls.model_fields.items()):
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag", field_name)
+        ns = extra.get("ns")
+
+        child_cls = extract_base_model(field_info.annotation)
+        is_complex = child_cls is not None and child_cls != model_cls
+
+        child_nodes = []
+        for child in list(element):
+            localname = etree.QName(child).localname
+            namespace = etree.QName(child).namespace
+            if localname == tag and (not ns or namespace == ns):
+                child_nodes.append(child)
+
+        for child_node in child_nodes:
+            if is_complex and current_depth >= max_depth:
+                # Completely remove complex nodes at boundary so they deserialize as None
+                element.remove(child_node)
+            elif is_complex:
+                prune_xml_tree_to_depth(child_node, child_cls, max_depth, current_depth + 1)
+
+def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
+    """Refuse an `nc:operation="replace"` that would delete unset fields.
+
+    RFC 6241 Sec 8.2.1: with nc:operation="replace" on a node, the server
+    replaces that node's *entire* contents, so any child absent from the
+    payload is removed. A hand-built model -- or one read at a shallower depth
+    -- omits fields, and the previous code sent it anyway, quietly deleting
+    them. A round-trip (retrieve -> modify -> replace) is unaffected because
+    every field the device returned is "set".
+    """
+    if allow_partial:
+        return
+    if not hasattr(data, "model_fields"):
+        # `replace()` accepts a dict or an XML/JSON string exactly as readily
+        # as a model, and the caller coerces it *after* this guard runs. Left
+        # uncoerced, a plain dict raised an opaque
+        # `AttributeError: 'dict' object has no attribute 'model_fields'`, which
+        # is both a bad error and a silent bypass of the safety check for the
+        # most convenient input form. Coerce with the same rules `update()`
+        # uses, so the check always sees a model.
+        if data is None:
+            raise ValueError("replace() needs a model, dict, or XML/JSON string.")
+        if model_cls is None:
+            raise TypeError(
+                f"replace() cannot inspect {type(data).__name__}; pass the model "
+                f"instance, or allow_partial=True to skip the completeness check."
+            )
+        if isinstance(data, dict):
+            data = model_cls.model_validate(data)
+        elif isinstance(data, str) and data.strip().startswith("<"):
+            data = model_cls.from_xml(data)
+        else:
+            data = model_cls.model_validate_json(data)
+    # nc_operation is the nc:operation *attribute*, not a data node; it is
+    # never part of the resource contents.
+    # `config false` (state) fields never appear in a config body and cannot be
+    # deleted by an edit, so counting them reported every state leaf of a
+    # partially-read interface as "would be deleted". Only config nodes are at
+    # risk, and `nc_operation` is an attribute rather than a data node.
+    unset = [
+        name
+        for name, info in data.model_fields.items()
+        if name != "nc_operation"
+        and name not in data.model_fields_set
+        and (info.json_schema_extra or {}).get("is_config") is not False
+    ]
+    if not unset:
+        return
+    shown = ", ".join(sorted(unset)[:12])
+    more = f" (+{len(unset) - 12} more)" if len(unset) > 12 else ""
+    raise ValueError(
+        f"replace() on {type(data).__name__} would DELETE {len(unset)} field(s) "
+        f"that are not set, because nc:operation=\"replace\" replaces the whole "
+        f"node (RFC 6241 Sec 8.2.1): {shown}{more}. "
+        f"Use update() to merge, retrieve the node at full depth first, or pass "
+        f"allow_partial=True if deleting them is what you intend."
+    )
+
+
+def build_filter_tree(path_tuples: list[tuple[str, str, dict[str, Any]]], model_cls: type | None = None, fields: list[str] | None = None) -> etree._Element:
+    """Builds a precise RFC 6241 selection node without sending exhaustive trees."""
+    root = current = None
+    for ns, tag, keys in path_tuples:
+        elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
+            key_elem.text = str(v)
+            elem.append(key_elem)
+            
+        if root is None: root = current = elem
+        else:
+            current.append(elem)
+            current = elem
+
+    # If specific fields are requested, explicitly append them to the filter node.
+    # Otherwise, we leave the node empty to retrieve the full subtree from the device.
+    if current is not None and fields and model_cls:
+        for field_name in fields:
+            field_info = getattr(model_cls, "model_fields", {}).get(field_name)
+            if field_info:
+                extra = field_info.json_schema_extra or {}
+                f_ns = extra.get("ns", path_tuples[-1][0] if path_tuples else "")
+                f_tag = extra.get("tag", field_name)
+                current.append(etree.Element("{" + f_ns + "}" + f_tag if f_ns else f_tag, nsmap={None: f_ns} if f_ns else None))
+
+    return root
+
+def find_xml_node(root_element: etree._Element | None, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element | None:
+    if root_element is None:
+        return None
+    current = root_element
+    for ns, tag, keys in path_tuples:
+        found = None
+        for child in current:
+            if etree.QName(child).localname == tag and (not ns or etree.QName(child).namespace == ns):
+                match = True
+                for k, v in keys.items():
+                    key_child = child.find("./{" + ns + "}" + k if ns else f"./{k}")
+                    if key_child is None:
+                        key_child = child.find(f"./{k}")
+                    if key_child is None or key_child.text != str(v):
+                        match = False
+                        break
+                if match:
+                    found = child
+                    break
+        if found is None:
+            return None
+        current = found
+    return current
+
+def find_xml_nodes(root_element: etree._Element | None, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> list[etree._Element]:
+    if root_element is None or not path_tuples:
+        return []
+    parent = find_xml_node(root_element, path_tuples[:-1]) if len(path_tuples) > 1 else root_element
+    if parent is None:
+        return []
+    
+    last_ns, last_tag, last_keys = path_tuples[-1]
+    results = []
+    for child in parent:
+        if etree.QName(child).localname == last_tag and (not last_ns or etree.QName(child).namespace == last_ns):
+            match = True
+            for k, v in last_keys.items():
+                key_child = child.find("./{" + last_ns + "}" + k if last_ns else f"./{k}")
+                if key_child is None:
+                    key_child = child.find(f"./{k}")
+                if key_child is None or key_child.text != str(v):
+                    match = False
+                    break
+            if match:
+                results.append(child)
+    return results
+
+def wrap_in_parent_hierarchy(element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element:
+    current = element
+    for ns, tag, keys in reversed(path_tuples[:-1]):
+        parent_elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
+            key_elem.text = str(v)
+            parent_elem.append(key_elem)
+        parent_elem.append(current)
+        current = parent_elem
+    return current
+
+
+def wrap_list_in_parent_hierarchy(elements: list[etree._Element], path_tuples: list[tuple[str, str, dict[str, Any]]]) -> list[etree._Element]:
+    if not path_tuples or len(path_tuples) < 2:
+        return elements
+        
+    parent_ns, parent_tag, parent_keys = path_tuples[-2]
+    parent_elem = etree.Element("{" + parent_ns + "}" + parent_tag if parent_ns else parent_tag, nsmap={None: parent_ns} if parent_ns else None)
+    for k, v in parent_keys.items():
+        key_elem = etree.Element("{" + parent_ns + "}" + k if parent_ns else k)
+        key_elem.text = str(v)
+        parent_elem.append(key_elem)
+        
+    for elem in elements: parent_elem.append(elem)
+        
+    current = parent_elem
+    for ns, tag, keys in reversed(path_tuples[:-2]):
+        anc_elem = etree.Element("{" + ns + "}" + tag if ns else tag, nsmap={None: ns} if ns else None)
+        for k, v in keys.items():
+            key_elem = etree.Element("{" + ns + "}" + k if ns else k)
+            key_elem.text = str(v)
+            anc_elem.append(key_elem)
+        anc_elem.append(current)
+        current = anc_elem
+        
+    return [current]
+
+
+class Node:
+    def __init__(self, client: NetconfClient, path: list[tuple[str, str, dict]] = None):
+        self._client = client
+        self._path = path or []
+
+class ItemNode(Node): pass
+TNode = TypeVar("TNode", bound=ItemNode)
+
+class ListNode(Node, Generic[TNode]):
+    def __init__(self, client: NetconfClient, item_cls: type[TNode], path: list = None):
+        super().__init__(client, path)
+        self._item_cls = item_cls
+
+    def __call__(self, *keys: Any) -> TNode: raise NotImplementedError("Implemented by generated subclasses")

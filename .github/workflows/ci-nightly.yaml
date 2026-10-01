@@ -1,0 +1,36 @@
+name: ci-nightly
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  full-matrix:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - { package: notconf, tag: latest }
+          - { package: notconf-ietf, tag: latest }
+          - { package: notconf-sros, tag: "21.10" }
+          - { package: notconf-sros, tag: "22.2" }
+          - { package: notconf-junos, tag: 21.1R1 }
+          - { package: notconf-junos, tag: 23.4R1 }
+          - { package: notconf-cisco-xr, tag: "762" }
+          - { package: notconf-cisco-xr, tag: "771" }
+          - { package: notconf-cisco-xr, tag: "2411" }
+          - { package: notconf-cisco-xr, tag: "2531" }
+          - { package: notconf-cisco-nx, tag: 10.4-4 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --group dev --extra lab
+      - run: uv run pytest tests/test_notconf_protocol.py tests/test_sdk_generate.py -v
+        env:
+          NOTCONF_RUN_INTEGRATION: "1"
+          NOTCONF_IMAGE_PACKAGE: ${{ matrix.image.package }}
+          NOTCONF_IMAGE_TAG: ${{ matrix.image.tag }}
+      - name: Collect container logs
+        if: always()
+        run: docker ps -a --format '{{.Names}}' | grep -e yang2sdk- || true

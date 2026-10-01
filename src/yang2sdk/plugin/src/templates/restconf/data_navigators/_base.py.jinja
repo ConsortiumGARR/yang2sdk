@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from ..session_manager import RestconfClient
+
+
+def _get_max_depth(data: Any, current_depth: int = 1) -> int:
+    """Calculates max depth, treating lists of primitives as leaf values."""
+    if isinstance(data, dict) and data:
+        return max(
+            (_get_max_depth(v, current_depth + 1) for v in data.values()),
+            default=current_depth,
+        )
+
+    if isinstance(data, list) and data:
+        # Check if the list contains complex structures (dicts or nested lists)
+        if any(isinstance(item, (dict, list)) for item in data):
+            return max(
+                (_get_max_depth(item, current_depth + 1) for item in data),
+                default=current_depth,
+            )
+        # If it's a list of primitives (leaf-list), don't increment depth
+        return current_depth
+
+    return current_depth
+
+
+def _prune_at_max_depth(data: Any, target_depth: int, current_depth: int = 1) -> Any:
+    """Deletes empty dicts only if they are located at the target_depth."""
+    if isinstance(data, dict):
+        # If we reached target depth and it's an empty dict, this is a candidate for deletion
+        # However, the parent call handles the deletion. Here we filter children.
+        return {
+            k: _prune_at_max_depth(v, target_depth, current_depth + 1)
+            for k, v in data.items()
+            if not (isinstance(v, dict) and not v and current_depth + 1 == target_depth)
+        }
+    if isinstance(data, list):
+        return [
+            _prune_at_max_depth(item, target_depth, current_depth + 1)
+            for item in data
+            if not (
+                isinstance(item, (dict, list))
+                and not item
+                and current_depth + 1 == target_depth
+            )
+        ]
+    return data
+
+
+def _maybe_prune(data: Any, depth: int | str) -> Any:
+    """Drop empty boundary containers, but never deeper than the caller asked.
+
+    RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling, so a
+    container returned empty at that boundary is a truncation artefact rather
+    than a real value, and strict models should not be asked to validate it.
+
+    Two things were wrong before: the *observed* depth of the response was
+    used and the *requested* depth was ignored entirely, so `depth=2` and
+    `depth=30` behaved identically and the result depended on what the device
+    happened to return; and a legitimately empty container at the deepest
+    returned level was deleted from the caller's data with no warning.
+
+    `depth="unbounded"` (the RFC default) has no boundary, so nothing is
+    touched. Otherwise the boundary is min(requested, observed): a server that
+    honours the request truncates at exactly `depth`, and one that returns
+    less is truncating at whatever it returned.
+    """
+    if isinstance(depth, bool):
+        return data
+    requested: int | None = None
+    if isinstance(depth, int):
+        requested = depth
+    elif isinstance(depth, str) and depth.isdigit():
+        requested = int(depth)
+    if requested is None:
+        return data
+    observed = _get_max_depth(data)
+    return _prune_at_depth(data, min(requested, observed))
+
+
+def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
+    """Refuse a PUT that would silently delete unset fields.
+
+    RFC 8040 Sec 4.5: the body of a PUT MUST represent the complete target
+    resource, so every node missing from the body is removed on the device.
+    A hand-built model -- or one produced by `retrieve(depth=N)` when the real
+    configuration is deeper than N -- omits fields, and the previous code
+    sent it anyway, quietly deleting them. A round-trip
+    (retrieve -> modify -> replace) is unaffected because every field the
+    device returned is "set".
+    """
+    if allow_partial:
+        return
+    # `config false` (state) fields never appear in a config body and cannot be
+    # deleted by an edit, so counting them reported every state leaf of a
+    # partially-read interface as "would be deleted". Only config nodes are
+    # at risk.
+    unset = [
+        name
+        for name, info in data.model_fields.items()
+        if name not in data.model_fields_set
+        and (info.json_schema_extra or {}).get("is_config") is not False
+    ]
+    if not unset:
+        return
+    shown = ", ".join(sorted(unset)[:12])
+    more = f" (+{len(unset) - 12} more)" if len(unset) > 12 else ""
+    raise ValueError(
+        f"replace() on {type(data).__name__} would DELETE {len(unset)} field(s) "
+        f"that are not set, because a PUT body must represent the complete "
+        f"resource (RFC 8040 Sec 4.5): {shown}{more}. "
+        f"Use update() to merge, retrieve the node at full depth first, or pass "
+        f"allow_partial=True if deleting them is what you intend."
+    )
+
+
+def _prune_at_depth(data: Any, target_depth: int, current_depth: int = 1) -> Any:
+    """Drop empty containers/lists that sit exactly at `target_depth`.
+
+    RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling, so an
+    empty container at that boundary carries no information and strict
+    models should not be asked to validate it. The boundary is the depth the
+    caller *asked for* -- the previous code passed the depth it *observed* in
+    the response, which made the pruning depend on what the device happened
+    to return and deleted legitimately empty containers on the way.
+    """
+    if isinstance(data, dict):
+        return {
+            k: _prune_at_depth(v, target_depth, current_depth + 1)
+            for k, v in data.items()
+            if not (isinstance(v, (dict, list)) and not v and current_depth + 1 == target_depth)
+        }
+    if isinstance(data, list):
+        return [
+            _prune_at_depth(item, target_depth, current_depth + 1)
+            for item in data
+            if not (isinstance(item, (dict, list)) and not item and current_depth + 1 == target_depth)
+        ]
+    return data
+
+
+class Node:
+    __slots__ = ("_client", "_name", "_path", "_envelope_name")
+
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        envelope_name: str | None = None,
+    ):
+        self._client = client
+        self._path = path
+        self._name = name
+        # Key used for request bodies. RFC 7951 Sec 4 requires a
+        # module-qualified member name for the top-level member of a body,
+        # while responses use the simple name when the module matches the
+        # parent (RFC 7951 Sec 4), so `_name` (response key) and
+        # `_envelope_name` (write key) can differ for nested nodes.
+        self._envelope_name = envelope_name or name
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+
+        resp = self._client._request("GET", self._path, params=params)
+
+        payload = None
+
+        # Handle if the response is a dictionary
+        if isinstance(resp, dict):
+            # Check for exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                payload = inner
+
+            # Check for namespaced key match (e.g. ietf-hardware:slot-item)
+            else:
+                # Find any key that ends with ":name"
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    payload = inner
+                else:
+                    # Fallback: Assume the response itself is the object (unwrapped)
+                    payload = resp
+
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        payload = _maybe_prune(payload, depth)
+
+        return payload
+
+    def _update(self, **kwargs: Any) -> None:
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        data = {self._envelope_name: kwargs}
+        return self._client._request("PATCH", self._path, json=data)
+
+    def _replace(self, **kwargs: Any) -> None:
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        data = {self._envelope_name: kwargs}
+        return self._client._request("PUT", self._path, json=data)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)
+
+
+class ItemNode:
+    __slots__ = ("_client", "_name", "_path", "_envelope_name")
+
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        envelope_name: str | None = None,
+    ):
+        self._client = client
+        self._path = path
+        self._name = name
+        self._envelope_name = envelope_name or name
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+        resp = self._client._request("GET", self._path, params=params)
+
+        payload = None
+
+        # Handle if the response is a list (e.g., direct list return)
+        if isinstance(resp, list):
+            if not resp:
+                raise ValueError(f"Received empty list from API for {self._name}")
+            payload = resp[0]
+
+        # Handle if the response is a dictionary
+        elif isinstance(resp, dict):
+            # Check for exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                if isinstance(inner, list):
+                    if not inner:
+                        raise ValueError(
+                            f"Received empty list inside key '{self._name}'"
+                        )
+                    payload = inner[0]
+                else:
+                    # Handle case where it returns a single object instead of a list
+                    payload = inner
+
+            # Check for namespaced key match (e.g. ietf-hardware:slot-item)
+            else:
+                # Find any key that ends with ":name"
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    if isinstance(inner, list):
+                        if not inner:
+                            raise ValueError(
+                                f"Received empty list inside key '{found_keys[0]}'"
+                            )
+                        payload = inner[0]
+                    else:
+                        payload = inner
+                else:
+                    # Fallback: Assume the response itself is the object (unwrapped)
+                    payload = resp
+
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        payload = _maybe_prune(payload, depth)
+
+        return payload
+
+    def _update(self, **kwargs: Any) -> None:
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        # RFC 8040 Sec 4.5 PUT list-instance JSON is a single-element array
+        # (jukebox album example); RFC 7951 Sec 5.4 encodes a list as
+        # name/array of objects and Sec 3 requires a top-level object.
+        # PATCH on a list instance has no JSON example in RFC 8040 (only XML
+        # bare <album>); the array form follows the same JSON encoding and
+        # matches rousette tests/restconf-plain-patch.cpp (204). XML is bare
+        # <album> — JSON/XML differ here by design, not by deviation.
+        data = {self._envelope_name: [kwargs]}
+        return self._client._request("PATCH", self._path, json=data)
+
+    def _replace(self, **kwargs: Any) -> None:
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if not ((isinstance(v, list) or isinstance(v, dict)) and len(v) == 0)
+        }
+        # Same encoding as _update: RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4.
+        data = {self._envelope_name: [kwargs]}
+        return self._client._request("PUT", self._path, json=data)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)
+
+
+TNode = TypeVar("TNode", bound=ItemNode)
+
+
+class ListNode(Generic[TNode]):
+    __slots__ = ("_client", "_item_cls", "_name", "_path", "_envelope_name")
+
+    def __init__(
+        self,
+        client: RestconfClient,
+        path: str,
+        name: str,
+        item_cls: type[TNode],
+        envelope_name: str | None = None,
+    ):
+        self._client = client
+        self._path = path
+        self._name = name
+        self._item_cls = item_cls
+        self._envelope_name = envelope_name or name
+
+    def __call__(self, *keys: str | int) -> TNode:
+        """
+        Supports composite keys.
+        Usage: client.data.interfaces('eth0')
+        or client.data.routes('1.1.1.1', 'vrf-A')
+        """
+        if not keys:
+            raise ValueError("Keys must be provided")
+
+        encoded_keys = ",".join(quote(str(k), safe="") for k in keys)
+
+        new_path = f"{self._path}={encoded_keys}"
+
+        return self._item_cls(
+            self._client, new_path, self._name, envelope_name=self._envelope_name
+        )
+
+    def _retrieve(
+        self,
+        *,
+        content: str = "all",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+        fields: list[str] | None = None,
+    ) -> Any:
+        params = {
+            "content": content,
+            "depth": depth,
+            "with-defaults": with_defaults,
+        }
+        if fields:
+            params["fields"] = ";".join(fields)
+        resp = self._client._request("GET", self._path, params=params)
+
+        data_list = []
+
+        # 1. Handle Root List
+        if isinstance(resp, list):
+            data_list = resp
+
+        # 2. Handle Dictionary
+        elif isinstance(resp, dict):
+            # 2a. Exact key match
+            if self._name in resp:
+                inner = resp[self._name]
+                if isinstance(inner, list):
+                    data_list = inner
+                elif isinstance(inner, dict):
+                    data_list = [inner]
+                elif inner is None:
+                    data_list = []
+                else:
+                    # Fallback for primitives or unknown types, though unlikely for a list node
+                    # We might want to raise, but let's try to treat as single item or error?
+                    # Raising is safer.
+                    raise ValueError(
+                        f"Unexpected value type for '{self._name}': {type(inner)}"
+                    )
+
+            # 2b. Namespaced key match
+            else:
+                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
+                if found_keys:
+                    inner = resp[found_keys[0]]
+                    if isinstance(inner, list):
+                        data_list = inner
+                    elif isinstance(inner, dict):
+                        data_list = [inner]
+                    elif inner is None:
+                        data_list = []
+                else:
+                    # 2c. No wrapper found. Assume response is a single item (unwrapped)
+                    # For a list retrieval, this is the "list of 1 item" case where the list wrapper is missing.
+                    data_list = [resp]
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+
+        data_list = _maybe_prune(data_list, depth)
+
+        return data_list
+
+    def _create(self, data_list: list[dict[str, Any]]) -> None:
+        # RFC 8040 Sec 4.4.1: POST targets the parent (collection holder) and
+        # the body MUST contain exactly one instance. Appendix B.2.1 shows
+        # POST .../library -> {"example-jukebox:artist": [{"name": ...}]}.
+        # Hence one POST per entry to the parent URL with a single-element
+        # array (RFC 7951 Sec 5.4). Key-mismatch / multi-entry rejections
+        # ("requires N keys", "MUST contain exactly one instance",
+        # "List key mismatch") enforce RFC 8040 Sec 3.5.3 / Sec 4.5.
+        url = self._path.removesuffix(f"/{self._name}")
+        for item in data_list:
+            self._client._request("POST", url, json={self._envelope_name: [item]})
+
+    def _replace(self, data_list: list[dict[str, Any]]) -> None:
+        # Whole-list replace: PUT targets the list resource itself with the
+        # RFC 7951 Sec 5.4 list encoding (RFC 8040 Sec 4.5: body MUST represent
+        # the target resource). PUT to the parent container with a list-keyed
+        # body is malformed (target is the container, body must be the
+        # container) and correctly yields LY_EVALID — that prior shape was a
+        # client bug, not a server deviation. Bulk replace is not exercised
+        # by the item-level CRUD tests.
+        envelope = {self._envelope_name: data_list}
+        return self._client._request("PUT", self._path, json=envelope)
+
+    def delete(self) -> None:
+        return self._client._request("DELETE", self._path)

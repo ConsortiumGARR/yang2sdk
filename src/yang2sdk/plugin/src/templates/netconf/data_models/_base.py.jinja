@@ -1,0 +1,288 @@
+from typing import Annotated, Any, ClassVar, Literal, Self, get_args, get_origin, Union
+import types
+from pydantic import ConfigDict, BaseModel, BeforeValidator, model_validator
+from pydantic_xml import BaseXmlModel, attr
+from lxml import etree
+from decimal import Decimal
+import re
+
+NETCONF_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
+    """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml.
+
+    search_mode='unordered' is inherited by every generated model
+    (pydantic-xml model.py: __xml_search_mode__ falls back to the parent
+    class). The default STRICT search is a single forward-only cursor with
+    exact tag equality, so the *first* child the model does not know stalls the
+    cursor and turns every later sibling into `extra_forbidden` — a
+    single if-feature mismatch produced 127 phantom errors on SR Linux.
+    A client must not depend on the order in which a server emits sibling
+    data nodes: RFC 7950 Sec 7.7.1 lets the server sort list entries "in any
+    reasonable order", and RFC 6241 Sec 5.2 treats the <config> contents as
+    opaque data. UNORDERED consumes each match out of order while keeping
+    the consumed prefix contiguous, so `_check_extra` still detects genuine
+    unknown elements.
+    """
+
+    # Tolerate XML *attributes* a model cannot bind, drop unknown *elements*
+    # never. RFC 7952 Sec 4.1: "An attribute MUST NOT be used to represent a
+    # YANG leaf value" — attributes carry metadata, so an undeclared one
+    # cannot hide or corrupt data. pydantic-xml reports unbound attributes
+    # through the same `extra="forbid"` hook as unknown elements (it prefixes
+    # their loc with "@"), so a device that stamps its own attribute on every
+    # data node otherwise makes every read fail. The Groove G30 emits an
+    # undeclared `cli-name` on every node, with no YANG declaration anywhere.
+    #
+    # Unknown ELEMENTS remain fatal: that is the model-gap safety net
+    # (`--check-model-gaps` exists for exactly that case). Set this False on a
+    # subclass to get strict-attribute behaviour back.
+    ignore_unbound_attributes: ClassVar[bool] = True
+
+    @classmethod
+    def _drop_unbound_attributes(cls, root):
+        """Remove attributes no generated model binds, before pydantic-xml reads.
+
+        The only XML attribute a generated model ever binds is `nc:operation`
+        (`NetconfBaseModel.nc_operation`); everything else on a data element
+        is metadata. Namespaced `xmlns`/XSI attributes are never touched.
+        """
+        if not cls.ignore_unbound_attributes:
+            return root
+        for el in root.iter():
+            if not isinstance(el.tag, str):
+                continue
+            for name in list(el.attrib):
+                if name.startswith("{http://www.w3.org/2000/xmlns/}"):
+                    continue
+                qname = etree.QName(name)
+                if qname.namespace == NETCONF_BASE_NS and qname.localname == "operation":
+                    continue
+                del el.attrib[name]
+        return root
+
+    @classmethod
+    def from_xml(cls, source: str | bytes, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
+        rebuild_model_and_dependencies(cls)
+        # Always parse to a tree: attribute handling has to see the elements.
+        # (Passing an lxml element straight to pydantic-xml's from_xml() raises
+        # "memoryview: a bytes-like object is required".)
+        root = etree.fromstring(source)
+        if module_namespaces:
+            normalize_identityrefs(root, cls, module_namespaces)
+        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+
+    @classmethod
+    def from_xml_tree(cls, root, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
+        rebuild_model_and_dependencies(cls)
+        if module_namespaces:
+            normalize_identityrefs(root, cls, module_namespaces)
+        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+        return super().from_xml(source, *args, **kwargs)
+
+    @classmethod
+    def from_xml_tree(cls, root: etree._Element, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
+        rebuild_model_and_dependencies(cls)
+        if module_namespaces:
+            normalize_identityrefs(root, cls, module_namespaces)
+        return super().from_xml_tree(root, *args, **kwargs)
+
+    def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
+        rebuild_model_and_dependencies(self.__class__)
+        return super().to_xml(*args, **kwargs)
+
+
+def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] = None) -> None:
+    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers."""
+    if memo is None:
+        memo = set()
+    if cls in memo:
+        return
+    memo.add(cls)
+
+    # Initial resolve to populate annotations and generate initial schema metadata
+    if getattr(cls, "__xml_serializer__", None) is None:
+        cls.model_rebuild()
+
+    def extract_models(annot: Any) -> list[type[NetconfXmlModel]]:
+        if annot is None:
+            return []
+        origin = get_origin(annot)
+        if origin in (Union, types.UnionType):
+            models = []
+            for arg in get_args(annot):
+                models.extend(extract_models(arg))
+            return models
+        elif origin in (list, tuple, set, dict, Annotated):
+            models = []
+            for arg in get_args(annot):
+                models.extend(extract_models(arg))
+            return models
+        elif isinstance(annot, type) and issubclass(annot, NetconfXmlModel):
+            return [annot]
+        return []
+
+    fields = getattr(cls, "model_fields", {})
+    for field_info in fields.values():
+        for nested_cls in extract_models(field_info.annotation):
+            rebuild_model_and_dependencies(nested_cls, memo)
+
+    # Final seal: lock-in serializers once child dependencies are completely built
+    cls.model_rebuild()
+
+def _extract_child_model(annot: Any) -> type | None:
+    """Unwrap Optional/list/Annotated aliases to the nested model class."""
+    if annot is None:
+        return None
+    origin = get_origin(annot)
+    if origin in (Union, types.UnionType):
+        for arg in get_args(annot):
+            found = _extract_child_model(arg)
+            if found is not None:
+                return found
+    elif origin in (list, tuple, set, dict, Annotated):
+        for arg in get_args(annot):
+            found = _extract_child_model(arg)
+            if found is not None:
+                return found
+    elif isinstance(annot, type) and issubclass(annot, BaseModel):
+        return annot
+    return None
+
+def normalize_identityrefs(element: etree._Element, model_cls: type | None, module_namespaces: dict[str, str]) -> None:
+    """Rewrite identityref values from XML prefix form to RFC 7951 Sec 6.8
+    module-name form ('module:identity') using the in-scope namespaces.
+
+    Keeps models protocol-agnostic: retrieved values match the canonical
+    JSON encoding, so they round-trip unchanged through both transports.
+    """
+    if model_cls is None or not hasattr(model_cls, "model_fields"):
+        return
+    namespace_modules = {ns: name for name, ns in module_namespaces.items()}
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if tag is None:
+            continue
+        ns = extra.get("ns")
+        if extra.get("is_identityref"):
+            for child in element:
+                qname = etree.QName(child)
+                if qname.localname != tag or (ns and qname.namespace != ns):
+                    continue
+                text = child.text or ""
+                if ":" not in text:
+                    continue
+                prefix, name = text.split(":", 1)
+                module = namespace_modules.get((child.nsmap or {}).get(prefix, ""))
+                if module:
+                    child.text = f"{module}:{name}"
+            continue
+        child_cls = _extract_child_model(field_info.annotation)
+        if child_cls is not None and child_cls is not model_cls:
+            for child in element:
+                qname = etree.QName(child)
+                if qname.localname == tag and (not ns or qname.namespace == ns):
+                    normalize_identityrefs(child, child_cls, module_namespaces)
+
+def _strip_nonconfig_tree(element: etree._Element, model_cls: type | None) -> None:
+    """Remove `config false` subtrees in place using is_config metadata."""
+    if model_cls is None or not hasattr(model_cls, "model_fields"):
+        return
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if tag is None:
+            continue
+        ns = extra.get("ns")
+        # Only an explicit False means "state data, strip it". A missing or
+        # None is_config means config-ness is not defined here (rpc/action/
+        # notification subtrees); treating that as False deleted rpc input
+        # parameters from every write payload.
+        if extra.get("is_config", True) is not False:
+            child_cls = _extract_child_model(field_info.annotation)
+            if child_cls is not None and child_cls is not model_cls:
+                for child in list(element):
+                    qname = etree.QName(child)
+                    if qname.localname == tag and (not ns or qname.namespace == ns):
+                        _strip_nonconfig_tree(child, child_cls)
+            continue
+        for child in list(element):
+            qname = etree.QName(child)
+            if qname.localname == tag and (not ns or qname.namespace == ns):
+                element.remove(child)
+
+class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, defer_build=True, populate_by_name=True)
+    # ns="nc" (prefix alias, not the URI): pydantic-xml resolves attr namespaces
+    # through the model nsmap, which every generated subclass re-declares.
+    nc_operation: str | None = attr(name="operation", ns="nc", default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_wire_names(cls, data: Any) -> Any:
+        """Accept the YANG wire name as well as the Python field name.
+
+        pydantic-xml binds an element to a field by its `tag`, not by the
+        Python attribute name, so a NETCONF model has no `alias` and
+        `model_validate` would otherwise only accept e.g. `delay_seconds`.
+        The RESTCONF models carry `Field(alias="delay-seconds")` and accept
+        the wire name, so a dict written for one client raised
+        `extra_forbidden` on the other. Mapping the tag back here is what
+        makes `update()/create()/rpc()` take the *same* dict on both
+        transports (protocol parity), while `extra="forbid"` still rejects
+        genuinely unknown nodes.
+        """
+        if not isinstance(data, dict):
+            return data
+        # nc_operation is an attribute, not a pydantic-xml element, and has no
+        # `tag` in json_schema_extra, so name its wire form explicitly.
+        by_wire = {"operation": "nc_operation"}
+        for name, fi in cls.model_fields.items():
+            tag = (fi.json_schema_extra or {}).get("tag")
+            if tag and tag != name:
+                by_wire[tag] = name
+        if not (set(data) & set(by_wire)):
+            return data
+        return {(by_wire.get(k) or k): v for k, v in data.items()}
+
+    def to_xml_payload(self, **kwargs: Any) -> str | bytes:
+        """Serializes config nodes only (RFC 6241 edit-config/edit-data).
+
+        pydantic-xml to_xml() has no field-exclusion support, so serialize
+        with exclude_unset and strip operational (`config false`) subtrees
+        afterwards using the is_config model metadata.
+        """
+        allowed = {
+            k: v
+            for k, v in kwargs.items()
+            if k in ("skip_empty", "exclude_none", "exclude_unset")
+        }
+        allowed.setdefault("exclude_unset", True)
+        xml = self.to_xml(**allowed)
+        root = etree.fromstring(xml if isinstance(xml, bytes) else xml.encode())
+        _strip_nonconfig_tree(root, type(self))
+        return etree.tostring(root)
+
+Decimal64 = Decimal
+Uint64 = int
+Int64 = int
+
+
+def _empty_to_str(v: Any) -> Any:
+    """YANG `empty` is an element with no content (RFC 7950 Sec 9.11)."""
+    if v is None:
+        return None
+    if v is True or v is False or v == "":
+        return ""
+    return str(v)
+
+
+# A Python bool serialized to "<flag>false</flag>", which a conformant server
+# rejects for an `empty` leaf; a str renders as "<flag></flag>", which XML
+# treats identically to "<flag/>".
+Empty = Annotated[str | None, BeforeValidator(_empty_to_str)]
+
+def check_pattern(pattern: str, v: str) -> str:
+    if isinstance(v, str) and not re.match(pattern, v): raise ValueError(f'Value does not match pattern: {pattern}')
+    return v

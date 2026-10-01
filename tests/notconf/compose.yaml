@@ -1,0 +1,24 @@
+# Local notconf smoke lab. Host ports are offset per service because the
+# NAS/dev host may already bind 80/830 (e.g. kind). Containers always listen
+# on NETCONF 830 and RESTCONF 80 internally (notconf default: admin/admin).
+# Usage: docker compose -f tests/notconf/compose.yaml up -d
+#        NOTCONF_RUN_INTEGRATION=1 uv run pytest tests/ -m integration
+services:
+  base-latest:
+    image: ghcr.io/notconf/notconf:latest
+    ports: ["11830:830", "18080:80"]
+  ietf-latest:
+    image: ghcr.io/notconf/notconf-ietf:latest
+    ports: ["11831:830", "18081:80"]
+  sros-22-2:
+    image: ghcr.io/notconf/notconf-sros:22.2
+    ports: ["11832:830", "18082:80"]
+  junos-23-4r1:
+    image: ghcr.io/notconf/notconf-junos:23.4R1
+    ports: ["11833:830", "18083:80"]
+  xr-2411:
+    image: ghcr.io/notconf/notconf-cisco-xr:2411
+    ports: ["11834:830", "18084:80"]
+  nx-10-4-4:
+    image: ghcr.io/notconf/notconf-cisco-nx:10.4-4
+    ports: ["11835:830", "18085:80"]

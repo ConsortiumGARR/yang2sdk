@@ -19,6 +19,21 @@ Decimal64 = Annotated[Decimal, PlainSerializer(format_at_least_two_places, retur
 Uint64 = Annotated[int, PlainSerializer(lambda v: str(v), return_type=str)]
 Int64 = Annotated[int, PlainSerializer(lambda v: str(v), return_type=str)]
 
+# RFC 7951 Sec 6.9: the JSON representation of YANG `empty` is a
+# single-element array containing null -- never a bare null, and never a
+# boolean. Modelling it as `bool` (which the IR used to do) put `true`/`false`
+# on the wire for a leaf that carries no value at all.
+def _empty_to_json(v: Any) -> Any:
+    if isinstance(v, list):
+        return v or [None]
+    return [None]
+
+Empty = Annotated[
+    list[None],
+    BeforeValidator(_empty_to_json),
+    PlainSerializer(lambda v: [None], return_type=list),
+]
+
 def check_pattern(pattern: str, v: str) -> str:
     if isinstance(v, str) and not re.match(pattern, v):
         raise ValueError(f'Value does not match pattern: {pattern}')
@@ -66,7 +81,15 @@ class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBase
     {% endfor %}
     {% if model.is_rpc_envelope %}
     {% if model.rpc_input_cls %}
-    input: {{ model.rpc_input_cls }}
+    # RFC 8040 Sec 3.6.1: operation input parameters are encoded in a JSON
+    # object named "input" *in the namespace of the module that defines the
+    # rpc/action*. The member name is the fixed "input" -- the rpc identifier
+    # appears only in the request URI (Sec 3.6), never in the body. RFC 7951
+    # Sec 4 requires the top-level member of a body to be module-qualified, so
+    # the alias is mandatory. Optional so an input-less invocation of an rpc
+    # whose input has no mandatory children is still expressible (Sec 3.6.1
+    # allows omitting the body in that case).
+    input: {{ model.rpc_input_cls }} | None = Field(default=None, alias="{{ module.name }}:input")
     {% endif %}
     {% if model.rpc_output_cls %}
     output: {{ model.rpc_output_cls }} | None = Field(default=None)
@@ -74,7 +97,7 @@ class {{ model.name }}({% if model.is_rpc_envelope %}BaseModel{% else %}YangBase
     {% if not model.rpc_input_cls and not model.rpc_output_cls %}
     pass
     {% endif %}
-    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True)
+    model_config = ConfigDict(extra='forbid', validate_assignment=True, validate_default=True, defer_build=True, populate_by_name=True)
     {% endif %}
     {% endif %}
 

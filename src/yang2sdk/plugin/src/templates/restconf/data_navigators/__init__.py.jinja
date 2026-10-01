@@ -9,6 +9,9 @@ if TYPE_CHECKING:
 
 class Data(Node):
     """Navigator for data nodes."""
+    {% if not data_props %}
+    pass
+    {% endif %}
     {% for prop in data_props %}
     
     @property
@@ -25,6 +28,9 @@ class Data(Node):
 
 class Operations(Node):
     """Navigator for RPC operations."""
+    {% if not rpc_props %}
+    pass
+    {% endif %}
     {% for prop in rpc_props %}
     
     @property

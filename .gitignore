@@ -10,12 +10,18 @@ wheels/
 # Virtual environments
 .venv
 .ruff_cache
+.pytest_cache/
 
 # env files
 *.env
 
+# containerlab runtime state (LAB ONLY) — lives next to the topology file
+tests/srl/clab-*/
+
 # Temporary files
 digest.txt
+# Simulator snapshot payloads (run-local; strict golden comparison is follow-up)
+tests/fixtures/golden/*.json
 temp/**/*
 # except the directory structure itself
 !temp/**/

@@ -4,7 +4,7 @@ Generate a Pydantic-based IDE-friendly SDK for your network devices directly fro
 
 ## Overview
 
-This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF SDK interface to your device.
+This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF or NETCONF SDK interface to your device.
 
 Then you can do stuff like this to update the description of a port:
 
@@ -16,28 +16,56 @@ client = DeviceNameClient(
     port=443,
     username="user",
     password="pass",
-    verify=True
+    verify=True,
 )
 
-    # IDE will suggest possibilities and autocomplete as soon as you type `client.`
-uri = client.data.ne.shelf(1).slot(3).card.port(1)
+# Top-level data properties are named "<yang_module>_<node>", so an
+# `ietf-interfaces:interfaces/interface` becomes `ietf_interfaces_interface`.
+# Nested navigators then follow the YANG structure, and a list is called with
+# its key(s) -- a composite key takes one argument per leaf, in `key` order.
+interfaces = client.data.ietf_interfaces_interface("ethernet-1/1")
 
-    # Retrieve current config
-port131 = uri.retrieve(content='config', depth=2)
+# Retrieve current config
+port1 = interfaces.retrieve(content="config", depth=2)
 
-    # The retrieved config (JSON) is loaded into the corresponding Pydantic model that you can modify.
-    # As soon as you type `port1.` the IDE will show you all possible fields.
-port131.service_label = "test137"
+# The retrieved config (JSON) is loaded into the corresponding Pydantic model
+# that you can modify. As soon as you type `port1.` the IDE shows every field.
+port1.service_label = "test137"
 
-port131.admin_status = "dowm" 
-    # Here the code fails immediately, raising the following error:
-    # pydantic_core._pydantic_core.ValidationError: 1 validation error for PortItem
-    # admin_status
-    #   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
+port1.admin_status = "dowm"
+# Here the code fails immediately, raising the following error:
+# pydantic_core._pydantic_core.ValidationError: 1 validation error for InterfaceItem
+# admin_status
+#   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
 
-    # Update the device config
-uri.update(port131)
+# Merge the change (RESTCONF PATCH / NETCONF nc:operation="merge")
+interfaces.update(port1)
+
+# `replace()` is a PUT / nc:operation="replace", i.e. the body IS the whole
+# resource (RFC 8040 Sec 4.5). It refuses a model with unset fields so a
+# hand-built or depth-truncated model cannot silently delete the rest.
+interfaces.replace(port1)
 ```
+
+### Calling RPCs and actions
+
+RPCs live under `client.operations`; the same `<module>_<rpc>` naming applies.
+
+```python
+# Top-level RPC: POST /restconf/operations/<module>:<rpc>
+# (NETCONF sends the equivalent <rpc><rpc-name> element)
+result = client.operations.ietf_system_system_reset(delay_seconds=5)
+
+# YANG 1.1 actions are invoked through the data tree, not under /operations
+# (RFC 8040 Sec 3.6)
+client.data.ietf_interfaces_interface("ethernet-1/1").reset(delay=3)
+```
+
+> [!WARNING]
+> **Do not request the whole `restconf/data/` resource, and do not read with
+> `depth="unbounded"`.** On a large production config that is the classic way
+> to hit 100% CPU and trigger a watchdog reboot or an OOM kill. Read a subtree
+> with an explicit `depth`; the generated navigators default to `depth=2`.
 
 ---
 
@@ -50,7 +78,7 @@ You need [`uv`](https://github.com/astral-sh/uv).
 ```bash
 git clone https://github.com/ConsortiumGARR/yang2sdk.git
 cd yang2sdk
-uv sync --locked
+uv sync --locked --extra lab   # lab extra: downloader/tester tooling
 cp .env.example .env
 ```
 
@@ -94,7 +122,7 @@ uv run tester
 
 ### Usage
 
-Copy-paste the entire directory `temp/restconf_clients/device_name` into your own project and start automating!
+Copy-paste the entire directory `temp/netconf_clients/device_name` into your own project and start automating!
 
 #### Scaling to Production (Multi-Vendor / Multi-Version)
 
@@ -154,4 +182,13 @@ It does not provide the code for network operations.
 
 ## Status
 
-This is a public prototype. For the moment only RESTCONF is implemented, in future this tool can be extended to output NETCONF clients too.
+This is a public prototype. Both RESTCONF and NETCONF clients generate, with an interchangeable navigator surface
+(`retrieve`/`update`/`replace`/`create`/`delete`, and RPC/action `__call__`) so developer code written against one
+only needs the imported client swapped for the other. The RPC and action wire encodings are pinned offline by
+`tests/test_matrix.py` against RFC 8040 Sec 3.6 and RFC 7950 Sec 7.15.2, and re-verified live against SR Linux
+(`get-schema`, `lock`/`commit`/`unlock`, create→validate→commit→delete) and the Groove G30 (`no-op`, `ping`)
+over both transports.
+
+Both generated SDKs are exercised against all 11 pre-built [`notconf`](https://github.com/notconf/notconf) simulator images (Cisco IOS XR `762/771/2411/2531`, IOS NX `10.4-4`, Junos `21.1R1/23.4R1`, Nokia SROS `21.10/22.2`, IETF, base) via the `pytest` suite in `tests/`: protocol checks, per-image SDK generation from the simulator's own YANG, Pydantic validation of live payloads, full CRUD round-trips (create → retrieve → update → replace → delete) through both clients, and idempotent same-data merges on every top-level config node. `uv run pytest tests/` runs the offline gate; `NOTCONF_RUN_INTEGRATION=1` runs the live matrix (see `tests/notconf/matrix.json`, `.github/workflows/`).
+
+Known limits (each pinned to a test): write shapes follow strict RFC 8040 + RFC 7951 — `create` POSTs to the parent with a single-element array body (RFC 8040 §4.4.1 + App. B.2.1, exactly one instance) and item `update`/`replace` send single-element array bodies (RFC 8040 §4.5 jukebox album example + RFC 7951 §5.4 list as name/array; PATCH list-instance follows the same JSON encoding, cf. rousette `tests/restconf-plain-patch.cpp` 204); key-mismatch and `requires N keys` errors enforce RFC 8040 §3.5.3/§4.5. Whole-list `replace` PUTs the list resource itself (`tests/test_matrix.py`). Simulator read quirks (`/data` GETs hide written list entries; collection GETs 400; `/ds/...?content=config` 500s; `/ds` item GETs are root-wrapped) are isolated to test read-backs via the RFC 8527 running-datastore container, not baked into the SDK. Details in `tests/test_sdk_generate.py`.

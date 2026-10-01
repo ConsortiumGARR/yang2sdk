@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 AST Canonicalizer
 
@@ -11,7 +10,7 @@ import argparse
 import ast
 import sys
 from pathlib import Path
-from typing import List, Union
+from typing import cast
 
 
 class ASTCanonicalizer(ast.NodeTransformer):
@@ -22,7 +21,7 @@ class ASTCanonicalizer(ast.NodeTransformer):
         self.ignore_docstrings = ignore_docstrings
         self.ignore_order = ignore_order
 
-    def _remove_docstring(self, body: List[ast.stmt]) -> List[ast.stmt]:
+    def _remove_docstring(self, body: list[ast.stmt]) -> list[ast.stmt]:
         """Removes the leading docstring from a body of statements if present."""
         if not body:
             return body
@@ -34,22 +33,20 @@ class ASTCanonicalizer(ast.NodeTransformer):
             if isinstance(val, ast.Constant) and isinstance(val.value, str):
                 return body[1:]
             # Fallback for older python AST specifications (ast.Str)
-            elif (
-                hasattr(ast, "Str")
-                and isinstance(val, ast.Str)
-                and isinstance(val.s, str)
-            ):  # type: ignore
+            elif isinstance(getattr(val, "s", None), str):
+                # ast.Str is deprecated since 3.8 and untyped; read the
+                # attribute instead of naming the class.
                 return body[1:]
 
         return body
 
-    def _canonicalize_body(self, body: List[ast.stmt]) -> List[ast.stmt]:
+    def _canonicalize_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
         """Sorts consecutive class and function definitions alphabetically by name."""
         if not self.ignore_order:
             return body
 
-        new_body: List[ast.stmt] = []
-        group: List[Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]] = []
+        new_body: list[ast.stmt] = []
+        group: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
 
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -67,21 +64,21 @@ class ASTCanonicalizer(ast.NodeTransformer):
         return new_body
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        node = self.generic_visit(node)
+        node = cast(ast.Module, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         node.body = self._canonicalize_body(node.body)
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        node = self.generic_visit(node)
+        node = cast(ast.ClassDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         node.body = self._canonicalize_body(node.body)
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        node = self.generic_visit(node)
+        node = cast(ast.FunctionDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         # Execution order inside functions is semantic and is preserved as-is
@@ -90,7 +87,7 @@ class ASTCanonicalizer(ast.NodeTransformer):
     def visit_AsyncFunctionDef(
         self, node: ast.AsyncFunctionDef
     ) -> ast.AsyncFunctionDef:
-        node = self.generic_visit(node)
+        node = cast(ast.AsyncFunctionDef, self.generic_visit(node))
         if self.ignore_docstrings:
             node.body = self._remove_docstring(node.body)
         return node
@@ -209,7 +206,7 @@ def main() -> None:
             color_text(f"Syntax error in {args.input_file}: {e}", "31"), file=sys.stderr
         )
         sys.exit(1)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- top-level CLI guard; specific SyntaxError handled above
         print(
             color_text(f"An error occurred during canonicalization: {e}", "31"),
             file=sys.stderr,
