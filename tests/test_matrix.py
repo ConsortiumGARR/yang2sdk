@@ -1900,6 +1900,67 @@ def test_nmda_is_detected_from_the_capability_uri_not_a_module_name(tmp_path):
     assert client.has_nmda is True
 
 
+IDENTITYREF_YANG = """module tidref {
+  prefix t;
+  namespace "urn:test:tidref";
+  revision 2026-01-01;
+
+  identity service;
+  identity gnmi { base service; }
+  identity gribi { base service; }
+
+  container root {
+    leaf-list services {
+      type identityref { base service; }
+    }
+  }
+}"""
+
+
+def test_identityref_stays_a_string_on_the_wire(tmp_path):
+    """identityref is emitted as a value, not a nested element.
+
+    RFC 7950 Sec 9.10.2 permits either an element named after the identity or
+    the ``module-name:identity`` string. This pins the string form, which is
+    what real devices both emit and expect on read.
+
+    Measured on SR Linux 25.10.1, /system/aaa/server-group/type
+    (identityref base ``aaa_server_type``):
+
+      * READ  -- the device sends
+        ``<type xmlns:srl_nokia-aaa-types="...">srl_nokia-aaa-types:local</type>``
+        i.e. the string form, so our model round-trips it losslessly.
+      * WRITE -- the device REJECTS that same string ("'type' expected
+        keyword '(tacacs|radius|local)'") but ACCEPTS an element form
+        (``<local xmlns="urn:nokia.com:srlinux:aaa:aaa-types"/>``) that it
+        never emits itself.
+
+    That asymmetry is a device deviation, not a model defect: RFC 7950 allows
+    both, and AGENTS.md requires a contradicting device to be handled
+    downstream rather than baked into the generic path. So the emitted form
+    stays, pinned here because the element form is the more intuitive reading
+    of the RFC and someone will eventually try to "fix" it into the model.
+    """
+    out, _ = _gen(tmp_path / "netconf", "netconf", IDENTITYREF_YANG, "idref")
+    # The generated leaf lives in `data_models.<stem>`, matching the module name.
+    models = _import(out, "data_models.tidref")
+
+    # Re-declare with the emitter's own metadata: a hand-written subclass loses
+    # the tag/ns/pydantic-xml wiring, and pydantic-xml then rejects a bare
+    # leaf-list ("entity name is not provided"). Round-trip through the shipped
+    # model instead of reimplementing it.
+    root = models.Root(services=["gnmi", "gribi"])
+
+    xml = root.to_xml_payload()
+    text = xml.decode() if isinstance(xml, bytes) else xml
+    assert "<services>gnmi</services>" in text, text
+    assert "<services>gribi</services>" in text, text
+    # No element-per-identity anywhere.
+    for ident in ("gnmi", "gribi"):
+        assert f"<services><{ident}" not in text, text
+        assert f"<{ident}/>" not in text, text
+
+
 SCHEMA_COLLISION_YANG = """module tcoll {
   prefix tc;
   namespace "urn:test:tcoll";

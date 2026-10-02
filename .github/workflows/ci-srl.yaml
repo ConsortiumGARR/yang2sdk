@@ -1,13 +1,20 @@
 name: ci-srl
-# SR Linux (Nokia) in containerlab — the repo's only NETCONF **NMDA** device.
+# SR Linux (Nokia) in containerlab — the repo's only real *commercial* NOS.
 #
-# Why this exists: every notconf image in tests/notconf/matrix.json is
-# documented as NOT advertising `urn:ietf:params:netconf:capability:nmda:1.0`,
-# and the Groove G30 is writable-running only. So the NMDA branch of the
-# generated NETCONF session manager (`has_nmda` -> <get-data>/<edit-data>
-# routing) had no live coverage at all: not in ci-pr.yaml, not in
-# ci-nightly.yaml, and not in the real-lab harness (which needs hardware).
-# SR Linux in a container closes that gap.
+# Why this exists: every notconf image is a simulator built from a handful of
+# IETF/vendor models, and the Groove G30 is a single lab device that is
+# writable-running only. None of them exercise a full vendor model tree
+# (hundreds of modules, deep augment closure, identityref leaves) through the
+# generated client. SR Linux does, in a container, for free.
+#
+# NOT an NMDA device, contrary to an earlier revision of this file. Measured
+# against SR Linux 25.10.1 from a raw <hello> (370 capabilities): its complete
+# base-capability set is candidate, confirmed-commit, rollback-on-error,
+# startup, url, validate, with-defaults, with-operational-defaults and
+# yang-library. It ships the ietf-netconf-nmda *module* but does NOT advertise
+# `:nmda:1.0` — precisely the false positive guarded in
+# tests/test_matrix.py::test_nmda_is_detected_from_the_capability_uri_not_a_module_name.
+# So this job must not be described as NMDA coverage.
 #
 # Cost: this repository is public, so standard GitHub-hosted runners are free.
 # Do NOT move this job to a `*-large` runner — larger runners are billed even
@@ -145,9 +152,13 @@ jobs:
         # A failure *here* is a device/timing or generator-regression signal that
         # should be read, not a merge blocker.
         #
-        # Expect one skip: test_hostname_mutate_restore skips because SR Linux
-        # rejects the RFC 6241 Sec 7.5 <lock><target> encoding (documented at
-        # tests/test_srl_netconf.py). See that file for the full list.
+        # Expect one skip: test_hostname_mutate_restore. A whole-<system> merge
+        # is not expressible against this device for two verified reasons —
+        # SR Linux rejects identityref writes in the RFC 7951 string form it
+        # itself emits, and a write below the root omits the ancestor path the
+        # device requires. Both are documented at tests/test_srl_netconf.py.
+        # This job's first run earned that skip: it is not a pre-existing
+        # condition.
         id: srl-tests
         continue-on-error: true
         env:

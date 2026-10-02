@@ -430,13 +430,22 @@ asserts gates a merge — treat it as lab verification you run yourself.
 
 #### SR Linux job (`ci-srl.yaml`)
 
-Every `notconf` image is documented as **not** advertising
-`urn:ietf:params:netconf:capability:nmda:1.0`, and the Groove G30 is
-writable-running only. SR Linux is therefore the only device in this repo with a
-real NMDA implementation, so `ci-srl.yaml` exists to cover the
-`has_nmda` → `<get-data>`/`<edit-data>` routing that had no live coverage.
+Every `notconf` image is a simulator built from a handful of IETF and vendor
+models, and the Groove G30 is a single lab device that is writable-running only.
+None of them exercise a **full commercial vendor model tree** — hundreds of
+modules, deep augment closure, identityref leaves — through the generated
+client. `ci-srl.yaml` brings up an SR Linux node to close that gap.
 
-It runs on every PR but **cannot fail a merge**, in three severity tiers:
+It is worth being precise about what this is **not**: SR Linux does *not*
+implement NMDA. Measured from a raw `<hello>` (370 capabilities), its base set is
+`candidate`, `confirmed-commit`, `rollback-on-error`, `startup`, `url`,
+`validate`, `with-defaults`, `with-operational-defaults`, `yang-library` — no
+`:nmda:1.0`. It ships the `ietf-netconf-nmda` *module* without advertising the
+capability, which is exactly the false positive that
+`test_nmda_is_detected_from_the_capability_uri_not_a_module_name` exists to
+catch. An earlier revision of this README claimed the opposite.
+
+It runs on every PR but **cannot fail a merge**, in two severity tiers:
 
 | Tier | Steps | On failure |
 | --- | --- | --- |
@@ -450,8 +459,13 @@ before pytest runs at all, so a broken lab is never reported as "tests passed".
 The job pulls the node's own models over `get-schema` and compiles from those,
 generating `temp/netconf_clients/srl` before pytest — the same
 `yang-downloader` → `yang2netconf` path a user runs by hand. Expect one skip:
-`test_hostname_mutate_restore` skips because SR Linux rejects the RFC 6241
-§7.5 `<lock><target>` encoding.
+`test_hostname_mutate_restore`, because a whole-`<system>` merge is not
+expressible against this device for two independently verified reasons — SR
+Linux rejects identityref writes in the RFC 7951 string form it itself emits,
+and a write below the root omits the ancestor path the device requires. Both
+are documented in `tests/test_srl_netconf.py`. An earlier revision blamed an
+RFC 6241 §7.5 `<lock>` rejection; that was a misattributed error and is now
+fixed — `test_candidate_lock_is_honoured` asserts the lock instead.
 
 Pinned image, containerlab version, and host requirements are recorded in
 [`tests/srl/PINNED.md`](tests/srl/PINNED.md).
@@ -505,7 +519,7 @@ Both generated SDKs are exercised against all 11 pre-built `notconf` simulator i
 
 The offline gate is `uv run pytest tests/test_matrix.py`, which runs on every PR with no device and no docker; it covers matrix coverage, the template secure defaults, navigator parity, and the RPC/action wire shapes. The live matrix is opt-in and splits across CI as described under [Development](#development): smoke shards per family on PRs, the full 11 images nightly. A test that covers zero nodes skips rather than passing vacuously — the image ships no config modules, the simulator cannot read the node, or the device has no `:validate`.
 
-Live runs against SR Linux (`get-schema`, `lock`/`commit`/`unlock`, create → validate → commit → delete) happen in `tests/test_srl_netconf.py` and `tests/test_lab_device_netconf.py`. The first runs on every PR via `ci-srl.yaml` — SR Linux is the only NMDA device here — but **non-blocking**: it reports signal, it does not gate a merge. `test_lab_device_netconf.py` still needs real hardware and is in no workflow, so nothing it asserts gates anything.
+Live runs against SR Linux (`get-schema`, lock contention, `is_config` write-body filtering, interface CRUD) happen in `tests/test_srl_netconf.py`, which runs on every PR via `ci-srl.yaml` — SR Linux is the only full commercial vendor model tree in the repo, though notably **not** an NMDA device. It is **non-blocking**: it reports signal, it does not gate a merge. `test_lab_device_netconf.py` still needs real hardware and is in no workflow, so nothing it asserts gates anything.
 
 For validating a generated client on real gear, `sdk-verify` (see [Validating a generated SDK against a lab device](#validating-a-generated-sdk-against-a-lab-device)) walks the client's whole navigator tree and records one row per endpoint. It is a lab harness, not a CI gate, and it is where a generator bug that only shows up against a real datastore gets caught.
 

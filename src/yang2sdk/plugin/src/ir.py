@@ -1007,7 +1007,26 @@ class IRBuilder:
         elif yt == "identityref":
             # Marked so the NETCONF emitter can bind the value's module prefix
             # in XML (RFC 7950 Sec 9.10.3); values are RFC 7951 Sec 6.8
-            # module-name-qualified strings.
+            # module-name-qualified strings, e.g. "srl_nokia-aaa-types:local".
+            #
+            # That form is correct and is deliberately kept. Measured against
+            # SR Linux 25.10.1 on /system/aaa/server-group/type
+            # (identityref base aaa_server_type):
+            #
+            #   * the device READS it back in exactly this form --
+            #     <type xmlns:srl_nokia-aaa-types="...">srl_nokia-aaa-types:local
+            #     </type> -- so round-tripping is lossless;
+            #   * on WRITE the device REJECTS that same string with
+            #     invalid-value / "'type' expected keyword '(tacacs|radius|
+            #     local)'", while accepting an element form it never emits.
+            #
+            # The device is asymmetric, not the model: AGENTS.md requires a
+            # contradicting device to be documented as a deviation and worked
+            # around downstream, never baked into the generic path. RFC 7950
+            # Sec 9.10.2 permits either encoding, so the emitted form stays.
+            #
+            # Do not "fix" this to the element form on RFC-reading alone; see
+            # tests/test_matrix.py::test_identityref_stays_a_string_on_the_wire.
             return "str", {"_identityref": True}
         elif yt == "string":
             # This map carries ints, strs, bools and the "_patterns" list.
