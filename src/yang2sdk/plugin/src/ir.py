@@ -177,6 +177,12 @@ class IRModule:
     namespace: str = ""
     revision: str = ""
     imports_nsmap: dict[str, str] = field(default_factory=dict)
+    #: module-name -> namespace, compile-time. An identityref value is written
+    #: as "module-name:identity" (RFC 7951 Sec 6.8), and that is an XML QName,
+    #: so the prefix must be declared in the document (RFC 7950 Sec 9.10.3).
+    #: Distinct from ``imports_nsmap``, which is keyed by the module's YANG
+    #: *prefix* and drives pydantic-xml's own tag/attribute prefixes.
+    module_namespaces: dict[str, str] = field(default_factory=dict)
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
     nav_nodes: list[IRNavNode] = field(default_factory=list)
@@ -206,14 +212,31 @@ class IRBuilder:
         if own_prefix and ns:
             imports_nsmap[own_prefix.arg] = ns.arg
 
+        # module-name -> namespace, keyed the way an identityref VALUE is
+        # written (RFC 7951 Sec 6.8 uses the module *name*, not the module's
+        # YANG prefix). `imp.arg` is the module name, so this map is available
+        # at compile time for free.
+        #
+        # Why it exists: an identityref value like "audit:local" is an XML
+        # QName, so RFC 7950 Sec 9.10.3 requires the prefix to be *declared*.
+        # Previously that declaration came only from session_manager's
+        # bind_module_prefixes(), which reads the device's <hello> module
+        # capabilities -- i.e. the write was namespace-complete only if the
+        # server happened to advertise the module. pyang already knows the
+        # answer, so bind it here and stop depending on the peer.
+        module_namespaces: dict[str, str] = {}
+        if ns:
+            module_namespaces[module.arg] = ns.arg
+
         for imp in module.search("import"):
             prefix_stmt = imp.search_one("prefix")
-            if prefix_stmt:
-                imported_module = self.ctx.get_module(imp.arg)
-                if imported_module:
-                    ns_stmt = imported_module.search_one("namespace")
-                    if ns_stmt:
+            imported_module = self.ctx.get_module(imp.arg)
+            if imported_module:
+                ns_stmt = imported_module.search_one("namespace")
+                if ns_stmt:
+                    if prefix_stmt:
                         imports_nsmap[prefix_stmt.arg] = ns_stmt.arg
+                    module_namespaces[imp.arg] = ns_stmt.arg
         # ----------------------------------------------------------------------
 
         rev = module.search_one("revision")
@@ -223,6 +246,7 @@ class IRBuilder:
             namespace=ns.arg if ns else "urn:unknown",
             revision=rev.arg if rev else "",
             imports_nsmap=imports_nsmap,  # Pass the map to the IR
+            module_namespaces=module_namespaces,
         )
 
     def _get_module_namespace(self, stmt) -> str:
@@ -1005,25 +1029,25 @@ class IRBuilder:
         elif yt in ["binary", "bits", "instance-identifier"]:
             return "str", {}
         elif yt == "identityref":
-            # Marked so the NETCONF emitter can bind the value's module prefix
-            # in XML (RFC 7950 Sec 9.10.3); values are RFC 7951 Sec 6.8
-            # module-name-qualified strings, e.g. "srl_nokia-aaa-types:local".
+            # RFC 7951 Sec 6.8 string form, e.g. "srl_nokia-aaa-types:local", or
+            # bare when the identity is defined in the leaf's own module. Both
+            # this and RFC 7950 Sec 9.10.2's element form are conformant.
             #
-            # That form is correct and is deliberately kept. Measured against
-            # SR Linux 25.10.1 on /system/aaa/server-group/type
-            # (identityref base aaa_server_type):
+            # The string form is what we emit, deliberately. Measured on SR
+            # Linux 25.10.1: the device reads the bare form back verbatim, and
+            # on write accepts it for a new entry while rejecting the prefixed
+            # and element forms. The device cannot round-trip its own retrieved
+            # subtree as a result -- its /system config merges back only after
+            # all identityref leaves are removed. That is a device deviation:
+            # AGENTS.md requires it be worked around downstream, never baked
+            # into this mapping.
             #
-            #   * the device READS it back in exactly this form --
-            #     <type xmlns:srl_nokia-aaa-types="...">srl_nokia-aaa-types:local
-            #     </type> -- so round-tripping is lossless;
-            #   * on WRITE the device REJECTS that same string with
-            #     invalid-value / "'type' expected keyword '(tacacs|radius|
-            #     local)'", while accepting an element form it never emits.
-            #
-            # The device is asymmetric, not the model: AGENTS.md requires a
-            # contradicting device to be documented as a deviation and worked
-            # around downstream, never baked into the generic path. RFC 7950
-            # Sec 9.10.2 permits either encoding, so the emitted form stays.
+            # The `is_identityref` marker is consumed on the READ path only, by
+            # the NETCONF model's normalize_identityrefs(), which rewrites an
+            # XML-prefixed value into the module-name form. Nothing writes the
+            # flag; the write path binds prefixes via session_manager's
+            # bind_module_prefixes(), keyed on the ':' in the value rather than
+            # on this flag.
             #
             # Do not "fix" this to the element form on RFC-reading alone; see
             # tests/test_matrix.py::test_identityref_stays_a_string_on_the_wire.

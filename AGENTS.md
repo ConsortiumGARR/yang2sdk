@@ -80,13 +80,15 @@ The generator must handle, at minimum:
 - Reuse: `grouping`/`uses`, cross-module `augment`, `typedef` chains.
 - RPCs: `rpc` + `action` (both map to `rpc` navigator nodes with `Input`/`Output` envelopes), `notification` (model-only).
 - Types: `int8/16/32`, `int64`/`uint64` (RFC 7951 string form), `uint8/16/32`, `decimal64`, `boolean`/`empty` → `bool`, `string` (+ `length`/`pattern`, XSD→Python regex map), `enumeration` (`Literal` if ≤3 values else `Enum` with MD5-fingerprint dedup), `union`, `leafref` (resolve to target type, fallback `str`), `bits`/`binary`/`instance-identifier` → `str`.
-- **`identityref` → `str` holding `module:identity`, deliberately, and do not "fix" it.** RFC 7950 §9.10.2 permits *either* an element named after the identity or the `module:identity` string; we emit the string and the NETCONF
-  emitter binds the module prefix in XML (RFC 7950 §9.10.3). Measured on SR Linux 25.10.1: the device
-  *reads* that form back verbatim (`<type xmlns:srl_nokia-aaa-types="…">srl_nokia-aaa-types:local</type>`),
-  so the round-trip is lossless — but its *write* path rejects the same string (`invalid-value`,
-  "expected keyword '(tacacs|radius|local)'") while accepting the element form it never emits. That
-  asymmetry is a **device deviation**: document it and work around it downstream, never bake it into
-  the generic path. Pinned by `test_matrix.py::test_identityref_stays_a_string_on_the_wire`.
+- **`identityref` → `str`, deliberately, and do not "fix" it.** RFC 7950 §9.10.2 permits *either* an element
+  named after the identity or a string; we emit RFC 7951 §6.8 `module:identity` (bare when the identity is
+  defined in the leaf's own module). Both are conformant. Measured on SR Linux 25.10.1: the device reads
+  the bare form back verbatim, and on write accepts it for a *new* entry while rejecting every prefixed
+  form and the element form. Consequence, verified by bisection: **the device cannot round-trip its own
+  retrieved subtree** — its `/system` config merges back only after all 19 identityref leaves are removed.
+  That is a device deviation: document it and work around it downstream, never bend the generic path.
+  Pinned by `test_matrix.py::test_identityref_stays_a_string_on_the_wire`, which asserts the *emitted
+  shape only* — it contacts no device and deliberately claims nothing about device behaviour.
 - Metadata: `mandatory`, `config true/false` (`--config-only` drops `config false`), `default` (type-aware), `when`/`must` (emitted into descriptions; `_is_mandatory` returns `False` when present — intentional until constraints become executable), `description` (escaped docstrings).
 - Naming: `YANG-name → PascalCase` classes / `snake_case` fields; iterative depth-based collision resolver + `_pydantic_class_name` propagation in `ir.py` are load-bearing. Do not "simplify" them without a regression corpus.
 - **Reserved Python names (three classes, all in `_to_field_name`):** keywords (`class`, `import`), `BaseModel`/`BaseXmlModel` attribute names (`schema`, `json`, `copy`, `dict` → `schema_`, `json_`, …), and the builtins the emitter itself writes bare inside a generated class body (`property`, `str`, `int`, `bool`, `list` → suffixed). The third class is what stops a node named `property` from generating an *unimportable* module (`TypeError: 'property' object is not callable`), which `_validate_generated` cannot catch because the output still parses. Keep that list to names the emitter actually emits: escaping all of `builtins` would rename ordinary YANG leaves `id`/`type`/`input`/`filter`/`range` for no benefit. `tests/test_matrix.py::test_builtin_named_nodes_do_not_break_the_generated_import` is the tripwire — widen the emitter's vocabulary without widening the set and it fails loudly.
@@ -96,7 +98,27 @@ When adding a YANG feature: extend `IRBuilder` first, then templates. Never emit
 
 ## RESTCONF ↔ NETCONF parity (normative)
 
-- Public navigator API must stay symmetrical: `retrieve(depth, content, fields/with-defaults)`, `update` (PATCH/merge), `replace` (PUT), `create` (POST), `delete`, RPC dispatch.
+- Public navigator API is `retrieve(depth, content, fields/with-defaults)`, `update` (PATCH/merge), `replace` (PUT), `create` (POST), `delete`, RPC dispatch — **symmetrical in intent, not in every method on every node class.** The surface is
+  *asymmetrical by protocol*, and that is deliberate. Measured on generated clients (not inferred):
+
+  | node | verbs present |
+  | --- | --- |
+  | NETCONF `ListNode` (plural) | `create` `replace` `retrieve` `update` — **no `delete`** |
+  | NETCONF `ItemNode` (keyed) | `delete` `replace` `retrieve` `update` — no `create` |
+  | RESTCONF `ListNode` (plural) | `delete` `replace` `retrieve` `update` — **no `create`** |
+
+  The divergence is protocol-shaped, not accidental:
+  - **No RESTCONF `create`.** RFC 8040 §4.5.1 makes PUT on a list entry
+    create-or-replace, so POST is redundant; `replace()` covers creation. NETCONF
+    needs the distinct `operation="create"` attribute of §7.2, so only it has
+    `create`.
+  - **No NETCONF list `delete`.** Deleting a NETCONF list entry requires its
+    keys, which only the keyed `ItemNode` has. RESTCONF `DELETE` on the list
+    *resource* is meaningful (§4.6), so only it has the plural `delete`.
+
+  Do not "fix" this by adding verbs whose semantics do not map across
+  transports. A HAL adapter must branch on capability, not assume the union.
+  If a verb is added, this table and `tests/test_matrix.py` move with it.
 - Transports intentionally differ:
   - RESTCONF: `requests` + TCP keepalive, `loopback_ip/management_ip` failover, `application/yang-data+json`.
   - NETCONF: `ncclient`, capability discovery by **exact base capability URI** (`:candidate` / `:writable-running` / `:nmda:1.0` — never a module name, or a device that ships `ietf-netconf-nmda` without implementing NMDA routes every read to an unsupported `<get-data>`), NMDA vs legacy RPC routing, `lock`/`unlock`, opt-in `auto_commit` plus `validate()` + `commit`/`discard_changes`, `RPCError → RuntimeError` (attribute access must never raise from the error path).

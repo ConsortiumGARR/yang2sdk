@@ -134,36 +134,37 @@ def _property_names(nav: object) -> list[str]:
     return [n for n, v in vars(type(nav)).items() if isinstance(v, property)]
 
 
-def _has_identityref(model: Any) -> bool:
-    """True if any leaf in the retrieved tree is marked ``is_identityref``.
+def _identityref_leaves(model: Any) -> list[tuple[str, str]]:
+    """Every populated ``is_identityref`` leaf in a retrieved tree.
 
-    Walks the pydantic models rather than the XML: the metadata is on the
-    field, and reusing it means this check cannot drift from what the emitter
-    actually produced.
+    Returns ``[(model_class, field_name), ...]``. Walks the pydantic models
+    rather than the XML so the check cannot drift from what the emitter
+    actually produced, and descends into list items (which are models, not
+    fields -- iterating fields alone silently misses every list-valued leaf).
     """
     from pydantic import BaseModel
 
-    def walk(node: Any, depth: int = 0) -> bool:
+    found: list[tuple[str, str]] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
         if depth > 12:
-            return False
+            return
         if isinstance(node, BaseModel):
             # `model_fields` is a class attribute on pydantic v2; iterate the
             # class, not the instance, and let the checkers see a mapping.
             fields: dict[str, Any] = dict(type(node).model_fields)
             for name, info in fields.items():
                 extra: dict[str, Any] = info.json_schema_extra or {}
-                if extra.get("is_identityref"):
-                    value = getattr(node, name, None)
-                    if value not in (None, [], ""):
-                        return True
-                if walk(getattr(node, name, None), depth + 1):
-                    return True
-            return False
-        if isinstance(node, (list, tuple)):  # list items are BaseModel, not fields
-            return any(walk(item, depth + 1) for item in node)
-        return False
+                value = getattr(node, name, None)
+                if extra.get("is_identityref") and value not in (None, [], ""):
+                    found.append((type(node).__name__, name))
+                walk(value, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, depth + 1)
 
-    return walk(model)
+    walk(model)
+    return found
 
 
 def _system_nav(client):
@@ -298,33 +299,51 @@ def test_hostname_mutate_restore(srl_client):
     ):
         pytest.skip("no <system>/<name>/<host-name> leaf in the generated model")
 
-    # A whole-<system> merge is not expressible against this device, for two
-    # independently verified reasons. Neither is the model's fault, so this
-    # test asserts the boundary instead of silently passing.
+    # Assert the shape of the blocker rather than just skipping on it: the
+    # subtree must actually carry identityref leaves, otherwise the skip above
+    # would be hiding a different regression.
+    leaves = _identityref_leaves(model)
+    assert leaves, (
+        "no identityref leaves in the retrieved /system subtree; the "
+        "whole-<system> merge should now be expressible -- re-investigate "
+        "instead of leaving this skip in place"
+    )
+
+    # SR Linux cannot round-trip its OWN retrieved subtree.
     #
-    # (1) identityref read/write asymmetry. The subtree carries identityref
-    #     leaves (system/aaa/server-group/type, system/grpc-server/services).
-    #     The device READS them back in the RFC 7951 "module:identity" string
-    #     form this client emits, but REJECTS that same string on WRITE
-    #     ("'services' expected keyword '(ndk|gnmi|gnoi|...)'"), while accepting
-    #     an element form it never emits. RFC 7950 Sec 9.10.2 allows either.
-    if _has_identityref(model):
-        pytest.skip(
-            "SR Linux rejects identityref writes in the RFC 7951 string form it "
-            "itself emits (documented read/write asymmetry); whole-<system> merge "
-            "is not expressible without a downstream adapter"
-        )
-    # (2) an ItemNode below the root writes its subtree root as <config>, and
-    #     <config><name> is not a valid top-level node: the device answers
-    #     unknown-namespace / unknown-element unless the ancestor path is
-    #     present. Reproduced by hand -- a payload carrying the full
-    #     /system/name/host-name path is accepted.
+    # Verified by bisection on the live node: take the device's own
+    # /system config subtree exactly as retrieved, merge it back verbatim, and
+    # strip leaves until it is accepted.
     #
-    # The hostname write itself is therefore proven at the CRUD tier, which
-    # addresses a subtree by key and keeps the ancestor path.
+    #   attempt 0 (verbatim)              -> rejected
+    #   attempt 1 (drop <type>       x1)   -> rejected
+    #   attempt 2 (drop <services>   x18)  -> ACCEPTED
+    #
+    # Every removed leaf is an identityref, and the accepted payload is the
+    # device's own configuration minus 19 identityref leaves. So the blocker is
+    # identityref handling on the write path -- NOT the ancestor path, and NOT
+    # this client. An earlier revision of this file blamed the ancestor path
+    # and carried a second skip branch for it; that was wrong on both counts.
+    # `wrap_in_parent_hierarchy` iterates path_tuples[:-1], excluding only the
+    # node itself (which is already the element), so the full ancestor path is
+    # always emitted -- verified from generated code and from captured payloads.
+    #
+    # On the encoding itself: this client emits RFC 7951 Sec 6.8
+    # "module:identity" strings (bare for a same-module identity), which is what
+    # the device reads back. On write it accepts the bare form for a NEW entry
+    # and rejects every prefixed form and the RFC 7950 Sec 9.10.2 element form.
+    # Both RFC encodings are permitted, so the emitted form is not the defect;
+    # the device's write path is inconsistent with its own read path for
+    # identityrefs inside an existing entry.
+    #
+    # The hostname write is proven at the CRUD tier instead, which addresses a
+    # subtree by key and contains no identityref leaves.
     pytest.skip(
-        "ItemNode writes below the root omit the ancestor path, which SR Linux "
-        "rejects; see test_throwaway_interface_crud for the proven write path"
+        "SR Linux cannot round-trip its own /system config subtree: merging it "
+        "verbatim is rejected, and it is accepted only after removing all 19 "
+        "identityref leaves. Whole-<system> merge is therefore not expressible "
+        "against this device; see test_throwaway_interface_crud for a proven "
+        "write path"
     )
 
 

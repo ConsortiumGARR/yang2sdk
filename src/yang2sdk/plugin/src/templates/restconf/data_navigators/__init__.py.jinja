@@ -8,10 +8,36 @@ if TYPE_CHECKING:
 {% endfor %}
 
 class Data(Node):
-    """Navigator for data nodes."""
-    {% if not data_props %}
-    pass
-    {% endif %}
+    """Navigator for data nodes.
+
+    This is the datastore ROOT. It deliberately refuses every write: RFC 8040
+    Sec 4 defines no DELETE/PATCH/PUT on /restconf/data, and a root write is
+    the one operation AGENTS.md forbids outright ("Never request root
+    restconf/data/"). Inheriting Node's write methods made `client.data.delete()`
+    emit a bare `DELETE /restconf/data` -- a whole-datastore request reachable
+    with no flag, no warning and no second acknowledgement.
+
+    The NETCONF root has no write methods at all, so this also removes a
+    protocol asymmetry. Delete a *top-level node* instead
+    (`client.data.system.delete()`), which is a bounded, meaningful request.
+    """
+
+    def _refuse_root_write(self, operation: str) -> None:
+        raise RuntimeError(
+            f"{operation} on the datastore root is not a RESTCONF operation "
+            f"(RFC 8040 Sec 4) and is forbidden here: it addresses the entire "
+            f"datastore. Delete or replace a top-level node instead, e.g. "
+            f"client.data.<node>.delete()."
+        )
+
+    def delete(self) -> None:
+        self._refuse_root_write("DELETE")
+
+    def _update(self, **kwargs: Any) -> None:
+        self._refuse_root_write("PATCH")
+
+    def _replace(self, **kwargs: Any) -> None:
+        self._refuse_root_write("PUT")
     {% for prop in data_props %}
     
     @property

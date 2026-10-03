@@ -1131,6 +1131,99 @@ def test_restconf_rpc_request_body_is_module_qualified(tmp_path):
     assert body == {"trpc:input": {"delay-seconds": 5, "force": True}}, body
 
 
+def test_restconf_datastore_root_refuses_every_write(tmp_path):
+    """The datastore root must not be writable, on either transport.
+
+    AGENTS.md makes "never request root `restconf/data/`" non-negotiable and
+    requires opt-in for destructive defaults. `Data` inherited `Node`'s write
+    methods, so `client.data.delete()` emitted a bare `DELETE /restconf/data` --
+    a whole-datastore request reachable with no flag, no warning, and no second
+    acknowledgement. Nothing in the suite touched it.
+
+    RFC 8040 Sec 4 defines no DELETE/PATCH/PUT on /restconf/data, so this is
+    refused rather than merely discouraged. Deleting a *top-level node* is a
+    bounded, meaningful request and stays available -- asserted below, because a
+    guard that also broke legitimate deletes would be no better than the bug.
+    """
+    out, _ = _gen(tmp_path / "restconf", "restconf", ROOT_WRITE_YANG, "trdw")
+    nav = _import(out, "data_navigators")
+    recorder = _Recorder()
+    data = nav.Data(recorder, "/data", "")
+    assert data._path == "/data"
+
+    for method in ("delete", "_update", "_replace"):
+        with pytest.raises(RuntimeError, match="datastore root"):
+            if method == "delete":
+                data.delete()
+            else:
+                getattr(data, method)(**{"x": 1})
+    assert not recorder.calls, (
+        f"a refused write still issued a request: {recorder.calls}"
+    )
+
+    # A top-level node is still deletable -- the guard is on the root only.
+    prop = next(n for n, v in vars(type(data)).items() if isinstance(v, property))
+    node = getattr(data, prop)
+    node.delete()
+    assert recorder.calls[-1][0] == "DELETE", recorder.calls
+    assert recorder.calls[-1][1].startswith("/data/"), recorder.calls
+
+
+def test_netconf_datastore_root_exposes_no_write_methods(tmp_path):
+    """The NETCONF root navigator has no write methods at all.
+
+    The parity counterpart to the RESTCONF guard above, asserted directly so the
+    two transports cannot drift apart again: RESTCONF's root used to inherit
+    write methods that NETCONF's root never had.
+    """
+    out, _ = _gen(tmp_path / "netconf", "netconf", NETCONF_SAFETY_YANG, "trn")
+    nav = _import(out, "data_navigators")
+    data = nav.Data(None, [])
+    for method in ("delete", "_update", "_replace", "update", "replace", "create"):
+        assert not hasattr(data, method), (
+            f"the NETCONF datastore root must not expose {method}()"
+        )
+
+
+def test_identityref_prefix_binds_without_a_server(tmp_path):
+    """An identityref's module prefix is declared from the COMPILE-TIME map.
+
+    An identityref value is `module-name:identity` (RFC 7951 Sec 6.8), which is
+    an XML QName, so RFC 7950 Sec 9.10.3 requires the prefix to be declared.
+    The model cannot do it -- it only knows YANG prefixes, not module names --
+    so the client binds it before sending.
+
+    This used to depend entirely on the peer advertising the module in its
+    `<hello>` (RFC 6241 Sec 8.3): a device that omitted the capability, or a
+    value for a module it never advertised, put an undeclared prefix on the
+    wire. pyang already knows the answer, so the IR now carries
+    `module_namespaces` and the generated client seeds from it.
+
+    Asserted without any device: the compile-time map alone must produce a
+    declared prefix, with `module_namespaces` supplied as the template does.
+    """
+    out, _ = _gen(tmp_path, "netconf", IDENTITYREF_YANG, "tidref")
+    models = _import(out, "data_models.tidref")
+    sm = _import(out, "session_manager")
+
+    model = models.Root(services=["tidref:gnmi"])
+    xml = model.to_xml_payload()
+    text = xml.decode() if isinstance(xml, bytes) else xml
+    # The module name is NOT a declared prefix on its own: the model declares the
+    # module's YANG prefix ('t'), which is a different string.
+    assert "xmlns:tidref=" not in text, text
+    assert "tidref:gnmi" in text, text
+
+    # Exactly what the emitted client does, with no <hello> involved.
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    compile_time = {"tidref": "urn:test:tidref"}
+    element = etree.fromstring(text.encode())
+    sm.bind_module_prefixes(element, compile_time)
+    bound = etree.tostring(element).decode()
+    assert 'xmlns:tidref="urn:test:tidref"' in bound, bound
+
+
 def test_restconf_rpc_without_input_sends_no_body(tmp_path):
     """RFC 8040 Sec 3.6.1: with no `input` section the request MUST NOT
     include a message-body. The generated code always POSTed a JSON object.
@@ -1900,6 +1993,16 @@ def test_nmda_is_detected_from_the_capability_uri_not_a_module_name(tmp_path):
     assert client.has_nmda is True
 
 
+ROOT_WRITE_YANG = """module trdw {
+  prefix t;
+  namespace "urn:test:trdw";
+  revision 2026-01-01;
+  container system {
+    leaf hostname { type string; }
+  }
+}"""
+
+
 IDENTITYREF_YANG = """module tidref {
   prefix t;
   namespace "urn:test:tidref";
@@ -1918,28 +2021,27 @@ IDENTITYREF_YANG = """module tidref {
 
 
 def test_identityref_stays_a_string_on_the_wire(tmp_path):
-    """identityref is emitted as a value, not a nested element.
+    """identityref is emitted as a *value*, not a nested element.
 
-    RFC 7950 Sec 9.10.2 permits either an element named after the identity or
-    the ``module-name:identity`` string. This pins the string form, which is
-    what real devices both emit and expect on read.
+    Scope, deliberately narrow: this asserts the **emitted shape only**. It
+    contacts no device and therefore makes no claim about how any device
+    behaves. An earlier revision of this docstring carried several SR Linux
+    claims; an independent audit found every one of them wrong or
+    unverifiable from here, and they were removed. Device behaviour is
+    documented in AGENTS.md and proven in tests/test_srl_netconf.py, which
+    runs against a live node.
 
-    Measured on SR Linux 25.10.1, /system/aaa/server-group/type
-    (identityref base ``aaa_server_type``):
+    Why the shape is pinned at all: RFC 7950 Sec 9.10.2 permits either an
+    element named after the identity or a string, and the element form is the
+    more intuitive reading. Emitting the element would silently change the
+    wire format for every identityref leaf on every device, so the string form
+    is pinned deliberately.
 
-      * READ  -- the device sends
-        ``<type xmlns:srl_nokia-aaa-types="...">srl_nokia-aaa-types:local</type>``
-        i.e. the string form, so our model round-trips it losslessly.
-      * WRITE -- the device REJECTS that same string ("'type' expected
-        keyword '(tacacs|radius|local)'") but ACCEPTS an element form
-        (``<local xmlns="urn:nokia.com:srlinux:aaa:aaa-types"/>``) that it
-        never emits itself.
-
-    That asymmetry is a device deviation, not a model defect: RFC 7950 allows
-    both, and AGENTS.md requires a contradicting device to be handled
-    downstream rather than baked into the generic path. So the emitted form
-    stays, pinned here because the element form is the more intuitive reading
-    of the RFC and someone will eventually try to "fix" it into the model.
+    Both this test and `ir.py` agree the value is the RFC 7951 Sec 6.8
+    ``module:identity`` string, bare when the identity is defined in the leaf's
+    own module. The values below are bare for exactly that reason -- an earlier
+    revision used bare identities while the docstring talked about module-name
+    qualification, which made the test lock in the non-canonical form.
     """
     out, _ = _gen(tmp_path / "netconf", "netconf", IDENTITYREF_YANG, "idref")
     # The generated leaf lives in `data_models.<stem>`, matching the module name.
