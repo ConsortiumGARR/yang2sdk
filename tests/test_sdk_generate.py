@@ -273,6 +273,50 @@ def test_netconf_sdk_retrieve_and_validate(generated_sdks):
     assert model is None or isinstance(model, BaseModel), f"{name} bad type"
 
 
+def test_netconf_all_rpc_schemas_serialize(generated_sdks):
+    """Every generated NETCONF RPC/action serializes its Input offline.
+
+    Same harness as sdk-verify's rpc tier (same Verifier, same walk_rpcs),
+    promoted to a gate so every matrix image proves it: build each RPC Input
+    model and round-trip it through model_dump(by_alias=) and
+    to_xml_payload() WITHOUT dispatching. An envelope bug then fails here on
+    all N RPCs instead of on a device at call time.
+
+    Never dispatches: an empty Input is not a meaningful call for most RPCs,
+    and some compiled RPCs are destructive by design (system-restart,
+    system-shutdown, factory-reset). Dispatch stays an explicit
+    --rpc-allowlist decision in sdk-verify (LAB ONLY), reported as skip-with-
+    reason when the device refuses -- never as a pass.
+    """
+    from yang2sdk.cli.sdk_verify import Report, Verifier
+
+    mod = generated_sdks
+    ep = mod["ep"]
+    client = mod["netc"].NetconfClient(
+        management_ip="127.0.0.1",
+        port=ep["netconf_port"],
+        username=CREDS[0],
+        password=CREDS[1],
+        # Same documented opt-out as the other generated-client tests: the
+        # simulator mints a random host key per container.
+        verify=False,
+    )
+    try:
+        report = Report(device=mod["slug"], protocol="netconf")
+        Verifier(client, report).walk_rpcs(client.operations)
+    finally:
+        try:
+            client._manager.close_session()
+        except Exception:  # noqa: BLE001, S110 - teardown best effort
+            pass
+    fails = [r for r in report.results if r.status == "fail"]
+    assert not fails, "RPC schema serialization failed: " + "; ".join(
+        f"{r.node}: {r.detail}" for r in fails
+    )
+    if not report.results:
+        pytest.skip("no RPCs/actions in the compiled roots for this image")
+
+
 def _find_list_navigator(client, attr):
     nav = getattr(client.data, attr, None)
     if nav is None:

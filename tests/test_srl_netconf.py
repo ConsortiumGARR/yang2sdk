@@ -134,6 +134,84 @@ def _property_names(nav: object) -> list[str]:
     return [n for n, v in vars(type(nav)).items() if isinstance(v, property)]
 
 
+def test_all_navigator_references_resolve():
+    """Every lazy navigator/model import in the generated tree must resolve.
+
+    Navigator properties import their classes lazily (`from .<mod> import X`
+    inside the getter), so a wrong emitted name is not an import-time error:
+    the client imports fine and blows up the first time a caller touches that
+    navigator. Measured on SR Linux: three navigators referenced
+    `..._1ItemNode` classes while the emitter defined `..._1Node`
+    (collision-renamed lists), so sdk-verify's read tier failed them live.
+
+    Navigator properties are pure path builders -- resolving the reference
+    issues no request -- but walking them needs no device at all when done
+    statically: parse every generated navigator/model module and assert each
+    same-package import names a class that module defines. Needs only the
+    generated client on disk, so this runs wherever the CI job compiled it.
+    """
+    import ast
+
+    client_dir = CLIENTS / "srl"
+    if not (client_dir / "__init__.py").is_file():
+        pytest.skip("generated SRL client not found in temp/netconf_clients")
+    nav_dir = client_dir / "data_navigators"
+    models_dir = client_dir / "data_models"
+
+    def defined_classes(path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        return {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+
+    cache: dict[str, set[str]] = {}
+
+    def classes_in(directory: Path, stem: str) -> set[str]:
+        key = f"{directory.name}.{stem}"
+        if key not in cache:
+            cache[key] = defined_classes(directory / f"{stem}.py")
+        return cache[key]
+
+    problems: list[str] = []
+    for module_file in sorted(nav_dir.glob("*.py")):
+        if module_file.name.startswith("_"):
+            continue
+        tree = ast.parse(module_file.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                continue
+            target = node.module or ""
+            if target == module_file.stem:
+                available = classes_in(nav_dir, target)
+                where = f"data_navigators/{module_file.name}"
+            else:
+                continue
+            for alias in node.names:
+                if alias.name not in available:
+                    problems.append(f"{where}: {target}.{alias.name} is not defined")
+    for module_file in sorted(models_dir.glob("*.py")):
+        if module_file.name.startswith("_"):
+            continue
+        tree = ast.parse(module_file.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                continue
+            # `from .x import Y` inside data_models is always a self-module
+            # lazy import; anything else is a real dependency, not a reference
+            # this gate owns.
+            if (node.module or "") != module_file.stem:
+                continue
+            available = classes_in(models_dir, module_file.stem)
+            for alias in node.names:
+                if alias.name not in available:
+                    problems.append(
+                        f"data_models/{module_file.name}: "
+                        f"{module_file.stem}.{alias.name} is not defined"
+                    )
+    assert not problems, (
+        f"{len(problems)} generated references do not resolve: "
+        + "; ".join(problems[:10])
+    )
+
+
 def _identityref_leaves(model: Any) -> list[tuple[str, str]]:
     """Every populated ``is_identityref`` leaf in a retrieved tree.
 

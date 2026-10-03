@@ -2063,6 +2063,143 @@ def test_identityref_stays_a_string_on_the_wire(tmp_path):
         assert f"<{ident}/>" not in text, text
 
 
+AUGMENT_BASE_YANG = """module taug {
+  prefix a;
+  namespace "urn:test:taug";
+  revision 2026-01-01;
+  container system {
+    container name {
+      leaf host-name { type string; }
+    }
+  }
+}"""
+
+AUGMENT_EXT_YANG = """module taugext {
+  prefix e;
+  namespace "urn:test:taugext";
+  import taug { prefix a; }
+  revision 2026-01-01;
+  augment "/a:system" {
+    container aaa {
+      leaf mode { type string; }
+    }
+  }
+}"""
+
+
+def _gen_roots(tmp_path, fmt, files, roots, device):
+    """Compile several YANG roots; same subprocess contract as _gen."""
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (tmp_path / f"{name}.yang").write_text(text)
+    out = tmp_path / f"{device}_{fmt}"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        f"run_compiler({fmt!r}, sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code]
+        + [str(tmp_path / f"{r}.yang") for r in roots]
+        + [
+            "--device",
+            device,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return out, compileall.compile_dir(str(out), quiet=1)
+
+
+def test_augment_model_root_uses_augmenting_namespace(tmp_path):
+    """An augment-defined model's root tag is in the AUGMENTING namespace.
+
+    RFC 7950 Sec 7.17: augment adds nodes to the target, but every node keeps
+    the namespace of the module that defines it. The device therefore returns
+    ``{augment-ns}aaa`` for a node augmented into ``{base-ns}system`` -- and a
+    model whose root defaults to the base namespace rejects that correct
+    answer with "root element not found".
+
+    Measured on SR Linux 25.10.1: 77 nodes under /system/{aaa,tls,ssh-server,
+    ...} and /qos failed exactly this way, and all of them validate once the
+    root carries the augmenting namespace. Same-module models are unchanged
+    (ns ""), asserted below so the fix cannot drift the common case.
+    """
+    out, _ = _gen_roots(
+        tmp_path / "netconf",
+        "netconf",
+        {"taug": AUGMENT_BASE_YANG, "taugext": AUGMENT_EXT_YANG},
+        ["taug", "taugext"],
+        "augm",
+    )
+    models = _import(out, "data_models.taug")
+    namespaces = {"taug": "urn:test:taug", "taugext": "urn:test:taugext"}
+
+    system = models.System(name=models.Name(host_name="h"))
+    system_xml = system.to_xml_payload()
+    system_text = system_xml.decode() if isinstance(system_xml, bytes) else system_xml
+    assert 'xmlns="urn:test:taug"' in system_text, system_text
+
+    aaa = models.Aaa(mode="strict")
+    aaa_xml = aaa.to_xml_payload()
+    aaa_text = aaa_xml.decode() if isinstance(aaa_xml, bytes) else aaa_xml
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    # The tag may be default- or prefix-qualified; what matters is the URI.
+    assert etree.QName(etree.fromstring(aaa_text.encode())).namespace == (
+        "urn:test:taugext"
+    ), aaa_text
+
+    # The device-shaped payload -- augment namespace on the wire -- parses.
+    parsed = models.Aaa.from_xml(
+        b'<aaa xmlns="urn:test:taugext"><mode>strict</mode></aaa>',
+        module_namespaces=namespaces,
+    )
+    assert parsed.mode == "strict"
+
+
+def test_sdk_verify_parse_errors_are_never_device_skips():
+    """sdk-verify must not file a model failure under "device rejected".
+
+    A ParsingError/ValidationError proves the device ANSWERED: bytes came back
+    and the generated model could not read them. Reporting that as a skip hid
+    77 augment-namespace parse failures on SR Linux behind "device rejected
+    the operation". Genuine device answers (RPC error replies, HTTP
+    400/404/405) stay skips.
+    """
+    from yang2sdk.cli.sdk_verify import _is_device_fault
+    from pydantic_xml import ParsingError
+
+    assert (
+        _is_device_fault(
+            ParsingError(
+                "root element not found "
+                "(actual: {urn:test:taugext}aaa, expected: {urn:test:taug}aaa)"
+            )
+        )
+        is False
+    )
+    assert (
+        _is_device_fault(
+            RuntimeError("NETCONF RPC Error: invalid-value Type: application")
+        )
+        is True
+    )
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = 404
+    assert _is_device_fault(requests.HTTPError(response=resp)) is True
+
+
 SCHEMA_COLLISION_YANG = """module tcoll {
   prefix tc;
   namespace "urn:test:tcoll";

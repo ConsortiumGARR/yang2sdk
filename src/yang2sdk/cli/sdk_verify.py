@@ -512,6 +512,15 @@ _DEVICE_FAULT_STATUSES = {400, 404, 405}
 
 
 def _is_device_fault(exc: BaseException) -> bool:
+    # A parse/validation failure proves the device ANSWERED: bytes came back
+    # and our model could not read them. That is a fidelity finding about the
+    # generated client (wrong namespace, alias, type), never a device fault --
+    # and it must never be reported as a skip. This used to match the
+    # "not found" substring inside pydantic-xml's own "root element not
+    # found (actual: ..., expected: ...)" text, which hid 77 augment-namespace
+    # parse failures on SR Linux as device skips.
+    if type(exc).__name__ in ("ParsingError", "ValidationError"):
+        return False
     status = _status_of(exc)
     if status is not None:
         return status in _DEVICE_FAULT_STATUSES

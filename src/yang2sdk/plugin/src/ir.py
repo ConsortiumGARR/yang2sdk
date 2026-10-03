@@ -103,6 +103,14 @@ class IRModel:
     is_rpc_envelope: bool = False
     rpc_input_cls: str | None = None
     rpc_output_cls: str | None = None
+    #: pydantic-xml prefix alias for the model's OWN namespace ("" = the file's
+    #: module default). Differs from "" only for augment-defined nodes: per
+    #: RFC 7950 Sec 7.17 an augment's nodes belong to the AUGMENTING module's
+    #: namespace, so a model built from one must declare that root tag --
+    #: emitting the parent module's default makes every read of the node fail
+    #: with "root element not found" even though the device answered correctly
+    #: (measured on SR Linux: /system/aaa, tls, ssh-server, ... -- 77 nodes).
+    ns_alias: str = ""
 
 
 @dataclass
@@ -250,7 +258,9 @@ class IRBuilder:
         )
 
     def _get_module_namespace(self, stmt) -> str:
-        mod = getattr(stmt, "i_module", self.module)
+        # `i_module` is None on the module statement itself and on some
+        # pyang-expanded copies -- fall back to the builder's own module.
+        mod = getattr(stmt, "i_module", None) or self.module
         ns = mod.search_one("namespace")
         return ns.arg if ns else "urn:unknown"
 
@@ -535,6 +545,22 @@ class IRBuilder:
                         nav_cls = type_hint
 
                     child_module = self._get_module_name(child)
+                    # `item_cls` is the navigator item class the property passes
+                    # to the ListNode. The template defines that class as
+                    # `{{ node.item_class_name }}Node` (navigators.py.jinja),
+                    # where `item_class_name` is the list's own resolved
+                    # `cls_name` -- never re-suffixed. So the reference must be
+                    # `child_cls + "Node"` verbatim. Appending "Item" when the
+                    # name does not already end with it (the pre-2026 rule)
+                    # breaks every collision-renamed list: `_register_model`
+                    # suffixes `InterfaceItem` -> `InterfaceItem_1` (measured
+                    # on SR Linux srl_nokia-acl / srl_nokia-system), the
+                    # definition is `InterfaceItem_1Node`, but the property
+                    # imported `InterfaceItem_1ItemNode` -- ImportError the
+                    # first time any caller touches that navigator.
+                    # sdk-verify's read tier walks every navigator, so it
+                    # caught this live; tests/test_srl_netconf.py pins the
+                    # walk as a gate.
                     prop = IRNavProperty(
                         name=self._to_field_name(child.arg),
                         type_hint=type_hint,
@@ -542,7 +568,7 @@ class IRBuilder:
                         path_name=child.arg,
                         yang_name=child.arg,
                         ns=self._get_module_namespace(child),
-                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
+                        item_cls=f"{child_cls}Node"
                         if child.keyword == "list"
                         else None,
                         module_yang_name=child_module,
@@ -574,6 +600,11 @@ class IRBuilder:
             description=self._docstring(stmt.search_one("description").arg)
             if stmt.search_one("description")
             else f"{stmt.keyword.capitalize()}: {stmt.arg}",
+            # The model's root tag lives in its DEFINING module's namespace.
+            # For same-module nodes _ns_alias returns "" (output unchanged);
+            # for augments it returns the augmenting module's prefix, backfilled
+            # into imports_nsmap before render so the declaration exists.
+            ns_alias=self._ns_alias(self._get_module_namespace(stmt)),
         )
 
         if hasattr(stmt, "i_children"):

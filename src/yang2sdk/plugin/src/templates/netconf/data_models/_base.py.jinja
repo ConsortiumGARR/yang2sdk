@@ -254,6 +254,23 @@ class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
         xml = self.to_xml(**allowed)
         root = etree.fromstring(xml if isinstance(xml, bytes) else xml.encode())
         _strip_nonconfig_tree(root, type(self))
+        # Prune namespace declarations nothing in the tree uses. Every model
+        # re-declares the whole module nsmap on its root, so a bare payload
+        # carries dozens of redundant xmlns -- harmless alone, but when the
+        # navigator grafts this element under ancestor wrappers, a redundant
+        # default declaration shadows the inherited one and the root tag
+        # serializes into the WRONG namespace (measured: {boot}autoboot sent
+        # as {system}autoboot, device answers unknown-namespace). Prefixes
+        # that appear only in text (identityref/module-name values, RFC 7951
+        # Sec 6.8) are invisible to the cleanup pass, so keep every declared
+        # prefix the text still references -- dropping one puts an undeclared
+        # prefix on the wire (RFC 7950 Sec 9.10.3).
+        declared = set(root.nsmap or {})
+        text_used = set()
+        for el in root.iter():
+            if isinstance(el.tag, str) and el.text and ":" in el.text:
+                text_used.add(el.text.split(":", 1)[0])
+        etree.cleanup_namespaces(root, keep_ns_prefixes=sorted(text_used & declared))
         return etree.tostring(root)
 
 Decimal64 = Decimal
