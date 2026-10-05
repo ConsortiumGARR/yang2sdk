@@ -103,6 +103,14 @@ class IRModel:
     is_rpc_envelope: bool = False
     rpc_input_cls: str | None = None
     rpc_output_cls: str | None = None
+    #: pydantic-xml prefix alias for the model's OWN namespace ("" = the file's
+    #: module default). Differs from "" only for augment-defined nodes: per
+    #: RFC 7950 Sec 7.17 an augment's nodes belong to the AUGMENTING module's
+    #: namespace, so a model built from one must declare that root tag --
+    #: emitting the parent module's default makes every read of the node fail
+    #: with "root element not found" even though the device answered correctly
+    #: (measured on SR Linux: /system/aaa, tls, ssh-server, ... -- 77 nodes).
+    ns_alias: str = ""
 
 
 @dataclass
@@ -177,6 +185,12 @@ class IRModule:
     namespace: str = ""
     revision: str = ""
     imports_nsmap: dict[str, str] = field(default_factory=dict)
+    #: module-name -> namespace, compile-time. An identityref value is written
+    #: as "module-name:identity" (RFC 7951 Sec 6.8), and that is an XML QName,
+    #: so the prefix must be declared in the document (RFC 7950 Sec 9.10.3).
+    #: Distinct from ``imports_nsmap``, which is keyed by the module's YANG
+    #: *prefix* and drives pydantic-xml's own tag/attribute prefixes.
+    module_namespaces: dict[str, str] = field(default_factory=dict)
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
     nav_nodes: list[IRNavNode] = field(default_factory=list)
@@ -206,14 +220,31 @@ class IRBuilder:
         if own_prefix and ns:
             imports_nsmap[own_prefix.arg] = ns.arg
 
+        # module-name -> namespace, keyed the way an identityref VALUE is
+        # written (RFC 7951 Sec 6.8 uses the module *name*, not the module's
+        # YANG prefix). `imp.arg` is the module name, so this map is available
+        # at compile time for free.
+        #
+        # Why it exists: an identityref value like "audit:local" is an XML
+        # QName, so RFC 7950 Sec 9.10.3 requires the prefix to be *declared*.
+        # Previously that declaration came only from session_manager's
+        # bind_module_prefixes(), which reads the device's <hello> module
+        # capabilities -- i.e. the write was namespace-complete only if the
+        # server happened to advertise the module. pyang already knows the
+        # answer, so bind it here and stop depending on the peer.
+        module_namespaces: dict[str, str] = {}
+        if ns:
+            module_namespaces[module.arg] = ns.arg
+
         for imp in module.search("import"):
             prefix_stmt = imp.search_one("prefix")
-            if prefix_stmt:
-                imported_module = self.ctx.get_module(imp.arg)
-                if imported_module:
-                    ns_stmt = imported_module.search_one("namespace")
-                    if ns_stmt:
+            imported_module = self.ctx.get_module(imp.arg)
+            if imported_module:
+                ns_stmt = imported_module.search_one("namespace")
+                if ns_stmt:
+                    if prefix_stmt:
                         imports_nsmap[prefix_stmt.arg] = ns_stmt.arg
+                    module_namespaces[imp.arg] = ns_stmt.arg
         # ----------------------------------------------------------------------
 
         rev = module.search_one("revision")
@@ -223,10 +254,13 @@ class IRBuilder:
             namespace=ns.arg if ns else "urn:unknown",
             revision=rev.arg if rev else "",
             imports_nsmap=imports_nsmap,  # Pass the map to the IR
+            module_namespaces=module_namespaces,
         )
 
     def _get_module_namespace(self, stmt) -> str:
-        mod = getattr(stmt, "i_module", self.module)
+        # `i_module` is None on the module statement itself and on some
+        # pyang-expanded copies -- fall back to the builder's own module.
+        mod = getattr(stmt, "i_module", None) or self.module
         ns = mod.search_one("namespace")
         return ns.arg if ns else "urn:unknown"
 
@@ -511,6 +545,22 @@ class IRBuilder:
                         nav_cls = type_hint
 
                     child_module = self._get_module_name(child)
+                    # `item_cls` is the navigator item class the property passes
+                    # to the ListNode. The template defines that class as
+                    # `{{ node.item_class_name }}Node` (navigators.py.jinja),
+                    # where `item_class_name` is the list's own resolved
+                    # `cls_name` -- never re-suffixed. So the reference must be
+                    # `child_cls + "Node"` verbatim. Appending "Item" when the
+                    # name does not already end with it (the pre-2026 rule)
+                    # breaks every collision-renamed list: `_register_model`
+                    # suffixes `InterfaceItem` -> `InterfaceItem_1` (measured
+                    # on SR Linux srl_nokia-acl / srl_nokia-system), the
+                    # definition is `InterfaceItem_1Node`, but the property
+                    # imported `InterfaceItem_1ItemNode` -- ImportError the
+                    # first time any caller touches that navigator.
+                    # sdk-verify's read tier walks every navigator, so it
+                    # caught this live; tests/test_srl_netconf.py pins the
+                    # walk as a gate.
                     prop = IRNavProperty(
                         name=self._to_field_name(child.arg),
                         type_hint=type_hint,
@@ -518,7 +568,7 @@ class IRBuilder:
                         path_name=child.arg,
                         yang_name=child.arg,
                         ns=self._get_module_namespace(child),
-                        item_cls=f"{child_cls if child_cls.endswith('Item') else f'{child_cls}Item'}Node"
+                        item_cls=f"{child_cls}Node"
                         if child.keyword == "list"
                         else None,
                         module_yang_name=child_module,
@@ -550,6 +600,11 @@ class IRBuilder:
             description=self._docstring(stmt.search_one("description").arg)
             if stmt.search_one("description")
             else f"{stmt.keyword.capitalize()}: {stmt.arg}",
+            # The model's root tag lives in its DEFINING module's namespace.
+            # For same-module nodes _ns_alias returns "" (output unchanged);
+            # for augments it returns the augmenting module's prefix, backfilled
+            # into imports_nsmap before render so the declaration exists.
+            ns_alias=self._ns_alias(self._get_module_namespace(stmt)),
         )
 
         if hasattr(stmt, "i_children"):
@@ -1005,9 +1060,28 @@ class IRBuilder:
         elif yt in ["binary", "bits", "instance-identifier"]:
             return "str", {}
         elif yt == "identityref":
-            # Marked so the NETCONF emitter can bind the value's module prefix
-            # in XML (RFC 7950 Sec 9.10.3); values are RFC 7951 Sec 6.8
-            # module-name-qualified strings.
+            # RFC 7951 Sec 6.8 string form, e.g. "srl_nokia-aaa-types:local", or
+            # bare when the identity is defined in the leaf's own module. Both
+            # this and RFC 7950 Sec 9.10.2's element form are conformant.
+            #
+            # The string form is what we emit, deliberately. Measured on SR
+            # Linux 25.10.1: the device reads the bare form back verbatim, and
+            # on write accepts it for a new entry while rejecting the prefixed
+            # and element forms. The device cannot round-trip its own retrieved
+            # subtree as a result -- its /system config merges back only after
+            # all identityref leaves are removed. That is a device deviation:
+            # AGENTS.md requires it be worked around downstream, never baked
+            # into this mapping.
+            #
+            # The `is_identityref` marker is consumed on the READ path only, by
+            # the NETCONF model's normalize_identityrefs(), which rewrites an
+            # XML-prefixed value into the module-name form. Nothing writes the
+            # flag; the write path binds prefixes via session_manager's
+            # bind_module_prefixes(), keyed on the ':' in the value rather than
+            # on this flag.
+            #
+            # Do not "fix" this to the element form on RFC-reading alone; see
+            # tests/test_matrix.py::test_identityref_stays_a_string_on_the_wire.
             return "str", {"_identityref": True}
         elif yt == "string":
             # This map carries ints, strs, bools and the "_patterns" list.

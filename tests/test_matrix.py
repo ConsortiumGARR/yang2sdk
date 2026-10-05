@@ -1131,6 +1131,99 @@ def test_restconf_rpc_request_body_is_module_qualified(tmp_path):
     assert body == {"trpc:input": {"delay-seconds": 5, "force": True}}, body
 
 
+def test_restconf_datastore_root_refuses_every_write(tmp_path):
+    """The datastore root must not be writable, on either transport.
+
+    AGENTS.md makes "never request root `restconf/data/`" non-negotiable and
+    requires opt-in for destructive defaults. `Data` inherited `Node`'s write
+    methods, so `client.data.delete()` emitted a bare `DELETE /restconf/data` --
+    a whole-datastore request reachable with no flag, no warning, and no second
+    acknowledgement. Nothing in the suite touched it.
+
+    RFC 8040 Sec 4 defines no DELETE/PATCH/PUT on /restconf/data, so this is
+    refused rather than merely discouraged. Deleting a *top-level node* is a
+    bounded, meaningful request and stays available -- asserted below, because a
+    guard that also broke legitimate deletes would be no better than the bug.
+    """
+    out, _ = _gen(tmp_path / "restconf", "restconf", ROOT_WRITE_YANG, "trdw")
+    nav = _import(out, "data_navigators")
+    recorder = _Recorder()
+    data = nav.Data(recorder, "/data", "")
+    assert data._path == "/data"
+
+    for method in ("delete", "_update", "_replace"):
+        with pytest.raises(RuntimeError, match="datastore root"):
+            if method == "delete":
+                data.delete()
+            else:
+                getattr(data, method)(x=1)
+    assert not recorder.calls, (
+        f"a refused write still issued a request: {recorder.calls}"
+    )
+
+    # A top-level node is still deletable -- the guard is on the root only.
+    prop = next(n for n, v in vars(type(data)).items() if isinstance(v, property))
+    node = getattr(data, prop)
+    node.delete()
+    assert recorder.calls[-1][0] == "DELETE", recorder.calls
+    assert recorder.calls[-1][1].startswith("/data/"), recorder.calls
+
+
+def test_netconf_datastore_root_exposes_no_write_methods(tmp_path):
+    """The NETCONF root navigator has no write methods at all.
+
+    The parity counterpart to the RESTCONF guard above, asserted directly so the
+    two transports cannot drift apart again: RESTCONF's root used to inherit
+    write methods that NETCONF's root never had.
+    """
+    out, _ = _gen(tmp_path / "netconf", "netconf", NETCONF_SAFETY_YANG, "trn")
+    nav = _import(out, "data_navigators")
+    data = nav.Data(None, [])
+    for method in ("delete", "_update", "_replace", "update", "replace", "create"):
+        assert not hasattr(data, method), (
+            f"the NETCONF datastore root must not expose {method}()"
+        )
+
+
+def test_identityref_prefix_binds_without_a_server(tmp_path):
+    """An identityref's module prefix is declared from the COMPILE-TIME map.
+
+    An identityref value is `module-name:identity` (RFC 7951 Sec 6.8), which is
+    an XML QName, so RFC 7950 Sec 9.10.3 requires the prefix to be declared.
+    The model cannot do it -- it only knows YANG prefixes, not module names --
+    so the client binds it before sending.
+
+    This used to depend entirely on the peer advertising the module in its
+    `<hello>` (RFC 6241 Sec 8.3): a device that omitted the capability, or a
+    value for a module it never advertised, put an undeclared prefix on the
+    wire. pyang already knows the answer, so the IR now carries
+    `module_namespaces` and the generated client seeds from it.
+
+    Asserted without any device: the compile-time map alone must produce a
+    declared prefix, with `module_namespaces` supplied as the template does.
+    """
+    out, _ = _gen(tmp_path, "netconf", IDENTITYREF_YANG, "tidref")
+    models = _import(out, "data_models.tidref")
+    sm = _import(out, "session_manager")
+
+    model = models.Root(services=["tidref:gnmi"])
+    xml = model.to_xml_payload()
+    text = xml.decode() if isinstance(xml, bytes) else xml
+    # The module name is NOT a declared prefix on its own: the model declares the
+    # module's YANG prefix ('t'), which is a different string.
+    assert "xmlns:tidref=" not in text, text
+    assert "tidref:gnmi" in text, text
+
+    # Exactly what the emitted client does, with no <hello> involved.
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    compile_time = {"tidref": "urn:test:tidref"}
+    element = etree.fromstring(text.encode())
+    sm.bind_module_prefixes(element, compile_time)
+    bound = etree.tostring(element).decode()
+    assert 'xmlns:tidref="urn:test:tidref"' in bound, bound
+
+
 def test_restconf_rpc_without_input_sends_no_body(tmp_path):
     """RFC 8040 Sec 3.6.1: with no `input` section the request MUST NOT
     include a message-body. The generated code always POSTed a JSON object.
@@ -1898,6 +1991,214 @@ def test_nmda_is_detected_from_the_capability_uri_not_a_module_name(tmp_path):
             management_ip="127.0.0.1", username="u", password="p", verify=False
         )
     assert client.has_nmda is True
+
+
+ROOT_WRITE_YANG = """module trdw {
+  prefix t;
+  namespace "urn:test:trdw";
+  revision 2026-01-01;
+  container system {
+    leaf hostname { type string; }
+  }
+}"""
+
+
+IDENTITYREF_YANG = """module tidref {
+  prefix t;
+  namespace "urn:test:tidref";
+  revision 2026-01-01;
+
+  identity service;
+  identity gnmi { base service; }
+  identity gribi { base service; }
+
+  container root {
+    leaf-list services {
+      type identityref { base service; }
+    }
+  }
+}"""
+
+
+def test_identityref_stays_a_string_on_the_wire(tmp_path):
+    """identityref is emitted as a *value*, not a nested element.
+
+    Scope, deliberately narrow: this asserts the **emitted shape only**. It
+    contacts no device and therefore makes no claim about how any device
+    behaves. An earlier revision of this docstring carried several SR Linux
+    claims; an independent audit found every one of them wrong or
+    unverifiable from here, and they were removed. Device behaviour is
+    documented in AGENTS.md and proven in tests/test_srl_netconf.py, which
+    runs against a live node.
+
+    Why the shape is pinned at all: RFC 7950 Sec 9.10.2 permits either an
+    element named after the identity or a string, and the element form is the
+    more intuitive reading. Emitting the element would silently change the
+    wire format for every identityref leaf on every device, so the string form
+    is pinned deliberately.
+
+    Both this test and `ir.py` agree the value is the RFC 7951 Sec 6.8
+    ``module:identity`` string, bare when the identity is defined in the leaf's
+    own module. The values below are bare for exactly that reason -- an earlier
+    revision used bare identities while the docstring talked about module-name
+    qualification, which made the test lock in the non-canonical form.
+    """
+    out, _ = _gen(tmp_path / "netconf", "netconf", IDENTITYREF_YANG, "idref")
+    # The generated leaf lives in `data_models.<stem>`, matching the module name.
+    models = _import(out, "data_models.tidref")
+
+    # Re-declare with the emitter's own metadata: a hand-written subclass loses
+    # the tag/ns/pydantic-xml wiring, and pydantic-xml then rejects a bare
+    # leaf-list ("entity name is not provided"). Round-trip through the shipped
+    # model instead of reimplementing it.
+    root = models.Root(services=["gnmi", "gribi"])
+
+    xml = root.to_xml_payload()
+    text = xml.decode() if isinstance(xml, bytes) else xml
+    assert "<services>gnmi</services>" in text, text
+    assert "<services>gribi</services>" in text, text
+    # No element-per-identity anywhere.
+    for ident in ("gnmi", "gribi"):
+        assert f"<services><{ident}" not in text, text
+        assert f"<{ident}/>" not in text, text
+
+
+AUGMENT_BASE_YANG = """module taug {
+  prefix a;
+  namespace "urn:test:taug";
+  revision 2026-01-01;
+  container system {
+    container name {
+      leaf host-name { type string; }
+    }
+  }
+}"""
+
+AUGMENT_EXT_YANG = """module taugext {
+  prefix e;
+  namespace "urn:test:taugext";
+  import taug { prefix a; }
+  revision 2026-01-01;
+  augment "/a:system" {
+    container aaa {
+      leaf mode { type string; }
+    }
+  }
+}"""
+
+
+def _gen_roots(tmp_path, fmt, files, roots, device):
+    """Compile several YANG roots; same subprocess contract as _gen."""
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (tmp_path / f"{name}.yang").write_text(text)
+    out = tmp_path / f"{device}_{fmt}"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        f"run_compiler({fmt!r}, sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code]
+        + [str(tmp_path / f"{r}.yang") for r in roots]
+        + [
+            "--device",
+            device,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return out, compileall.compile_dir(str(out), quiet=1)
+
+
+def test_augment_model_root_uses_augmenting_namespace(tmp_path):
+    """An augment-defined model's root tag is in the AUGMENTING namespace.
+
+    RFC 7950 Sec 7.17: augment adds nodes to the target, but every node keeps
+    the namespace of the module that defines it. The device therefore returns
+    ``{augment-ns}aaa`` for a node augmented into ``{base-ns}system`` -- and a
+    model whose root defaults to the base namespace rejects that correct
+    answer with "root element not found".
+
+    Measured on SR Linux 25.10.1: 77 nodes under /system/{aaa,tls,ssh-server,
+    ...} and /qos failed exactly this way, and all of them validate once the
+    root carries the augmenting namespace. Same-module models are unchanged
+    (ns ""), asserted below so the fix cannot drift the common case.
+    """
+    out, _ = _gen_roots(
+        tmp_path / "netconf",
+        "netconf",
+        {"taug": AUGMENT_BASE_YANG, "taugext": AUGMENT_EXT_YANG},
+        ["taug", "taugext"],
+        "augm",
+    )
+    models = _import(out, "data_models.taug")
+    namespaces = {"taug": "urn:test:taug", "taugext": "urn:test:taugext"}
+
+    system = models.System(name=models.Name(host_name="h"))
+    system_xml = system.to_xml_payload()
+    system_text = system_xml.decode() if isinstance(system_xml, bytes) else system_xml
+    assert 'xmlns="urn:test:taug"' in system_text, system_text
+
+    aaa = models.Aaa(mode="strict")
+    aaa_xml = aaa.to_xml_payload()
+    aaa_text = aaa_xml.decode() if isinstance(aaa_xml, bytes) else aaa_xml
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    # The tag may be default- or prefix-qualified; what matters is the URI.
+    assert etree.QName(etree.fromstring(aaa_text.encode())).namespace == (
+        "urn:test:taugext"
+    ), aaa_text
+
+    # The device-shaped payload -- augment namespace on the wire -- parses.
+    parsed = models.Aaa.from_xml(
+        b'<aaa xmlns="urn:test:taugext"><mode>strict</mode></aaa>',
+        module_namespaces=namespaces,
+    )
+    assert parsed.mode == "strict"
+
+
+def test_sdk_verify_parse_errors_are_never_device_skips():
+    """sdk-verify must not file a model failure under "device rejected".
+
+    A ParsingError/ValidationError proves the device ANSWERED: bytes came back
+    and the generated model could not read them. Reporting that as a skip hid
+    77 augment-namespace parse failures on SR Linux behind "device rejected
+    the operation". Genuine device answers (RPC error replies, HTTP
+    400/404/405) stay skips.
+    """
+    from pydantic_xml import ParsingError
+
+    from yang2sdk.cli.sdk_verify import _is_device_fault
+
+    assert (
+        _is_device_fault(
+            ParsingError(
+                "root element not found "
+                "(actual: {urn:test:taugext}aaa, expected: {urn:test:taug}aaa)"
+            )
+        )
+        is False
+    )
+    assert (
+        _is_device_fault(
+            RuntimeError("NETCONF RPC Error: invalid-value Type: application")
+        )
+        is True
+    )
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = 404
+    assert _is_device_fault(requests.HTTPError(response=resp)) is True
 
 
 SCHEMA_COLLISION_YANG = """module tcoll {

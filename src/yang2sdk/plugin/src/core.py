@@ -367,10 +367,23 @@ class Yang2Netconf(plugin.PyangPlugin):
             "data_navigators/_base.py": "netconf/data_navigators/_base.py.jinja",
         }
 
+        # Every module pyang loaded, name -> namespace, merged across the roots.
+        # An identityref value is "module-name:identity" (RFC 7951 Sec 6.8), an
+        # XML QName whose prefix MUST be declared (RFC 7950 Sec 9.10.3). Handing
+        # this to the client makes the write path namespace-complete without
+        # depending on the peer advertising the module in its <hello>.
+        merged_module_namespaces: dict[str, str] = {}
+        for ir_module in ir_modules:
+            merged_module_namespaces.update(getattr(ir_module, "module_namespaces", {}))
+
         for target_path, template_path in static_files.items():
             full_path = os.path.join(output_dir, target_path)
             with open(full_path, "w") as f:
-                f.write(env.get_template(template_path).render())
+                f.write(
+                    env.get_template(template_path).render(
+                        module_namespaces_literal=repr(merged_module_namespaces),
+                    )
+                )
 
         _write_package_files(env, output_dir, ctx, modules, ir_modules, "netconf")
         fd.write(f"Generated NETCONF SDK in: {output_dir}\n")

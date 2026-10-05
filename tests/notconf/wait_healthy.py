@@ -2,7 +2,15 @@
 
 Polls NETCONF :830 hello (RFC 6241 Sec 8) and RESTCONF host-meta
 (RFC 8040 Sec 3.1) until both answer or the timeout expires.
+
 Usage: python wait_healthy.py <netconf_host> <netconf_port> <restconf_base_url>
+
+``username``/``password`` default to the published notconf image credentials
+(admin/admin). The SR Linux containerlab lab uses a different published
+default, so the NETCONF probe takes them as arguments rather than assuming one
+credential set for every backend. Values are passed straight to ncclient and
+never logged -- both are public container defaults, but the probe must not
+become a place that prints them.
 """
 
 import socket
@@ -12,8 +20,18 @@ import urllib.request
 
 from ncclient import manager
 
+#: Published notconf image defaults (tests/notconf/matrix.json "credentials").
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = "admin"
 
-def wait_netconf(host: str, port: int, timeout: int = 300) -> None:
+
+def wait_netconf(
+    host: str,
+    port: int,
+    timeout: int = 300,
+    username: str = DEFAULT_USERNAME,
+    password: str = DEFAULT_PASSWORD,
+) -> None:
     deadline = time.time() + timeout
     last: Exception | None = None
     while time.time() < deadline:
@@ -21,8 +39,8 @@ def wait_netconf(host: str, port: int, timeout: int = 300) -> None:
             m = manager.connect(
                 host=host,
                 port=port,
-                username="admin",
-                password="admin",
+                username=username,
+                password=password,
                 hostkey_verify=False,
                 timeout=15,
             )

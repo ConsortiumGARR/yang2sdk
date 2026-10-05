@@ -512,6 +512,15 @@ _DEVICE_FAULT_STATUSES = {400, 404, 405}
 
 
 def _is_device_fault(exc: BaseException) -> bool:
+    # A parse/validation failure proves the device ANSWERED: bytes came back
+    # and our model could not read them. That is a fidelity finding about the
+    # generated client (wrong namespace, alias, type), never a device fault --
+    # and it must never be reported as a skip. This used to match the
+    # "not found" substring inside pydantic-xml's own "root element not
+    # found (actual: ..., expected: ...)" text, which hid 77 augment-namespace
+    # parse failures on SR Linux as device skips.
+    if type(exc).__name__ in ("ParsingError", "ValidationError"):
+        return False
     status = _status_of(exc)
     if status is not None:
         return status in _DEVICE_FAULT_STATUSES
@@ -785,18 +794,20 @@ def _run_crud(verifier: Verifier, protocol: str, args: argparse.Namespace) -> No
                 "<discard-changes>); pass --allow-restconf-writes",
             )
             return
-    elif not getattr(verifier.client, "has_candidate", False):
-        if not args.allow_running_writes:
-            verifier._record(
-                "-",
-                "crud",
-                "gate",
-                SKIP,
-                "device has no :candidate, so edits land in running and only a "
-                "re-written snapshot can undo them; back up the config and pass "
-                "--allow-running-writes",
-            )
-            return
+    elif (
+        not getattr(verifier.client, "has_candidate", False)
+        and not args.allow_running_writes
+    ):
+        verifier._record(
+            "-",
+            "crud",
+            "gate",
+            SKIP,
+            "device has no :candidate, so edits land in running and only a "
+            "re-written snapshot can undo them; back up the config and pass "
+            "--allow-running-writes",
+        )
+        return
 
     snapshot_path = _write_snapshot(verifier, protocol, args)
     if snapshot_path is None:
@@ -893,7 +904,7 @@ def _crud_targets(verifier: Verifier) -> list[tuple[str, Any]]:
         for _name, prop in verifier._nav_props(node):
             try:
                 child = prop.fget(node)
-            except Exception:  # noqa: BLE001 - already reported by the read tier
+            except Exception:  # noqa: BLE001, S112 - already reported by the read tier
                 continue
             kind = verifier._classify(child)
             if kind == "rpc":

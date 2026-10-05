@@ -78,10 +78,20 @@ The generator must handle, at minimum:
 
 - Data nodes: `container`, `list` (+ `key`, composite keys, `min/max-elements`), `leaf`, `leaf-list`, `choice/case` (flattened, optional, runtime mutual-exclusion check via `choice_mapping`), `anydata`/`anyxml` → `str`.
 - Reuse: `grouping`/`uses`, cross-module `augment`, `typedef` chains.
+- **Augment nodes keep the AUGMENTING module's namespace on the wire.** RFC 7950 §7.17 adds the nodes to the target tree but each node still belongs to its defining module, so the NETCONF model root for an augmented node must declare the augmenting namespace -- not the file's module default. Emitting the default makes every read of the node fail with "root element not found" even though the device answered correctly (measured on SR Linux 25.10.1: 77 nodes under `/system/{aaa,tls,ssh-server,…}` and `/qos`, all validating once fixed; same defect also fixed G30 `openroadm-augment` port models). Pinned offline by `test_augment_model_root_uses_augmenting_namespace`; the vendor-tree sweep is `sdk-verify --tiers read,rpc` (a parse/validation failure there is a FAIL, never a device skip).
 - RPCs: `rpc` + `action` (both map to `rpc` navigator nodes with `Input`/`Output` envelopes), `notification` (model-only).
-- Types: `int8/16/32`, `int64`/`uint64` (RFC 7951 string form), `uint8/16/32`, `decimal64`, `boolean`/`empty` → `bool`, `string` (+ `length`/`pattern`, XSD→Python regex map), `enumeration` (`Literal` if ≤3 values else `Enum` with MD5-fingerprint dedup), `union`, `leafref` (resolve to target type, fallback `str`), `identityref`/`bits`/`binary`/`instance-identifier` → `str`.
+- Types: `int8/16/32`, `int64`/`uint64` (RFC 7951 string form), `uint8/16/32`, `decimal64`, `boolean`/`empty` → `bool`, `string` (+ `length`/`pattern`, XSD→Python regex map), `enumeration` (`Literal` if ≤3 values else `Enum` with MD5-fingerprint dedup), `union`, `leafref` (resolve to target type, fallback `str`), `bits`/`binary`/`instance-identifier` → `str`.
+- **`identityref` → `str`, deliberately, and do not "fix" it.** RFC 7950 §9.10.2 permits *either* an element
+  named after the identity or a string; we emit RFC 7951 §6.8 `module:identity` (bare when the identity is
+  defined in the leaf's own module). Both are conformant. Measured on SR Linux 25.10.1: the device reads
+  the bare form back verbatim, and on write accepts it for a *new* entry while rejecting every prefixed
+  form and the element form. Consequence, verified by bisection: **the device cannot round-trip its own
+  retrieved subtree** — its `/system` config merges back only after all 19 identityref leaves are removed.
+  That is a device deviation: document it and work around it downstream, never bend the generic path.
+  Pinned by `test_matrix.py::test_identityref_stays_a_string_on_the_wire`, which asserts the *emitted
+  shape only* — it contacts no device and deliberately claims nothing about device behaviour.
 - Metadata: `mandatory`, `config true/false` (`--config-only` drops `config false`), `default` (type-aware), `when`/`must` (emitted into descriptions; `_is_mandatory` returns `False` when present — intentional until constraints become executable), `description` (escaped docstrings).
-- Naming: `YANG-name → PascalCase` classes / `snake_case` fields; iterative depth-based collision resolver + `_pydantic_class_name` propagation in `ir.py` are load-bearing. Do not "simplify" them without a regression corpus.
+- Naming: `YANG-name → PascalCase` classes / `snake_case` fields; iterative depth-based collision resolver + `_pydantic_class_name` propagation in `ir.py` are load-bearing. Do not "simplify" them without a regression corpus. Corollary: a list navigator's item class is referenced as `<resolved>Node` verbatim on BOTH the definition and the reference side -- re-appending `Item` on the reference side breaks every collision-renamed (`…_1`) list with an ImportError on first touch (measured on SR Linux ACL/system navigators). Pinned by `test_all_navigator_references_resolve`.
 - **Reserved Python names (three classes, all in `_to_field_name`):** keywords (`class`, `import`), `BaseModel`/`BaseXmlModel` attribute names (`schema`, `json`, `copy`, `dict` → `schema_`, `json_`, …), and the builtins the emitter itself writes bare inside a generated class body (`property`, `str`, `int`, `bool`, `list` → suffixed). The third class is what stops a node named `property` from generating an *unimportable* module (`TypeError: 'property' object is not callable`), which `_validate_generated` cannot catch because the output still parses. Keep that list to names the emitter actually emits: escaping all of `builtins` would rename ordinary YANG leaves `id`/`type`/`input`/`filter`/`range` for no benefit. `tests/test_matrix.py::test_builtin_named_nodes_do_not_break_the_generated_import` is the tripwire — widen the emitter's vocabulary without widening the set and it fails loudly.
 - `is_key` and the key-aware `ListNode.__call__` must be emitted on **both** transports. They were NETCONF-only, which left RESTCONF callers unable to address a list instance at all (the YANG `key` statement is not in an instance payload, so it cannot be recovered from device data). This is what makes the navigator surfaces symmetrical.
 
@@ -89,7 +99,27 @@ When adding a YANG feature: extend `IRBuilder` first, then templates. Never emit
 
 ## RESTCONF ↔ NETCONF parity (normative)
 
-- Public navigator API must stay symmetrical: `retrieve(depth, content, fields/with-defaults)`, `update` (PATCH/merge), `replace` (PUT), `create` (POST), `delete`, RPC dispatch.
+- Public navigator API is `retrieve(depth, content, fields/with-defaults)`, `update` (PATCH/merge), `replace` (PUT), `create` (POST), `delete`, RPC dispatch — **symmetrical in intent, not in every method on every node class.** The surface is
+  *asymmetrical by protocol*, and that is deliberate. Measured on generated clients (not inferred):
+
+  | node | verbs present |
+  | --- | --- |
+  | NETCONF `ListNode` (plural) | `create` `replace` `retrieve` `update` — **no `delete`** |
+  | NETCONF `ItemNode` (keyed) | `delete` `replace` `retrieve` `update` — no `create` |
+  | RESTCONF `ListNode` (plural) | `delete` `replace` `retrieve` `update` — **no `create`** |
+
+  The divergence is protocol-shaped, not accidental:
+  - **No RESTCONF `create`.** RFC 8040 §4.5.1 makes PUT on a list entry
+    create-or-replace, so POST is redundant; `replace()` covers creation. NETCONF
+    needs the distinct `operation="create"` attribute of §7.2, so only it has
+    `create`.
+  - **No NETCONF list `delete`.** Deleting a NETCONF list entry requires its
+    keys, which only the keyed `ItemNode` has. RESTCONF `DELETE` on the list
+    *resource* is meaningful (§4.6), so only it has the plural `delete`.
+
+  Do not "fix" this by adding verbs whose semantics do not map across
+  transports. A HAL adapter must branch on capability, not assume the union.
+  If a verb is added, this table and `tests/test_matrix.py` move with it.
 - Transports intentionally differ:
   - RESTCONF: `requests` + TCP keepalive, `loopback_ip/management_ip` failover, `application/yang-data+json`.
   - NETCONF: `ncclient`, capability discovery by **exact base capability URI** (`:candidate` / `:writable-running` / `:nmda:1.0` — never a module name, or a device that ships `ietf-netconf-nmda` without implementing NMDA routes every read to an unsupported `<get-data>`), NMDA vs legacy RPC routing, `lock`/`unlock`, opt-in `auto_commit` plus `validate()` + `commit`/`discard_changes`, `RPCError → RuntimeError` (attribute access must never raise from the error path).
@@ -190,14 +220,20 @@ CI and must not be claimed as coverage.
     can satisfy `must`/`when`/leafref/mandatory, so claiming CRUD coverage would
     be false. Report the coverage the tool has.
 
-- Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe).
+- Layout: `tests/test_matrix.py` (offline, no docker: matrix coverage, template secure defaults, navigator parity, rpc-free generation regression), `tests/test_notconf_protocol.py` + `tests/test_sdk_generate.py` (integration, gated on `NOTCONF_RUN_INTEGRATION=1` or `--integration`), `tests/notconf/matrix.json` (all 11 pre-built images, `smoke` flags latest-per-family), `tests/notconf/compose.yaml` (local lab), `tests/notconf/wait_healthy.py` (readiness probe, credentials parameterised per backend), `tests/srl/` (containerlab lab: topology, startup-config, pinned versions, and `lab.py` — the single source of truth for the committed defaults, used by both the test suite and the CI job).
 - Simulated backend: `https://github.com/notconf/notconf` (admin/admin, lab-only). CI: `.github/workflows/ci-pr.yaml` (lint → typecheck → offline → smoke shards) and `ci-nightly.yaml` (full 11-tag matrix + `workflow_dispatch`).
+- **Vendor-model-tree coverage comes from SR Linux, not the simulators — but it is NOT NMDA coverage.** An earlier revision of this file claimed SR Linux supplied NMDA coverage. It does not: measured from a raw `<hello>` (370 capabilities) on 25.10.1, its base set is `candidate`, `confirmed-commit`, `rollback-on-error`, `startup`, `url`, `validate`, `with-defaults`, `with-operational-defaults`, `yang-library` — **no `:nmda:1.0`**. It ships the `ietf-netconf-nmda` *module* without advertising the capability, which is exactly the false positive `test_nmda_is_detected_from_the_capability_uri_not_a_module_name` pins. Do not reintroduce that claim; the `has_nmda` branch's only live coverage remains offline, and that gap is real. What SR Linux *does* supply is a full commercial vendor model tree (hundreds of modules, deep augment closure, identityref leaves) through the generated client. `.github/workflows/ci-srl.yaml` deploys it via containerlab, pulls the node's own models over `get-schema`, compiles `temp/netconf_clients/srl`, then runs `tests/test_srl_netconf.py`. Three rules govern it:
+  - **Severity is split on purpose.** Deploy / readiness / `get-schema` / generate are **blocking** — zero coverage must never render as a green run. The pytest step is `continue-on-error: true`, so a generator regression is reported without gating a merge. Do not collapse these into one all-or-nothing step.
+  - **It must stay on a standard runner.** `ubuntu-24.04` (4 vCPU / 16 GB) is free for public repos; larger runners are billed even for public repos. SR Linux needs 2 vCPU / 4 GB, so the standard runner is sufficient.
+  - **Versions are pinned in `tests/srl/PINNED.md`** (image tag *and* digest, plus the containerlab version). Update tag and digest together. An unpinned containerlab release can change deploy behaviour overnight and redden the pipeline with no code change.
 - Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored; promoting them to checked-in, diff-compared fixtures (plus `canonicalize_ast.py` snapshot diffs) is still open.
 - Agents must not claim coverage beyond what the suite asserts. Current reality: there is no `xfail`
 in the suite; RESTCONF and NETCONF CRUD round-trips make hard assertions (a `if-feature`
 mismatch or a missing `ietf-interfaces` navigator skips them); NMDA discrimination may skip on the
-documented factory-default race; and `tests/test_srl_netconf.py` / `tests/test_lab_device_netconf.py`
-are in no CI workflow, so anything they assert is not gating anything.
+documented factory-default race; `tests/test_srl_netconf.py` runs in CI but is **non-blocking**, so it
+reports rather than gates (and it carries one skip, `test_hostname_mutate_restore`, for two reasons
+documented in that file — neither of which is a generator defect); and
+`tests/test_lab_device_netconf.py` is in no CI workflow, so anything it asserts is not gating anything.
 - **A `skip` is not a pass.** The SDK suite skips deliberately and must say why: an image that
 implements no config modules, a node the simulator cannot read, a device without `:validate`. When a
 test covers zero nodes it must `pytest.skip`, never "succeed" vacuously.

@@ -109,7 +109,7 @@
       "yang_dir": "temp/yang_modules/srl-live",
       "read_subtree": "system",
       "write_subtree": "system",
-      "notes": "Nokia SR Linux in containerlab (LAB ONLY). NMDA + candidate, confirmed-commit advertised, shared candidate datastore: auto_commit must stay False.",
+      "notes": "Nokia SR Linux in containerlab (LAB ONLY). candidate + confirmed-commit + validate advertised; NOT NMDA -- it ships the ietf-netconf-nmda module without the :nmda:1.0 base capability (measured from a raw <hello>, 25.10.1), which is the false positive pinned in tests/test_matrix.py::test_nmda_is_detected_from_the_capability_uri_not_a_module_name. Shared candidate datastore: auto_commit must stay False.",
       "ignore_errors": [],
       "read_path": []
     }

@@ -235,7 +235,16 @@ class NetconfClient:
         # RFC 6241 Sec 8.3: module capabilities are 'namespace?module=name&...'.
         # Maps module name -> namespace for identityref prefix binding on
         # write and prefix -> module-name normalization on read.
-        self.module_namespaces: dict[str, str] = {}
+        #
+        # Seeded from the COMPILE-TIME map (the modules pyang actually loaded
+        # for this client) and then overlaid with what the device advertises.
+        # Seeding first matters: an identityref value is an XML QName, so its
+        # prefix must be declared in the document (RFC 7950 Sec 9.10.3). If
+        # binding depended only on the peer's <hello>, a device that omitted a
+        # module capability -- or a value for a module the device never
+        # advertised -- would put an undeclared prefix on the wire. The server
+        # still wins on conflicts: it is authoritative about what it speaks.
+        self.module_namespaces: dict[str, str] = dict({{ module_namespaces_literal }})
         for cap in self.server_capabilities:
             if "?" not in cap:
                 continue

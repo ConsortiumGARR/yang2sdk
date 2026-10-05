@@ -1,6 +1,7 @@
 name: yang2sdk-srl
-# LAB ONLY — single SR Linux node for yang2sdk NETCONF SDK spike.
-# Pinned image (righteous plan): update tag + digest together in PINNED.md.
+# LAB ONLY — single SR Linux node for the yang2sdk NETCONF SDK.
+# Pinned image: update the tag AND the digest together in PINNED.md, which
+# also records the pinned containerlab version used by ci-srl.yaml.
 # See README.md in this directory.
 topology:
   nodes:
