@@ -2176,6 +2176,7 @@ def test_sdk_verify_parse_errors_are_never_device_skips():
     400/404/405) stay skips.
     """
     from pydantic_xml import ParsingError
+
     from yang2sdk.cli.sdk_verify import _is_device_fault
 
     assert (
