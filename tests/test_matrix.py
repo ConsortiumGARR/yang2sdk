@@ -166,6 +166,8 @@ def test_clients_swappable_signature():
 
 
 def test_navigator_parity_surface():
+    import re
+
     base = REPO_ROOT / "src/yang2sdk/plugin/src/templates"
     # Public surface = generated per-node methods + inherited _base methods.
     rest = (base / "restconf/data_navigators/navigators.py.jinja").read_text()
@@ -177,6 +179,30 @@ def test_navigator_parity_surface():
         assert op in netc, f"NETCONF navigators missing {op}"
     assert "_create" in (base / "restconf/data_navigators/_base.py.jinja").read_text()
     assert "def create" in netc, "NETCONF list navigators missing create"
+
+    # Per-class verbs pin the AGENTS.md parity table so docs and templates
+    # cannot drift again: RESTCONF plural lists expose create (not update),
+    # NETCONF plural lists expose update (not delete).
+    rest_lists = re.findall(
+        r"ListNode\[.*?\](.*?)\n(?=class |\{% |\Z)",
+        (base / "restconf/data_navigators/navigators.py.jinja").read_text(),
+        re.S,
+    )
+    assert rest_lists, "no RESTCONF ListNode classes found in template"
+    for block in rest_lists:
+        assert "def create" in block, "RESTCONF ListNode missing create"
+        assert "def replace" in block and "def retrieve" in block
+        assert "def update" not in block, "RESTCONF ListNode must not expose update"
+    netc_lists = re.findall(
+        r"ListNode\[.*?\](.*?)\n(?=class |\{% |\Z)",
+        (base / "netconf/data_navigators/navigators.py.jinja").read_text(),
+        re.S,
+    )
+    assert netc_lists, "no NETCONF ListNode classes found in template"
+    for block in netc_lists:
+        for op in ["def retrieve", "def update", "def create", "def replace"]:
+            assert op in block, f"NETCONF ListNode missing {op}"
+        assert "def delete" not in block, "NETCONF ListNode must not expose delete"
 
     # RFC 7951 Sec 4: RESTCONF write bodies must use a module-qualified
     # top-level member; the navigator splits the response key (_name) from

@@ -17,8 +17,8 @@ safe:
   rpc     For every RPC/action, build the Input model and round-trip it through
           the wire serializer *without sending it*, then invoke only the RPCs
           named in --rpc-allowlist.
-  crud    create -> retrieve -> update -> replace -> delete against the writable
-          datastore. NOT automatic: needs --write, plus a second acknowledgement
+  crud    retrieve -> update -> read back per container, then a proven restore.
+          NOT automatic: needs --write, plus a second acknowledgement
           when there is no candidate to discard into.
   rpc-live  RPCs on the allowlist are dispatched. Never automatic.
 
@@ -634,8 +634,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--verify-tls",
-        action="store_true",
-        help="Verify TLS/host keys (the generated default; omit only for lab self-signed gear).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify TLS/host keys (default on, matching the generated clients; "
+        "use --no-verify-tls for lab self-signed gear only).",
     )
     parser.add_argument(
         "--restconf-scheme",

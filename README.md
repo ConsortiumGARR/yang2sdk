@@ -1,526 +1,101 @@
 # yang2sdk
 
-Generate a Pydantic-based IDE-friendly SDK for your network devices directly from YANG modules.
+Generate a Pydantic v2, IDE-friendly SDK for your network device directly from the YANG modules it actually runs.
 
-## Overview
-
-This pipeline extracts the YANG modules directly from your network devices and transforms them into a type-safe RESTCONF or NETCONF SDK interface to your device.
-
-Then you can do stuff like this to update the description of a port:
-
-```python
-from device_name_1_4_0 import RestconfClient as DeviceNameClient
-
-client = DeviceNameClient(
-    management_ip="192.168.137.42",
-    port=443,
-    username="user",
-    password="pass",
-    verify=True,
-)
-
-# Top-level data properties are named "<yang_module>_<node>", so an
-# `ietf-interfaces:interfaces/interface` becomes `ietf_interfaces_interface`.
-# Nested navigators then follow the YANG structure, and a list is called with
-# its key(s) -- a composite key takes one argument per leaf, in `key` order.
-interfaces = client.data.ietf_interfaces_interface("ethernet-1/1")
-
-# Retrieve current config
-port1 = interfaces.retrieve(content="config", depth=2)
-
-# The retrieved config (JSON) is loaded into the corresponding Pydantic model
-# that you can modify. As soon as you type `port1.` the IDE shows every field.
-port1.service_label = "test137"
-
-port1.admin_status = "dowm"
-# Here the code fails immediately, raising the following error:
-# pydantic_core._pydantic_core.ValidationError: 1 validation error for InterfaceItem
-# admin_status
-#   Input should be 'up' or 'down'  [type=enum, input_value='dowm', input_type=str]
-
-# Merge the change (RESTCONF PATCH / NETCONF nc:operation="merge")
-interfaces.update(port1)
+```mermaid
+flowchart LR
+    A[yang-downloader<br/>get-schema off the box] --> B[pyang -f tree<br/>you pick root modules]
+    B --> C[yang2restconf / yang2netconf<br/>AST → IR → Jinja]
+    C --> D[versioned Python package]
+    D --> E[HAL + adapters<br/>multi-vendor automation]
+    D -. lab-only .-> F[sdk-verify<br/>read + RPC + gated CRUD]
 ```
 
-`update()` is the merge verb and the one you normally want. `replace()` is a
-PUT / `nc:operation="replace"`, which means the body **is** the whole resource
-(RFC 8040 §4.5, RFC 6241 §8.2.1): anything missing from it is deleted on the
-device. Because the example above reads at `depth=2`, the returned model has
-config fields the device never sent, so a `replace()` with it is refused:
+- **For network engineers:** [get an SDK in 4 commands](#for-network-engineers) · [write safely](docs/usage.md#netconf-write-safety) · [validate on lab](docs/lab.md)
+- **For contributors:** [gates and tests](#for-contributors) · [`docs/dev.md`](docs/dev.md) · [`AGENTS.md`](AGENTS.md)
+
+Both targets share the same navigator intent — `retrieve` / `update` / `replace` / `create` / `delete`, RPC `__call__` — but the per-class surface is asymmetrical by protocol (e.g. RESTCONF plural lists expose `create`, not `update`; NETCONF plural lists expose `update`, not `delete`); only transport/encoding differs (JSON vs XML). See `docs/usage.md` and `AGENTS.md` parity table.
+
+## Example
 
 ```python
-interfaces.replace(port1)
-# ValueError: replace() on InterfaceItem would DELETE 4 field(s) that are not
-# set, because a PUT body must represent the complete resource
-# (RFC 8040 Sec 4.5): description, hold-time, ...
+from g30_1_4_0 import RestconfClient
+
+# Auth comes from args or DEVICE_USER / DEVICE_PASS at runtime.
+# Nothing is baked into generated code. verify=True is the default.
+client = RestconfClient(management_ip="192.0.2.10")
+
+# Top-level data is "<module>_<node>"; lists take key(s) in `key` order.
+iface = client.data.ietf_interfaces_interface("ethernet-1/1")
+
+port = iface.retrieve(content="config", depth=2)
+port.description = "uplink-to-core"
+iface.update(port)  # PATCH merge — the verb you normally want
 ```
 
-That guard is deliberate — a depth-truncated model used to silently wipe the
-rest of the interface. Read at full depth first, use `update()` to merge, or
-pass `allow_partial=True` when deleting those fields is what you actually mean.
+Pydantic validates on assignment, so the IDE catches bad values before they reach the device:
 
 ```python
-full = interfaces.retrieve(content="config", depth="unbounded")
-full.service_label = "test137"
-interfaces.replace(full)  # every returned field counts as set
+port.admin_status = "dowm"
+# ValidationError: Input should be 'up' or 'down'
 ```
 
-### Credentials and connection security
-
-No credentials are ever baked into generated code. Both clients resolve them at
-runtime in the same order:
-
-1. the `username` / `password` constructor arguments, if given;
-2. otherwise `DEVICE_USER` and `DEVICE_PASS` from the environment.
-
-If either value is still missing, the constructor raises `ValueError` before any
-transport work happens, so there is no such thing as an unauthenticated client
-that fails later with an opaque error. Two names, both protocols, no aliases —
-the same `.env` that `yang-downloader` and `sdk-verify` read also works for a
-generated client.
-
-Transport security defaults are also identical, and both are secure:
-
-| Transport | Default | Opt-out |
-| --- | --- | --- |
-| RESTCONF | `verify=True`, `scheme="https"` | `verify=False` (self-signed lab gear) or `scheme="http"` (plaintext simulator) |
-| NETCONF | host keys verified (`verify=True`) | `verify=False` (lab-only) |
-
-Every opt-out logs a warning at construction. `verify=False` is for lab equipment
-with self-signed certificates — never for production. `loopback_ip` is tried
-before `management_ip`, so a local management interface wins when both are
-given, and `timeout` is a `(connect, read)` pair for RESTCONF and a single
-value in seconds for NETCONF.
-
-### NETCONF write safety
-
-`NetconfClient` defaults to `auto_commit=False`, and that default is the point:
-with it off, an `edit()` to `candidate` is invisible in `running` until you
-commit, so a multi-step change can be reviewed and rolled back. The safe
-sequence is edit, validate, commit:
-
-```python
-from device_name_1_4_0 import NetconfClient
-
-client = NetconfClient(management_ip="192.168.137.42", port=830, verify=True)
-
-navigator = client.data.ietf_interfaces_interface("ethernet-1/1")
-navigator.update(port1, target="candidate")
-
-if client.has_validate:  # :validate is optional (RFC 6241 §8.6.4.1)
-    client.validate(source="candidate")
-client.commit()
-```
-
-`commit()`, `validate()`, `lock()`, `unlock()` and `discard_changes()` are client
-methods; `discard_changes()` throws the candidate datastore away (RFC 6241
-§8.6.5), leaving `running` untouched. `auto_commit=True` commits after *every*
-edit, which is why it is opt-in and warns when enabled. Used as a context manager
-the client locks on entry and, on an exception, discards the candidate and
-releases the lock:
-
-```python
-with NetconfClient(management_ip="192.168.137.42", verify=True) as client:
-    client.data.ietf_interfaces_interface("ethernet-1/1").update(port1)
-    client.validate(source="candidate")
-    client.commit()
-```
-
-Which datastore a write lands in depends on what the device advertises: reads
-and writes route through NMDA (`<get-data>` / `<edit-data>`, RFC 8526) when the
-exact `:nmda:1.0` capability URI is present, and through legacy
-`<get>` / `<get-config>` / `<edit-config>` (RFC 6241) otherwise. `default_target`
-is `candidate` when the device offers `:candidate`, else `running`. The six
-capability flags are plain booleans, so `if client.has_validate:` is the correct
-test:
-
-`has_candidate`, `has_writable_running`, `has_nmda`, `has_validate`,
-`has_confirmed_commit`, `has_rollback_on_error`.
-
-Both clients also expose `close()` and work as context managers, which is how you
-release the HTTP connection pool or the SSH session deterministically rather than
-waiting for garbage collection.
-
-### Calling RPCs and actions
-
-RPCs live under `client.operations`; the same `<module>_<rpc>` naming applies.
-
-```python
-# Top-level RPC: POST /restconf/operations/<module>:<rpc>
-# (NETCONF sends the equivalent <rpc><rpc-name> element)
-result = client.operations.ietf_system_system_reset(delay_seconds=5)
-
-# YANG 1.1 actions are invoked through the data tree, not under /operations
-# (RFC 8040 Sec 3.6)
-client.data.ietf_interfaces_interface("ethernet-1/1").reset(delay=3)
-```
+`replace()` is PUT / `nc:operation="replace"` — the body **is** the whole resource (RFC 8040 §4.5, RFC 6241 §8.2.1). It refuses a depth-truncated model instead of silently deleting the rest; read deeper, use `update()`, or pass `allow_partial=True` when deletion is intended. See [`docs/usage.md`](docs/usage.md).
 
 > [!WARNING]
-> **Do not request the whole `restconf/data/` resource, and do not read with
-> `depth="unbounded"`.** On a large production config that is the classic way
-> to hit 100% CPU and trigger a watchdog reboot or an OOM kill. Read a subtree
-> with an explicit `depth`; the generated navigators default to `depth=2`.
+> **Lab gear only for whole-tree reads.** Never request root `restconf/data/` on production — a large config can spike to 100% CPU and trigger a watchdog reboot or OOM kill. Read a subtree with an explicit `depth` (navigators default to `depth=2`); reserve `depth="unbounded"` for small lab trees.
 
- --- 
-
-## Quick Start
-
-### Setup
-
-You need [`uv`](https://github.com/astral-sh/uv) and Python >= 3.12.
-
-```bash
-git clone https://github.com/ConsortiumGARR/yang2sdk.git
-cd yang2sdk
-uv sync --locked --extra lab   # lab extra: downloader/sdk-verify tooling
-cp .env.example .env
-```
-
-Modify and save `.env` with your device's information. `.env` is gitignored and
-must never be committed; the `DEVICE_*` names in it are what `yang-downloader`
-and `sdk-verify` read, and they are also the default source for the generated
-clients' credential lookup. `DEVICE_NAME` names the device and therefore the
-output directories; `DEVICE_VERSION` feeds `--device-version` and the generated
-package name.
-
-Three more example files cover the other environments, all with placeholder
-values and no secrets:
-
-| File | Used by |
-| --- | --- |
-| `.env.example` | `yang-downloader`, `sdk-verify`, local compiles against real gear |
-| `.env.notconf.example` | the `notconf` simulator matrix (`NOTCONF_USER` / `NOTCONF_PASS` / `NOTCONF_RUN_INTEGRATION`) |
-| `.env.srl-lab.example` | the SR Linux containerlab lab (`SRL_DEVICE_*`) |
-| `.env.lab-device.example` | the real-lab-device NETCONF harness (`LAB_DEVICE_*`) |
-
-### Model Extraction
-
-Get the YANG models from the vendor or use the following to try pulling what the network device is running.
-
-```bash
-uv run yang-downloader
-```
-
-Besides the YANG files, this writes `temp/yang_modules/<device>/features.json`
-from the `<hello>` capability set (RFC 6241 §8.3) and saves only the newest
-revision of each module (RFC 6022 §3.1.2). Both matter for the next step.
-
-### YANG Tree inspection and modules identification
-
-Identify the *root* modules you want to convert. This can help:
-
-```bash
-uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/device_name.txt
-```
-
-### Compile to SDK
-
-Both targets take the same arguments and produce the same navigator surface;
-only the transport differs.
-
-```bash
-uv run yang2restconf temp/yang_modules/<device>/file1.yang temp/yang_modules/<device>/file2.yang
-uv run yang2netconf  temp/yang_modules/<device>/file1.yang temp/yang_modules/<device>/file2.yang
-```
-
-| Flag | Effect |
-| --- | --- |
-| `--device` | target device name; defaults to `$DEVICE_NAME` |
-| `--yang-dir` | YANG search path; defaults to `temp/yang_modules/<device>` |
-| `--output-dir` | defaults to `temp/{restconf,netconf}_clients/<device>` |
-| `--config-only` | drop `config false` (state) nodes from the generated models |
-| `--device-version` | OS version for provenance and the package name; defaults to `$DEVICE_VERSION` |
-| `--package-version` | PEP 440 package version; defaults to the device version |
-| `--deviation-module` | apply a pyang deviation (repeatable, recorded in the MANIFEST) |
-| `--feature mod:feat` | enable a feature (repeatable); adds to the device set, never narrows it |
-| `--features-file` | feature set JSON; defaults to `<yang-dir>/features.json` when present |
-| `--no-device-features` | ignore the device feature set and use pyang's defaults |
-| `--ignore-error TAG` | downgrade a pyang error tag (repeatable), e.g. `XPATH_SYNTAX_ERROR` |
-| `--check-model-gaps` | after compiling, report device data nodes the model lacks (NETCONF only; exits non-zero on gaps) |
-
-Without a flag, the compiler picks up `<yang-dir>/features.json` automatically.
-That is the default worth keeping: pyang otherwise assumes *every* `if-feature`
-is on and prunes subtrees the device actually implements, and the strict models
-(`extra="forbid"`) then reject real device data. `--feature` unions with the
-device set on purpose, because narrowing is what produces a silently wrong
-model.
-
-### Validating a generated SDK against a lab device
-
-The offline suite proves the *wire shape* is right. It cannot prove that *your*
-device speaks it. `sdk-verify` closes that gap: it walks the generated client's
-own navigator tree, calls the client's own methods, and records one row per
-(node, method).
-
-> [!WARNING]  
-> **Lab equipment only, and never production.** Every read is depth-bounded, but
-> a large config can still hit 100% CPU and trigger a watchdog reboot or OOM
-> kill. The write tiers edit the device; read them before using `--write`.
-
-```bash
-# Read every node and round-trip every RPC model. Nothing is modified.
-uv run sdk-verify --device <device> --protocol both --tiers read,rpc
-
-# Report as JSON, for CI or a spreadsheet.
-uv run sdk-verify --device <device> --json-out temp/verify/<device>.json
-```
-
-It needs the `lab` extra, reads `DEVICE_IP`/`DEVICE_USER`/`DEVICE_PASS` (same
-contract as a generated client: args win, then the environment), and exits
-non-zero if any endpoint fails.
-
-Four tiers, split because "test every CRUD method" cannot be both total and safe:
-
-| Tier | What it does | Gate |
-| --- | --- | --- |
-| `read` | Recursive walk of the **entire** data tree at bounded depth, validating each payload. Automatic. | none |
-| `rpc` | Builds every RPC `Input` and serialises it (`model_dump(by_alias=)`, `to_xml_payload()`) **without sending**. Catches envelope bugs across the whole RPC surface. | none |
-| `rpc` + `--rpc-allowlist` | Actually dispatches the named RPCs, echoing each one first. | `--rpc-allowlist` |
-| `crud` | `retrieve → update → read back` per container, then a proven restore. Idempotent merge, so an interrupted run cannot leave a changed value. | `--write`, plus a second flag |
-
-Every skip carries its reason. A node that covers nothing is never reported as a
-pass, and a device rejection (HTTP 400/404/405, `invalid-value`, `access-denied`)
-is recorded as a skip with the RFC section, not as a client failure. A run in
-which **every** row is a skip exits non-zero with `no endpoint was exercised` —
-a validation tool that cannot fail is not a validation tool.
-
-#### The write gates
-
-`--write` is opt-in, and writing needs a *second* acknowledgement because the two
-transports are not equally reversible:
-
-| Situation | Extra flag | Why |
-| --- | --- | --- |
-| NETCONF with `:candidate` | — | edits stage in `candidate` and are dropped with `<discard-changes>` (RFC 6241 §8.3.5). |
-| NETCONF without `:candidate` | `--allow-running-writes` | edits land in **running** immediately (RFC 6241 §8.2). Only the snapshot can undo them. |
-| RESTCONF (any device) | `--allow-restconf-writes` | `PATCH`/`PUT`/`POST`/`DELETE` are live at once; RESTCONF has no candidate and no `<discard-changes>`. |
-
-Before any write the tool snapshots every node it will touch to
-`temp/verify/<device>-<protocol>-snapshot.json` and **refuses to proceed if that
-fails**. It holds a NETCONF lock for the duration — a lock failure aborts rather
-than warns, because RFC 6241 §8.5.1 makes the lock a precondition for safely
-writing running. Afterwards it compares a digest of the whole tree against the
-pre-test one and reports `RESTORE NOT PROVEN` loudly if they differ, naming the
-snapshot file.
-
-`create`/`delete` are **not** in the automated tier, and that is deliberate: a
-generic value synthesiser cannot satisfy arbitrary `must`/`when`/leafref/mandatory
-constraints, so testing every list would produce false failures against real
-device semantics and could write junk to live gear. The tool reports coverage it
-has rather than coverage it wishes it had.
-
-### Usage
-
-Each compile emits a self-contained, installable package at
-`temp/<protocol>_clients/<device>_<os-version>/`: the client, models, navigators,
-its own `pyproject.toml`, a README naming the source YANG revisions, the
-deviations and features applied, a `MANIFEST.yang-revisions.json`, and `py.typed`.
-Add it to your project:
-
-```bash
-uv add path/to/temp/netconf_clients/device_name_1_4_0          # or --editable
-```
-
-```python
-from device_name_1_4_0 import NetconfClient  # or RestconfClient
-```
-
-The emitter compiles every generated `.py` before reporting success, so a client
-that cannot be imported is never handed to you.
-
-#### Scaling to Production (Multi-Vendor / Multi-Version)
-
-When managing real networks, it is inevitable to deal with multiple device models, vendors, and OS versions.
-An option is to structure the automation around a **Hardware Abstraction Layer (HAL)** and concrete **adapters**.
-
-- **HAL:** Exposes generic, vendor-agnostic entities and functions (e.g., `update_port_description(port, description)`).
-- **adapters:** Implements the HAL interfaces using the specific `yang2sdk` clients for a given device and OS version.
-
-One package per device *and* OS version, since different YANG revisions produce
-different models:
-
-```txt
-multi_vendor_automation_project/
-├── pyproject.toml
-├── main.py
-├── hal/                      <-- Hardware Abstraction Layer (the abstract contracts)
-│   ├── __init__.py
-│   ├── node.py               <-- e.g. Protocols and match-case routing to load the correct adapter
-│   ├── port.py
-│   ├── l2services.py
-│   ├── l3services.py
-│   └── adapters/
-│       ├── __init__.py
-│       └── device_name_1_4_0/
-│           ├── __init__.py
-│           ├── node.py
-│           ├── port.py
-│           ├── l2services.py
-│           └── l3services.py
-└── clients/                   <-- generated clients, added as `uv add path/to/...`
-    └── device_name_1_4_0/
-        ├── pyproject.toml
-        ├── README.md
-        ├── MANIFEST.yang-revisions.json
-        ├── py.typed
-        ├── __init__.py
-        ├── session_manager.py
-        ├── data_models/
-        │   ├── __init__.py
-        │   ├── _base.py
-        │   └── models.py
-        └── data_navigators/
-            ├── __init__.py
-            ├── _base.py
-            └── navigators.py
-```
-
-`yang2sdk` itself stays vendor-agnostic. Device-specific workarounds belong in
-the adapter, with a comment naming the YANG module, its revision, and the
-observed behaviour — not in the generated models or the generator templates.
-
-## Development
+## For network engineers
 
 Requires Python >= 3.12 and [`uv`](https://github.com/astral-sh/uv).
 
 ```bash
-uv sync --locked --extra lab          # or: uv sync --locked --group dev --extra lab
+git clone https://github.com/ConsortiumGARR/yang2sdk.git
+cd yang2sdk
+uv sync --locked --extra lab
+cp .env.example .env   # never commit .env; DEVICE_USER / DEVICE_PASS live here
 ```
 
-Four blocking gates, all run on `src/` (the ephemeral `temp/` output is excluded):
+```bash
+uv run yang-downloader
+uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
+uv run yang2restconf temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
+uv run yang2netconf  temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
+```
+
+Each compile emits a self-contained package at `temp/<protocol>_clients/<device>_<os-version>/` (client, models, navigators, `pyproject.toml`, README, `MANIFEST.yang-revisions.json`, `py.typed`):
+
+```bash
+uv add path/to/temp/restconf_clients/<device>_<os-version>
+```
+
+```python
+from <device>_<os_version> import RestconfClient  # or NetconfClient
+```
+
+One package per device **and** OS version — different YANG revisions produce different models. Next: [compile flags and HAL sketch](docs/usage.md) · [lab validation with `sdk-verify`](docs/lab.md).
+
+## For contributors
 
 ```bash
 uvx ruff check .
 uvx ruff format --check .
 uvx ty check
 uvx pyrefly check
+uv run pytest tests/test_matrix.py   # offline gate: no docker, no device
 ```
 
-`ruff` is the only linter and formatter. `ty` and `pyrefly` are both required; a
-pass in one does not excuse a failure in the other.
+`ruff` is the only linter/formatter. `ty` and `pyrefly` must both pass on `src/` (`temp/` output is excluded). Live-matrix tests need docker / lab gear — see [`docs/dev.md`](docs/dev.md) for the test/CI matrix and [`AGENTS.md`](AGENTS.md) for the normative generator contract.
 
-### Tests
+## Docs
 
-```bash
-uv run pytest tests/test_matrix.py      # the offline gate: no docker, no device
-```
-
-Everything else in `tests/` is marked `integration` and skips unless you opt in:
-
-```bash
-uv run pytest tests/ --integration                        # notconf simulator matrix
-NOTCONF_RUN_INTEGRATION=1 uv run pytest tests/             # same, via the environment
-NOTCONF_SMOKE_ONLY=1 uv run pytest tests/ --integration   # one image per family
-```
-
-| File | Needs | In CI |
+| Doc | Audience | Contents |
 | --- | --- | --- |
-| `tests/test_matrix.py` | nothing | yes, every PR |
-| `tests/test_notconf_protocol.py` | docker + `notconf` images | yes, smoke shards |
-| `tests/test_sdk_generate.py` | docker + `notconf` images | yes, smoke shards |
-| `tests/test_srl_netconf.py` | SR Linux containerlab lab | yes, non-blocking (`ci-srl.yaml`) |
-| `tests/test_lab_device_netconf.py` | a real lab device | no, lab only |
-| `uv run sdk-verify` | a lab device (or a simulator) | no, manual lab harness |
-
-CI lives in `.github/workflows/`: `ci-pr.yaml` runs lint → typecheck → the
-offline gate → one smoke image per family on every PR, `ci-nightly.yaml` runs
-the full 11-image matrix, and `ci-srl.yaml` brings up an SR Linux node in
-containerlab. `test_lab_device_netconf.py` is in no workflow, so nothing it
-asserts gates a merge — treat it as lab verification you run yourself.
-
-#### SR Linux job (`ci-srl.yaml`)
-
-Every `notconf` image is a simulator built from a handful of IETF and vendor
-models, and the Groove G30 is a single lab device that is writable-running only.
-None of them exercise a **full commercial vendor model tree** — hundreds of
-modules, deep augment closure, identityref leaves — through the generated
-client. `ci-srl.yaml` brings up an SR Linux node to close that gap.
-
-It is worth being precise about what this is **not**: SR Linux does *not*
-implement NMDA. Measured from a raw `<hello>` (370 capabilities), its base set is
-`candidate`, `confirmed-commit`, `rollback-on-error`, `startup`, `url`,
-`validate`, `with-defaults`, `with-operational-defaults`, `yang-library` — no
-`:nmda:1.0`. It ships the `ietf-netconf-nmda` *module* without advertising the
-capability, which is exactly the false positive that
-`test_nmda_is_detected_from_the_capability_uri_not_a_module_name` exists to
-catch. An earlier revision of this README claimed the opposite.
-
-It runs on every PR but **cannot fail a merge**, in two severity tiers:
-
-| Tier | Steps | On failure |
-| --- | --- | --- |
-| blocking | deploy, readiness, `get-schema`, generate | red X — the run covered nothing |
-| non-blocking | `pytest tests/test_srl_netconf.py` | reported, not gating |
-
-The distinction matters: a lab that never boots and a suite that found a
-generator regression must not look the same. Blocking steps also have to pass
-before pytest runs at all, so a broken lab is never reported as "tests passed".
-
-The job pulls the node's own models over `get-schema` and compiles from those,
-generating `temp/netconf_clients/srl` before pytest — the same
-`yang-downloader` → `yang2netconf` path a user runs by hand. Expect one skip:
-`test_hostname_mutate_restore`, because a whole-`<system>` merge is not
-expressible against this device for two independently verified reasons — SR
-Linux rejects identityref writes in the RFC 7951 string form it itself emits,
-and a write below the root omits the ancestor path the device requires. Both
-are documented in `tests/test_srl_netconf.py`. An earlier revision blamed an
-RFC 6241 §7.5 `<lock>` rejection; that was a misattributed error and is now
-fixed — `test_candidate_lock_is_honoured` asserts the lock instead.
-
-Pinned image, containerlab version, and host requirements are recorded in
-[`tests/srl/PINNED.md`](tests/srl/PINNED.md).
-
-> [!NOTE]
-> Standard GitHub-hosted runners are **free for public repositories**; larger
-> runners are billed even then. The job is on `ubuntu-24.04` (4 vCPU / 16 GB,
-> above SR Linux's 2 vCPU / 4 GB minimum) for that reason — do not move it to a
-> `*-large` label.
-
-### Simulator lab
-
-`tests/notconf/` drives pre-built [`notconf`](https://github.com/notconf/notconf)
-images (`compose.yaml`, `matrix.json`, `wait_healthy.py`) covering Cisco IOS XR
-`762/771/2411/2531`, IOS NX `10.4-4`, Junos `21.1R1/23.4R1`, Nokia SROS
-`21.10/22.2`, IETF, and base. The `notconf` image also serves plain HTTP
-RESTCONF on port 80, which is what the tests' `scheme="http"` opt-out is for.
-
-### Contributing
-
-`AGENTS.md` is the contract for changes to the generator: the IR in
-`src/yang2sdk/plugin/src/ir.py` and the Jinja templates must stay in sync, the
-RFC citations must be real, the secure defaults (`verify=True`, no embedded
-credentials, `auto_commit=False`, the `replace()` completeness guard) must not be
-weakened, and `CHANGELOG.md` records what changed.
-
-## Comparison with Alternatives
-
-The primary alternatives are [pydantify](https://github.com/pydantify/pydantify) and [pyangbind](https://github.com/robshakir/pyangbind). They both address the data modeling but do not facilitate the actual network operations.
-
-**yang2sdk** directly targets the real-world needs of network automation engineers by generating the Pydantic v2 models as well as the code for actual network operations.
-The goal is to make the development of network automation faster, easier, and safer leveraging IDE autocomplete, type hinting, static type checking and Pydantic's runtime validation.
-The core of this project is the [pyang](https://github.com/mbj4668/pyang) plugin that walks the raw `pyang` Abstract Syntax Tree (AST), builds an Intermediate Representation and uses Jinja to generate Python code.
-
-**pydantify** converts YANG modules into Pydantic models using a more sophisticated pipeline:
-`YANG Abstract Syntax Tree (AST)` -> `Internal Object-Oriented AST` -> `Dynamic In-Memory Pydantic Models` -> `JSON Schema` -> `datamodel-code-generator` -> `Pydantic Models`.
-It does not provide the code for network operations.
-
-**pyangbind** dynamically generates Python classes at runtime and does not provide the code for network operations.
+| [`docs/usage.md`](docs/usage.md) | network engineer | Credentials, transport defaults, NETCONF write safety, RPCs/actions, packaging, HAL |
+| [`docs/lab.md`](docs/lab.md) | network engineer | `sdk-verify` tiers and write gates, simulator matrix, SR Linux job |
+| [`docs/dev.md`](docs/dev.md) | contributor | Lint, type-check, tests, CI, contribution guardrails |
+| [`AGENTS.md`](AGENTS.md) | contributor | Normative generator contract (IR ↔ templates, RFC compliance, safety) |
 
 ## Status
 
-This is a public prototype. Both RESTCONF and NETCONF clients generate, with an interchangeable navigator surface
-(`retrieve`/`update`/`replace`/`create`/`delete`, and RPC/action `__call__`) so developer code written against one
-only needs the imported client swapped for the other. The RPC and action wire encodings are pinned offline by
-`tests/test_matrix.py` against RFC 8040 Sec 3.6 and RFC 7950 Sec 7.15.2, and re-verified live against SR Linux
-(`get-schema`, `lock`/`commit`/`unlock`, create→validate→commit→delete) and the Groove G30 (`no-op`, `ping`)
-over both transports.
-
-Both generated SDKs are exercised against all 11 pre-built `notconf` simulator images via the `pytest` suite in `tests/`: protocol checks, per-image SDK generation from the simulator's own YANG, Pydantic validation of live payloads, full CRUD round-trips (create → retrieve → update → replace → delete) through both clients, and idempotent same-data merges on every top-level config node.
-
-The offline gate is `uv run pytest tests/test_matrix.py`, which runs on every PR with no device and no docker; it covers matrix coverage, the template secure defaults, navigator parity, and the RPC/action wire shapes. The live matrix is opt-in and splits across CI as described under [Development](#development): smoke shards per family on PRs, the full 11 images nightly. A test that covers zero nodes skips rather than passing vacuously — the image ships no config modules, the simulator cannot read the node, or the device has no `:validate`.
-
-Live runs against SR Linux (`get-schema`, lock contention, `is_config` write-body filtering, interface CRUD) happen in `tests/test_srl_netconf.py`, which runs on every PR via `ci-srl.yaml` — SR Linux is the only full commercial vendor model tree in the repo, though notably **not** an NMDA device. It is **non-blocking**: it reports signal, it does not gate a merge. `test_lab_device_netconf.py` still needs real hardware and is in no workflow, so nothing it asserts gates anything.
-
-For validating a generated client on real gear, `sdk-verify` (see [Validating a generated SDK against a lab device](#validating-a-generated-sdk-against-a-lab-device)) walks the client's whole navigator tree and records one row per endpoint. It is a lab harness, not a CI gate, and it is where a generator bug that only shows up against a real datastore gets caught.
-
-Known limits (each pinned to a test): write shapes follow strict RFC 8040 + RFC 7951 — `create` POSTs to the parent with a single-element array body (RFC 8040 §4.4.1 + App. B.2.1, exactly one instance) and item `update`/`replace` send single-element array bodies (RFC 8040 §4.5 jukebox album example + RFC 7951 §5.4 list as name/array; PATCH list-instance follows the same JSON encoding, cf. rousette `tests/restconf-plain-patch.cpp` 204); key-mismatch and `requires N keys` errors enforce RFC 8040 §3.5.3/§4.5. Whole-list `replace` PUTs the list resource itself (`tests/test_matrix.py`). Simulator read quirks (`/data` GETs hide written list entries; collection GETs 400; `/ds/...?content=config` 500s; `/ds` item GETs are root-wrapped) are isolated to test read-backs via the RFC 8527 running-datastore container, not baked into the SDK. Details in `tests/test_sdk_generate.py`.
+Public prototype. Both protocols generate; wire shapes are pinned offline in `tests/test_matrix.py` and exercised live against `notconf` simulators, SR Linux (full vendor tree, non-NMDA), and the Groove G30. Alternatives ([pydantify](https://github.com/pydantify/pydantify), [pyangbind](https://github.com/robshakir/pyangbind)) cover data modelling but not network operations — this project generates models **and** the operation code on top of [pyang](https://github.com/mbj4668/pyang).

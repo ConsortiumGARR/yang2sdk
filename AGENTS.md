@@ -35,7 +35,7 @@ yang-downloader (NETCONF get-schema)
 |---|---|---|
 | Download YANG | `src/yang2sdk/cli/downloader.py` (`yang-downloader`) | `ietf-netconf-monitoring/get-schema` via `ncclient`. Output: `temp/yang_modules/<device>/`. |
 | Inspect tree | `uv run pyang -p temp/yang_modules/<device>/ -f tree …` | Human identifies *root* modules. No automation here yet. |
-| Compile | `src/yang2sdk/cli/compiler.py` (`yang2restconf`, `yang2netconf`) | In-process pyang invocation. Defaults: `--yang-dir temp/yang_modules/<device>`, `--output-dir temp/{restconf,netconf}_clients/<device>`. Flags: `--device`, `--yang-dir`, `--output-dir`, `--config-only`. |
+| Compile | `src/yang2sdk/cli/compiler.py` (`yang2restconf`, `yang2netconf`) | In-process pyang invocation. Defaults: `--yang-dir temp/yang_modules/<device>`, `--output-dir temp/{restconf,netconf}_clients/<device>`. Flags: `--device`, `--yang-dir`, `--output-dir`, `--config-only`, `--device-version`, `--package-version`, `--deviation-module`, `--feature`, `--features-file`, `--no-device-features`, `--ignore-error`, `--check-model-gaps` (NETCONF only). |
 | IR | `src/yang2sdk/plugin/src/ir.py` (`IRBuilder`) | AST → `IRModule/IRModel/IREnum/IRNavNode/IRField` dataclasses. Load-bearing logic, see §5. |
 | Emit | `src/yang2sdk/plugin/src/core.py` (`Yang2Restconf`, `Yang2Netconf`) | IR → Jinja templates in `src/yang2sdk/plugin/src/templates/{restconf,netconf}/`. |
 | Validate | `src/yang2sdk/cli/sdk_verify.py` (`sdk-verify`) | Walks the generated navigator tree and calls its own methods: `read` (full tree, bounded depth), `rpc` (serialise every Input, no send), `crud` (idempotent merge + proven restore). Both protocols. LAB ONLY. |
@@ -106,16 +106,19 @@ When adding a YANG feature: extend `IRBuilder` first, then templates. Never emit
   | --- | --- |
   | NETCONF `ListNode` (plural) | `create` `replace` `retrieve` `update` — **no `delete`** |
   | NETCONF `ItemNode` (keyed) | `delete` `replace` `retrieve` `update` — no `create` |
-  | RESTCONF `ListNode` (plural) | `delete` `replace` `retrieve` `update` — **no `create`** |
+  | RESTCONF `ListNode` (plural) | `create` `delete` `replace` `retrieve` — **no `update`** |
+  | RESTCONF `ItemNode` (keyed) | `delete` `replace` `retrieve` `update` — no `create` |
 
-  The divergence is protocol-shaped, not accidental:
-  - **No RESTCONF `create`.** RFC 8040 §4.5.1 makes PUT on a list entry
-    create-or-replace, so POST is redundant; `replace()` covers creation. NETCONF
-    needs the distinct `operation="create"` attribute of §7.2, so only it has
-    `create`.
+  The divergence is protocol-shaped, not accidental (RFC 8040 §4.4–§4.7 for
+  POST/PUT/PATCH/DELETE; RFC 6241 §7.2 for `operation="create"`):
+  - **No RESTCONF plural `update`.** Collection `PATCH` (RFC 8040 §4.6.1 merge)
+    is legal but withheld: `create()` (POST, RFC 8040 §4.4.1) adds entries and
+    item `update()` merges them, so a collection-wide merge has no mapping the
+    item verbs do not already cover. NETCONF keeps plural `update` because
+    `operation="merge"` (§7.2) addresses the subtree directly.
   - **No NETCONF list `delete`.** Deleting a NETCONF list entry requires its
     keys, which only the keyed `ItemNode` has. RESTCONF `DELETE` on the list
-    *resource* is meaningful (§4.6), so only it has the plural `delete`.
+    *resource* is meaningful (RFC 8040 §4.7), so only it has the plural `delete`.
 
   Do not "fix" this by adding verbs whose semantics do not map across
   transports. A HAL adapter must branch on capability, not assume the union.
@@ -138,7 +141,7 @@ Generated clients are **securely publishable Python packages**:
 - **Credential contract (both protocols, normative):** `username`/`password` args win; otherwise the client reads **`DEVICE_USER` and `DEVICE_PASS`** from the environment. Exactly two names, never more. `DEVICE_USERNAME`/`DEVICE_PASSWORD` are **retired, not aliased** — a generated client must ignore them even when they are the only ones exported. Rationale: every other consumer in this repo (`.env.example`, `cli/downloader.py`, `cli/sdk_verify.py`, the lab matrix in `tests/conftest.py`) has always used the short form, so the long form existed only in these templates and made the `.env` the project tells you to copy fail against a generated client. A two-name alias was tried and was worse: the two templates resolved the pairs in opposite order, so a host exporting both names authenticated as two different identities depending on transport. Do not reintroduce an alias — with one name that hazard cannot exist. If a value is missing, the constructor raises `ValueError` (never a `Warning` subclass used as an exception) *before* any transport work: RESTCONF and NETCONF both fail closed, so no client can exist that would attempt an unauthenticated session. Covered by `tests/test_matrix.py::test_both_protocols_fail_closed_without_credentials` (args beat env, env fallback works, both protocols fail closed) and `::test_retired_long_form_credential_names_are_ignored` (the retired names are inert). Both `monkeypatch.delenv` all four names: `tests/conftest.py` loads an untracked local `.env` into `os.environ`, so any test touching this path without clearing them passes locally and fails in CI.
 - **Secure transport defaults (both protocols):**
   - RESTCONF: `verify=True` by default. `verify=False` is allowed **only** as an explicit opt-out with a logged warning (lab/self-signed use).
-  - NETCONF: verify host keys by default (`hostkey_verify=True`). Opt-out allowed **only** explicitly with a logged warning.
+  - NETCONF: verify host keys by default (`verify=True`; `hostkey_verify` kept only as a deprecated alias). Opt-out allowed **only** explicitly with a logged warning.
   - Template changes must keep the secure default; reviewers must reject PRs that flip the default or silence the warning.
 - **Contents:** generated package includes client, models, navigators, and minimal README (device, OS version, source YANG revisions, protocol). No `sdk-verify`, no `.env`, no log files.
 
