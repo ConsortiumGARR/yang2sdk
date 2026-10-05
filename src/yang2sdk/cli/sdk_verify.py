@@ -794,18 +794,20 @@ def _run_crud(verifier: Verifier, protocol: str, args: argparse.Namespace) -> No
                 "<discard-changes>); pass --allow-restconf-writes",
             )
             return
-    elif not getattr(verifier.client, "has_candidate", False):
-        if not args.allow_running_writes:
-            verifier._record(
-                "-",
-                "crud",
-                "gate",
-                SKIP,
-                "device has no :candidate, so edits land in running and only a "
-                "re-written snapshot can undo them; back up the config and pass "
-                "--allow-running-writes",
-            )
-            return
+    elif (
+        not getattr(verifier.client, "has_candidate", False)
+        and not args.allow_running_writes
+    ):
+        verifier._record(
+            "-",
+            "crud",
+            "gate",
+            SKIP,
+            "device has no :candidate, so edits land in running and only a "
+            "re-written snapshot can undo them; back up the config and pass "
+            "--allow-running-writes",
+        )
+        return
 
     snapshot_path = _write_snapshot(verifier, protocol, args)
     if snapshot_path is None:
@@ -902,7 +904,7 @@ def _crud_targets(verifier: Verifier) -> list[tuple[str, Any]]:
         for _name, prop in verifier._nav_props(node):
             try:
                 child = prop.fget(node)
-            except Exception:  # noqa: BLE001 - already reported by the read tier
+            except Exception:  # noqa: BLE001, S112 - already reported by the read tier
                 continue
             kind = verifier._classify(child)
             if kind == "rpc":

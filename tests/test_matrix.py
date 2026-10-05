@@ -1156,7 +1156,7 @@ def test_restconf_datastore_root_refuses_every_write(tmp_path):
             if method == "delete":
                 data.delete()
             else:
-                getattr(data, method)(**{"x": 1})
+                getattr(data, method)(x=1)
     assert not recorder.calls, (
         f"a refused write still issued a request: {recorder.calls}"
     )
@@ -2175,8 +2175,8 @@ def test_sdk_verify_parse_errors_are_never_device_skips():
     the operation". Genuine device answers (RPC error replies, HTTP
     400/404/405) stay skips.
     """
-    from yang2sdk.cli.sdk_verify import _is_device_fault
     from pydantic_xml import ParsingError
+    from yang2sdk.cli.sdk_verify import _is_device_fault
 
     assert (
         _is_device_fault(
