@@ -131,6 +131,7 @@ class Verifier:
         selected_containers: set[str] | None = None,
         max_depth: int = 12,
         dry_run: bool = False,
+        debug: bool = False,
     ):
         self.client = client
         self.report = report
@@ -142,6 +143,7 @@ class Verifier:
         self.selected_containers = selected_containers or set()
         self.max_depth = max_depth
         self.dry_run = dry_run
+        self.debug = debug
         self.is_netconf = hasattr(client, "has_nmda")
         self._imported_models: dict[str, Any] = {}
 
@@ -170,16 +172,34 @@ class Verifier:
         return "rpc"
 
     def _record(
-        self, node: str, kind: str, method: str, status: str, detail: str = ""
+        self,
+        node: str,
+        kind: str,
+        method: str,
+        status: str,
+        detail: str = "",
+        extra: str = "",
     ) -> None:
         self.report.add(
             Result(node=node, kind=kind, method=method, status=status, detail=detail)
         )
+        if self.debug:
+            # --debug streams every row live (pass, skip, and fail), one capped
+            # line on stderr. `extra` carries request shape (source/content/
+            # depth, keys) and is console-only: the Report keeps `detail`
+            # unchanged so --json-out output is identical with the flag on/off.
+            suffix = f" | {extra}" if extra else ""
+            print(
+                f"[debug] {node} {kind}.{method} -> {status}: {detail}{suffix}",
+                file=sys.stderr,
+            )
 
-    def _skip(self, node: str, kind: str, method: str, why: str) -> None:
+    def _skip(
+        self, node: str, kind: str, method: str, why: str, extra: str = ""
+    ) -> None:
         # A skip always carries its reason. A vacuous "pass" over zero nodes is
         # exactly what the old tester did and it proved nothing.
-        self._record(node, kind, method, SKIP, why)
+        self._record(node, kind, method, SKIP, why, extra=extra)
 
     # -- tier A: full-tree read ------------------------------------------
 
@@ -231,6 +251,13 @@ class Verifier:
             self._walk(child, depth + 1, seen, (*ancestry, name))
 
     def _check_retrieve(self, nav: Any, label: str) -> None:
+        # Request shape for the --debug line only. The Report detail stays
+        # unchanged so JSON output is identical with the flag on/off.
+        ctx = (
+            f"source={self._read_source()} content=config depth={self.depth}"
+            if self.is_netconf
+            else f"content=config depth={self.depth}"
+        )
         try:
             if self.is_netconf:
                 result = nav.retrieve(
@@ -240,9 +267,11 @@ class Verifier:
                 result = nav.retrieve(content="config", depth=self.depth)
         except Exception as e:  # noqa: BLE001 - aggregate, never fail fast
             if _is_device_fault(e):
-                self._skip(label, "container", "retrieve", _device_fault_reason(e))
+                self._skip(
+                    label, "container", "retrieve", _device_fault_reason(e), extra=ctx
+                )
             else:
-                self._record(label, "container", "retrieve", FAIL, _short(e))
+                self._record(label, "container", "retrieve", FAIL, _short(e), extra=ctx)
             return
 
         # A list-of-items retrieve legitimately returns []; an empty container
@@ -250,7 +279,11 @@ class Verifier:
         # the point of this tier is that the payload validated.
         if result is None:
             self._skip(
-                label, "container", "retrieve", "device returned no data for this node"
+                label,
+                "container",
+                "retrieve",
+                "device returned no data for this node",
+                extra=ctx,
             )
         elif isinstance(result, list):
             self._record(
@@ -259,10 +292,16 @@ class Verifier:
                 "retrieve",
                 PASS,
                 f"{len(result)} model(s): {sorted({type(i).__name__ for i in result})}",
+                extra=ctx,
             )
         else:
             self._record(
-                label, "container", "retrieve", PASS, f"model {type(result).__name__}"
+                label,
+                "container",
+                "retrieve",
+                PASS,
+                f"model {type(result).__name__}",
+                extra=ctx,
             )
 
     def _check_list(self, nav: Any, label: str, name: str) -> None:
@@ -281,10 +320,17 @@ class Verifier:
                 or []
             )
         except Exception as e:  # noqa: BLE001
+            ctx = (
+                f"source={self._read_source()}"
+                if self.is_netconf
+                else "collection retrieve"
+            )
             if _is_device_fault(e):
-                self._skip(label, "list", "retrieve", _device_fault_reason(e))
+                self._skip(
+                    label, "list", "retrieve", _device_fault_reason(e), extra=ctx
+                )
             else:
-                self._record(label, "list", "retrieve", FAIL, _short(e))
+                self._record(label, "list", "retrieve", FAIL, _short(e), extra=ctx)
             return
 
         keys = self._item_keys(nav)
@@ -646,6 +692,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="RESTCONF URI scheme. 'http' is plaintext, for simulators only.",
     )
     parser.add_argument("--json-out", default="", help="Write the JSON report here.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Stream every endpoint result live to stderr (pass, skip, and fail) "
+        "with request shape. Console-only; the JSON report is unchanged. "
+        "LAB ONLY: output may include device config.",
+    )
     return parser
 
 
@@ -744,7 +797,37 @@ def run_protocol(
         allow_restconf_writes=args.allow_restconf_writes,
         rpc_allowlist={r for r in args.rpc_allowlist.split(",") if r},
         selected_containers={c for c in args.containers.split(",") if c},
+        debug=bool(getattr(args, "debug", False)),
     )
+    if verifier.debug:
+        # Connection context without secrets: host/port/scheme/tiers only.
+        # Never log username or password here (AGENTS.md: no creds in output).
+        if protocol == "restconf":
+            print(
+                f"[debug] {protocol} host={host} port={port} "
+                f"scheme={args.restconf_scheme} tiers={sorted(tiers)} "
+                f"depth={args.depth} max-depth={args.max_depth}",
+                file=sys.stderr,
+            )
+        else:
+            caps = ",".join(
+                name
+                for name in (
+                    "has_candidate",
+                    "has_nmda",
+                    "has_validate",
+                    "has_writable_running",
+                    "has_confirmed_commit",
+                    "has_rollback_on_error",
+                )
+                if getattr(client, name, False)
+            )
+            print(
+                f"[debug] {protocol} host={host} port={port} "
+                f"tiers={sorted(tiers)} depth={args.depth} "
+                f"max-depth={args.max_depth} capabilities={caps or 'none'}",
+                file=sys.stderr,
+            )
 
     try:
         if "read" in tiers:
