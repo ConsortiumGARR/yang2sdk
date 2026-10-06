@@ -312,6 +312,7 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         sys.exit(1)
 
     yang_dir = yangs_dir(parsed_args)
+    _require_yang_dir(yang_dir)
     feature_set = resolve_features(
         yang_dir=yang_dir,
         manual=parsed_args.features,
@@ -352,6 +353,24 @@ def yangs_dir(parsed_args: argparse.Namespace) -> Path:
     )
 
 
+def _require_yang_dir(yang_dir: Path) -> None:
+    """Fail fast on a missing YANG search dir instead of a cryptic pyang error.
+
+    `temp/` is untracked and created on demand, but only *outputs* are
+    created (`--output-dir`, snapshots, reports). The search dir is an
+    *input*: auto-creating it would mask a forgotten `yang-downloader` run
+    with an empty directory and a confusing downstream failure.
+    """
+    if not yang_dir.is_dir():
+        print(
+            f"Error: YANG search dir not found: {yang_dir}. "
+            "Run 'yang-downloader' first (or pass --yang-dir pointing at "
+            "existing YANG modules).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def compile_in_process(
     *,
     format_type: Literal["restconf", "netconf"],
@@ -386,6 +405,7 @@ def compile_in_process(
     yangs = (
         Path(yang_dir) if yang_dir else Path.cwd() / "temp" / "yang_modules" / device
     )
+    _require_yang_dir(yangs)
     out = (
         Path(output_dir)
         if output_dir

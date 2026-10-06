@@ -58,10 +58,13 @@ cp .env.example .env   # never commit .env; DEVICE_USER / DEVICE_PASS live here
 
 ```bash
 uv run yang-downloader
+mkdir -p temp/yang_tree
 uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
 uv run yang2restconf temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
 uv run yang2netconf  temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
 ```
+
+`temp/` is an untracked workspace — every command creates its own output dir on demand, so a fresh clone has no `temp/` until the first run (and `rm -rf temp/` only loses re-downloadable/recompilable output).
 
 Each compile emits a self-contained package at `temp/<protocol>_clients/<device>_<os-version>/` (client, models, navigators, `pyproject.toml`, README, `MANIFEST.yang-revisions.json`, `py.typed`):
 

@@ -36,7 +36,7 @@ Every skip carries its reason. A node that covers nothing is never reported as a
 | NETCONF without `:candidate` | `--allow-running-writes` | edits land in **running** immediately (RFC 6241 §8.2); only the snapshot can undo them |
 | RESTCONF (any device) | `--allow-restconf-writes` | `PATCH`/`PUT`/`POST`/`DELETE` are live at once; no candidate, no `<discard-changes>` |
 
-Before any write the tool snapshots every node it will touch (`--snapshot`, default `temp/verify/<device>-<protocol>-snapshot.json`) and **refuses to proceed if that fails**. It holds a NETCONF lock for the duration — a lock failure aborts rather than warns (RFC 6241 §8.5.1 makes the lock a precondition for writing running). Afterwards it compares a whole-tree digest and reports `RESTORE NOT PROVEN` loudly, naming the snapshot.
+Before any write the tool snapshots every node it will touch (`--snapshot`, default `temp/verify/<device>-<protocol>-snapshot.json`, created on demand) and **refuses to proceed if that fails**. It holds a NETCONF lock for the duration — a lock failure aborts rather than warns (RFC 6241 §8.5.1 makes the lock a precondition for writing running). Afterwards it compares a whole-tree digest and reports `RESTORE NOT PROVEN` loudly, naming the snapshot.
 
 `create` / `delete` are **not** in the automated tier: no generic synthesiser can satisfy arbitrary `must` / `when` / leafref / mandatory constraints, so testing every list would produce false failures and could write junk to live gear.
 

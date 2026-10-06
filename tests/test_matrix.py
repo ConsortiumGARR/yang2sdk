@@ -3013,3 +3013,102 @@ def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
     ):
         nclient = netc.NetconfClient(management_ip="127.0.0.1")
     assert (nclient.username, nclient.password) == ("current", "currentpass")
+
+
+def test_missing_yang_dir_fails_fast_with_actionable_error(tmp_path):
+    """A missing YANG search dir must fail fast, never auto-create.
+
+    `temp/` is untracked and created on demand, but only *outputs* are
+    created. The search dir is an input: silently creating it would mask a
+    forgotten `yang-downloader` run with an empty dir and a cryptic pyang
+    failure downstream.
+    """
+    yang = tmp_path / "tmiss.yang"
+    yang.write_text(MINIMAL_YANG)
+    missing = tmp_path / "no-such-yang-dir"
+    assert not missing.exists()
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            "tmiss",
+            "--yang-dir",
+            str(missing),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 2, proc.stderr[-2000:]
+    assert "yang-downloader" in proc.stderr, proc.stderr[-2000:]
+    assert not missing.exists(), "a missing input dir must never be created"
+
+
+def test_output_dir_is_created_on_demand(tmp_path):
+    """Compiling into a nonexistent nested output dir must succeed.
+
+    Every writer owns its output path: a fresh clone has no `temp/` until
+    the first run, so the emitter cannot depend on checked-in scaffolding.
+    """
+    yang = tmp_path / "tfresh.yang"
+    yang.write_text(MINIMAL_YANG)
+    out = tmp_path / "fresh" / "nested" / "out"
+    assert not out.parent.exists()
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            "tfresh",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert (out / "__init__.py").is_file()
+    assert (out / "session_manager.py").is_file()
+
+
+def test_importing_downloader_creates_no_files(tmp_path):
+    """Importing the downloader must not touch the filesystem.
+
+    The module used to configure a DEBUG FileHandler into
+    `temp/yang_downloader.log` at import time, so `--help`, a test import,
+    or any tooling grew an unbounded log as a side effect. Logging is now
+    lazy (stderr by default, opt-in rotating file via YANG_DOWNLOADER_LOG_FILE).
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", "import yang2sdk.cli.downloader"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert not (tmp_path / "temp").exists(), "import must not create temp/"
+    assert list(tmp_path.glob("*.log")) == []

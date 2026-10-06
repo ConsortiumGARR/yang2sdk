@@ -543,6 +543,10 @@ def run_gap_check(
     """Compile default + device variants, diff them, clean up unless `keep_work`."""
     features = read_features_file(features_file)
     work = Path(work_dir) if work_dir else Path.cwd() / "temp" / "model_gaps" / device
+    # `temp/` is untracked and created on demand: the compiles below create
+    # their own `default/`/`device/` dirs, but ensure the parent exists so a
+    # custom --work-dir never fails on a missing parent.
+    work.mkdir(parents=True, exist_ok=True)
     default_dir = work / "default"
     device_dir = work / "device"
     for out in (default_dir, device_dir):

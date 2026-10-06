@@ -21,20 +21,49 @@ except ImportError as e:
         "(or `uv sync --extra lab` for development)"
     ) from e
 
-# Configure logging using standard pathways
-log_file = Path.cwd() / "temp" / "yang_downloader.log"
-log_file.parent.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),
-    ],
-)
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+_configured = False
+
+
+def _configure_logging() -> None:
+    """Configure logging lazily (no import-time side effects).
+
+    Importing this module must not create files: the previous top-level
+    ``basicConfig(FileHandler(temp/yang_downloader.log))`` at DEBUG level
+    grew a 118MB log as a side effect of ``--help`` or any test import.
+    Default is INFO to stderr; an opt-in rotating file is enabled only via
+    ``YANG_DOWNLOADER_LOG_FILE`` (5MB x 3 backups). ``YANG_DOWNLOADER_DEBUG=1``
+    selects DEBUG.
+    """
+    global _configured
+    if _configured:
+        return
+    level = (
+        logging.DEBUG
+        if os.environ.get("YANG_DOWNLOADER_DEBUG") == "1"
+        else logging.INFO
+    )
+    log_file = os.environ.get("YANG_DOWNLOADER_LOG_FILE", "")
+    handlers: list[logging.Handler]
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handlers = [
+            RotatingFileHandler(path, maxBytes=5_000_000, backupCount=3),
+            logging.StreamHandler(),
+        ]
+    else:
+        handlers = [logging.StreamHandler()]
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    _configured = True
 
 
 def _revision_key(version: str) -> tuple:
@@ -92,6 +121,7 @@ class YangDownloader:
         "CRITICAL SYSTEM ERROR", so a total extraction failure still exited 0
         and looked like success to any script or CI step.
         """
+        _configure_logging()
         logger.warning(
             "hostkey_verify=False is a lab-only opt-out; "
             "never use the downloader against production"
@@ -212,6 +242,8 @@ class YangDownloader:
 
 
 def main():
+    _configure_logging()
+    load_dotenv()
     try:
         ip = os.environ["DEVICE_IP"]
         port = os.environ["NETCONF_PORT"]

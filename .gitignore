@@ -22,9 +22,7 @@ tests/srl/clab-*/
 digest.txt
 # Simulator snapshot payloads (run-local; strict golden comparison is follow-up)
 tests/fixtures/golden/*.json
-temp/**/*
-# except the directory structure itself
-!temp/**/
-# specifically un-ignore the .gitkeep files
-!temp/.gitkeep
-!temp/**/.gitkeep
+# Ephemeral workspace (yang_modules/, *_clients/, yang_tree/, verify/,
+# model_gaps/). Never committed; every writer creates its own output dir
+# on demand, so `rm -rf temp/` is always recoverable (re-download/recompile).
+temp/

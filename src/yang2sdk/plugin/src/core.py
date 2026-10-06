@@ -204,6 +204,10 @@ class Yang2Restconf(plugin.PyangPlugin):
         output_dir = ctx.opts.sdk_output_dir
         config_only = ctx.opts.sdk_config_only
 
+        # `temp/` is untracked and created on demand: ensure the output root
+        # exists before any write (makedirs below would also create it, but
+        # the package/static writers must not depend on that ordering).
+        os.makedirs(output_dir, exist_ok=True)
         models_dir = os.path.join(output_dir, "data_models")
         navigators_dir = os.path.join(output_dir, "data_navigators")
 
@@ -305,6 +309,9 @@ class Yang2Netconf(plugin.PyangPlugin):
         output_dir = ctx.opts.sdk_output_dir
         config_only = ctx.opts.sdk_config_only
 
+        # `temp/` is untracked and created on demand: ensure the output root
+        # exists before any write (see the restconf emit above).
+        os.makedirs(output_dir, exist_ok=True)
         models_dir = os.path.join(output_dir, "data_models")
         navigators_dir = os.path.join(output_dir, "data_navigators")
 
@@ -427,6 +434,9 @@ def _write_package_files(
     pkg = _package_context(ctx, modules, ir_modules, protocol)
     pkg_name, pkg_version = pkg["package_name"], pkg["package_version"]
     out = Path(out_dir)
+    # Defensive: `emit()` already created this, but `_write_package_files`
+    # must not depend on call ordering (model_gaps introspection, tests).
+    out.mkdir(parents=True, exist_ok=True)
     # pyproject.toml (project root = out_dir)
     if protocol == "restconf":
         deps = ['"pydantic>=2.12.5"', '"requests>=2.32.5"']
@@ -501,7 +511,7 @@ def _write_package_files(
     (out / "py.typed").write_text("", encoding="utf-8")
     # Namespaced installable copy: out/<pkg_name>/...
     pkg_dir = out / pkg_name
-    pkg_dir.mkdir(exist_ok=True)
+    pkg_dir.mkdir(parents=True, exist_ok=True)
     for item in ("__init__.py", "session_manager.py", "py.typed"):
         src = out / item
         if src.exists():

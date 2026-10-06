@@ -31,7 +31,8 @@ against real SR Linux instead of the `notconf` simulator.
 curl -sL https://containerlab.dev/setup | sudo -E bash -s install-containerlab
 sudo -E containerlab deploy -t srl.clab.yml     # from this directory
 uv run python -m tests.srl.lab                   # block until NETCONF answers
-uv run yang-downloader                           # -> temp/yang_modules/srl
+uv run yang-downloader                           # -> temp/yang_modules/srl (created on demand)
+mkdir -p temp/yang_tree
 mapfile -t F < <(uv run python -m yang2sdk.cli.closure \
   srl_nokia-system srl_nokia-interfaces --yang-dir temp/yang_modules/srl --format files)
 uv run yang2netconf "${F[@]}" --device srl \

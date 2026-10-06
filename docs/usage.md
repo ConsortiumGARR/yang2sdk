@@ -2,6 +2,8 @@
 
 Generating clients, authenticating, writing safely, calling RPCs, and packaging the output.
 
+`temp/` is an untracked workspace: the compiler, downloader, and `sdk-verify` create their own output dirs on demand (`temp/yang_modules/<device>/`, `temp/{restconf,netconf}_clients/<device>/`, `temp/verify/`). A missing YANG search dir is a hard error (run `yang-downloader` first); output dirs are created automatically.
+
 ## Compile
 
 Both targets share the same navigator intent and differ only in transport; the per-class surface is asymmetrical by protocol (RESTCONF plural lists expose `create`, not `update`; NETCONF plural lists expose `update`, not `delete` — see `AGENTS.md` parity table).

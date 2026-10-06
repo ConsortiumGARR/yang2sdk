@@ -6,6 +6,25 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`temp/` is now an untracked workspace created on demand.** The five
+  committed `.gitkeep` scaffolds are removed and `.gitignore` collapses to a
+  single `temp/` rule. Every writer creates its own output dir
+  (`plugin/src/core.py` emitter, `model_gaps` work dir, verify
+  snapshots/reports); the YANG search dir (`--yang-dir`) is an *input* and
+  fails fast with "run `yang-downloader` first" instead of masking a missed
+  download with an empty dir. `yang-downloader` no longer configures a DEBUG
+  `FileHandler` into `temp/yang_downloader.log` at import time (which grew to
+  118MB as a side effect of `--help`/test imports): logging is lazy, INFO to
+  stderr by default, opt-in rotating file via `YANG_DOWNLOADER_LOG_FILE`.
+  Default paths are unchanged, so CI/docs/tests keep working; the `pyang -f
+  tree` redirect snippets gain a `mkdir -p temp/yang_tree` (shell `>` never
+  creates parents).
+  Pinned by `test_missing_yang_dir_fails_fast_with_actionable_error`,
+  `test_output_dir_is_created_on_demand`, and
+  `test_importing_downloader_creates_no_files`.
+
 ### Added
 
 - **`sdk-verify`: full-SDK validation against a lab device.** The old `tester`

@@ -166,6 +166,7 @@ Requires Python `>=3.12` (see `pyproject.toml`, `.python-version`).
 uv sync --locked --extra lab   # lab extra: downloader/sdk-verify + live-sim tests
 cp .env.example .env            # never commit .env
 uv run yang-downloader
+mkdir -p temp/yang_tree
 uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
 uv run yang2restconf <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
 uv run yang2netconf  <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
@@ -263,7 +264,7 @@ is not advertised (RFC 6241 §8.6.4.1 makes it optional).
 
 - **Never request root `restconf/data/` on production.** Large configs can spike to 100% CPU and trigger watchdog reboot / OOM kill. Lab equipment only (per `README.md` warning).
 - `sdk-verify` and `yang-downloader` run against lab devices only. Confirm `DEVICE_IP` in `.env` is a lab address before running.
-- `temp/` is ephemeral and gitignored (only `.gitkeep` scaffolding is committed). Never import from `temp/` in shipped code; never commit generated clients, logs (`*.log`), or YANG dumps.
+- `temp/` is ephemeral and gitignored (untracked; every writer creates its own output dir on demand). Never import from `temp/` in shipped code; never commit generated clients, logs (`*.log`), or YANG dumps.
 - `*.env` / `.env` never committed. `DEVICE_PASS` in cleartext on disk is already a compromise — do not print, log, or propagate it. Full response bodies must not be committed to logs at INFO in production paths.
 - Timeouts, failover URL order, and `verify`/host-key defaults are safety features, not tuning knobs. Changing them requires explicit justification.
 - `auto_commit` defaults to **False** on the generated NETCONF client. It is a destructive
