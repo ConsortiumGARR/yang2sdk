@@ -186,7 +186,7 @@ def test_navigator_parity_surface():
     rest_lists = re.findall(
         r"ListNode\[.*?\](.*?)\n(?=class |\{% |\Z)",
         (base / "restconf/data_navigators/navigators.py.jinja").read_text(),
-        re.S,
+        re.DOTALL,
     )
     assert rest_lists, "no RESTCONF ListNode classes found in template"
     for block in rest_lists:
@@ -196,7 +196,7 @@ def test_navigator_parity_surface():
     netc_lists = re.findall(
         r"ListNode\[.*?\](.*?)\n(?=class |\{% |\Z)",
         (base / "netconf/data_navigators/navigators.py.jinja").read_text(),
-        re.S,
+        re.DOTALL,
     )
     assert netc_lists, "no NETCONF ListNode classes found in template"
     for block in netc_lists:
