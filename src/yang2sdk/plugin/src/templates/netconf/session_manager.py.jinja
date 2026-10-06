@@ -1,11 +1,14 @@
 # --- src/yang2sdk/plugin/src/templates/netconf/session_manager.py.jinja ---
+import copy
 import logging
 import os
+import time
 from typing import Any, Self
 from urllib.parse import parse_qs
+
+from lxml import etree
 from ncclient import manager
 from ncclient.operations import RPCError
-from lxml import etree
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -84,6 +87,77 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
     if isinstance(obj, bytes) and len(obj) > 2000:
         return obj[:2000] + f"...[truncated {len(obj) - 2000} bytes]".encode()
     return obj
+
+
+# Cap for a single logged RPC request/reply. Raw protocol XML is what makes a
+# DEBUG log worth reading, but an unbounded full-datastore dump can flood the
+# log pipeline, so over-long bodies are cut with a marker (same style as
+# _redact's own truncation). INFO lines never carry bodies -- only this DEBUG
+# path does.
+_MAX_RPC_LOG_CHARS = 65536
+
+
+def _redact_xml(element: etree._Element) -> str:
+    """Serialize `element` with sensitive leaf values redacted.
+
+    Name-based, sharing `_SENSITIVE_KEYS` with the dict redactor: any element
+    whose local tag name contains a sensitive substring has its text replaced
+    and its children dropped (a `<private-key>` subtree nests secrets).
+    Attributes are left intact -- `message-id` correlation depends on them.
+    Operates on a deepcopy and never raises: the logging path must neither
+    mutate what is sent nor mask a device error with its own traceback.
+    """
+    try:
+        scrubbed = copy.deepcopy(element)
+        for el in scrubbed.iter():
+            if not isinstance(el.tag, str):
+                continue
+            local = el.tag.rsplit("}", 1)[-1]
+            if any(s in local.lower() for s in _SENSITIVE_KEYS):
+                el.text = "***redacted***"
+                del el[:]
+        text = etree.tostring(scrubbed, encoding="unicode")
+    except Exception:  # noqa: BLE001 - logging must never fail the RPC
+        return "...[unserializable rpc, not logged]"
+    if len(text) > _MAX_RPC_LOG_CHARS:
+        text = (
+            text[:_MAX_RPC_LOG_CHARS]
+            + f"...[truncated {len(text) - _MAX_RPC_LOG_CHARS} chars]"
+        )
+    return text
+
+
+def _request_wire(func: Any, args: tuple, kwargs: dict) -> str:
+    """Best-effort request text for the DEBUG line. Never raises.
+
+    `dispatch(rpc)` calls carry the rpc element in `args[0]`. Every other
+    operation's envelope is built inside ncclient, so those log the operation
+    name with redacted kwargs instead -- the subtree filter, when present, is
+    serialized through `_redact_xml`. That is the complete request semantics;
+    the envelope bytes are ncclient's, not ours, and this does not pretend
+    otherwise.
+    """
+    try:
+        if args and isinstance(args[0], etree._Element):
+            return _redact_xml(args[0])
+        parts: dict[str, Any] = {}
+        for key, value in kwargs.items():
+            parts[key] = _redact_xml(value) if isinstance(value, etree._Element) else value
+        return f"{getattr(func, '__name__', 'rpc')}({_redact(parts)})"
+    except Exception:  # noqa: BLE001 - logging must never fail the RPC
+        return "...[unserializable request, not logged]"
+
+
+def _reply_wire(reply: Any) -> tuple[str, int]:
+    """(redacted reply text, raw wire size in bytes) for the DEBUG line."""
+    try:
+        root = _reply_root(reply)
+        if root is None:
+            return "...[unparseable reply, not logged]", 0
+        size = len(etree.tostring(root))
+        return _redact_xml(root), size
+    except Exception:  # noqa: BLE001 - logging must never fail the RPC
+        return "...[unserializable reply, not logged]", 0
 
 
 def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, str]) -> etree._Element:
@@ -185,7 +259,17 @@ class NetconfClient:
         if not verify:
             log.warning("NETCONF hostkey_verify=False (verify=False) is an explicit lab-only opt-out; never use in production.")
         if log_bodies:
-            log.warning("NETCONF log_bodies=True may log config/secrets; debug use only, never in production.")
+            # Deprecated no-op alias: redacted request/response XML is logged
+            # whenever the logger is at DEBUG, with or without this flag.
+            # Kept (and warned once here) so older call sites keep
+            # constructing; new code should set the log level instead.
+            import warnings
+
+            warnings.warn(
+                "log_bodies is deprecated; set the logger to DEBUG instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if auto_commit:
             # auto_commit commits the candidate after EVERY edit, so a
             # multi-step change can never be reviewed, validated or rolled
@@ -334,11 +418,27 @@ class NetconfClient:
         return self._handle_rpc(self._mc.unlock, target=target).ok
 
     def _handle_rpc(self, func, *args, **kwargs) -> Any:
-        """Centralized error handling for ncclient operations."""
+        """Centralized dispatch: error handling plus INFO/DEBUG wire logging.
+
+        INFO logs one summary line per request and per response (operation,
+        datastore, outcome, size, duration) -- the production trail, with no
+        bodies ever. DEBUG adds the redacted raw request/reply XML, so every
+        request and every response is visible to an operator who opts in.
+        Serialization is skipped entirely unless DEBUG is enabled, so a
+        production session at the default level pays nothing for logs nobody
+        reads. Every helper on this path is total (never raises, never
+        mutates), so logging can neither alter what is sent nor mask a
+        device error with its own traceback.
+        """
+        name = getattr(func, "__name__", "rpc")
+        where = kwargs.get("source", kwargs.get("target", ""))
+        log.info("NETCONF request: %s%s", name, f" {where}" if where else "")
+        debug = log.isEnabledFor(logging.DEBUG)
+        if debug:
+            log.debug("NETCONF request %s: %s", name, _request_wire(func, args, kwargs))
+        start = time.perf_counter()
         try:
-            # AGENTS.md Safety: payloads never at INFO; DEBUG opt-in only.
-            log.info("NETCONF dispatch: %s", getattr(func, "__name__", "rpc"))
-            return func(*args, **kwargs)
+            reply = func(*args, **kwargs)
         except RPCError as e:
             # Transform ncclient XML exceptions into standard Python runtime exceptions.
             #
@@ -369,6 +469,12 @@ class NetconfClient:
             # errlist; surface it unchanged rather than losing it.
             log.error("NETCONF transport error: %s", e)
             raise
+        elapsed = time.perf_counter() - start
+        if debug:
+            text, size = _reply_wire(reply)
+            log.debug("NETCONF reply %s (%.2fs, %d bytes): %s", name, elapsed, size, text)
+        log.info("NETCONF response: %s ok (%.2fs)", name, elapsed)
+        return reply
 
     def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
         """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running."""
@@ -468,8 +574,6 @@ class NetconfClient:
                 conf.append(config_xml)
 
             bind_module_prefixes(rpc, self.module_namespaces)
-            if self.log_bodies:
-                log.debug("NETCONF edit-data: %s", _redact(etree.tostring(rpc)))
             reply = self._handle_rpc(self._mc.dispatch, rpc)
             success = reply.ok
 
@@ -512,8 +616,6 @@ class NetconfClient:
                 conf.append(config_xml)
 
             bind_module_prefixes(rpc, self.module_namespaces)
-            if self.log_bodies:
-                log.debug("NETCONF edit-config: %s", _redact(etree.tostring(rpc)))
             reply = self._handle_rpc(self._mc.dispatch, rpc)
             success = reply.ok
 
@@ -557,8 +659,6 @@ class NetconfClient:
         if source:
             src = etree.SubElement(rpc, "{" + NC_NS + "}source")
             etree.SubElement(src, "{" + NC_NS + "}" + source)
-        if self.log_bodies:
-            log.debug("NETCONF validate: %s", _redact(etree.tostring(rpc)))
         reply = self._handle_rpc(self._mc.dispatch, rpc)
         return bool(getattr(reply, "ok", True))
 
@@ -568,7 +668,5 @@ class NetconfClient:
 
     def rpc(self, rpc_xml: etree._Element) -> etree._Element | None:
         bind_module_prefixes(rpc_xml, self.module_namespaces)
-        if self.log_bodies:
-            log.debug("NETCONF rpc: %s", _redact(etree.tostring(rpc_xml)))
         reply = self._handle_rpc(self._mc.dispatch, rpc_xml)
         return _reply_root(reply)

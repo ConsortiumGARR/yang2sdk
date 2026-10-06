@@ -33,8 +33,11 @@ import argparse
 import hashlib
 import importlib
 import json
+import logging
 import os
 import sys
+import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -69,6 +72,48 @@ SKIP = "skip"
 # Depth for every read. Never request an unbounded top-level container: that is
 # the read AGENTS.md warns can drive a device to 100% CPU and trip a watchdog.
 DEFAULT_DEPTH = 2
+
+# Mirrors the generated session managers' sensitive-key list (those are
+# canonical): the --debug model preview redacts the same leaf names so a
+# password never reaches stderr in cleartext from either side.
+_SENSITIVE_KEYS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "auth",
+    "community",
+    "private-key",
+    "privatekey",
+    "psk",
+    "pre-shared",
+    "preshared",
+    "credential",
+    "credentials",
+    "md5",
+    "username",
+)
+
+# Cap for one parsed-model preview. Full payloads live in --json-out and the
+# snapshot file; the console gets enough to identify the model, not the data.
+_MAX_PREVIEW_CHARS = 1500
+
+
+def _redact_preview(obj: Any) -> Any:
+    """Redact sensitive values from a model dump before console display."""
+    if isinstance(obj, dict):
+        return {
+            k: (
+                "***redacted***"
+                if any(s in str(k).lower() for s in _SENSITIVE_KEYS)
+                else _redact_preview(v)
+            )
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact_preview(v) for v in obj[:50]]
+    return obj
 
 
 @dataclass
@@ -144,6 +189,7 @@ class Verifier:
         self.max_depth = max_depth
         self.dry_run = dry_run
         self.debug = debug
+        self._debug_n = 0
         self.is_netconf = hasattr(client, "has_nmda")
         self._imported_models: dict[str, Any] = {}
 
@@ -179,27 +225,95 @@ class Verifier:
         status: str,
         detail: str = "",
         extra: str = "",
+        seconds: float | None = None,
     ) -> None:
         self.report.add(
-            Result(node=node, kind=kind, method=method, status=status, detail=detail)
+            Result(
+                node=node,
+                kind=kind,
+                method=method,
+                status=status,
+                detail=detail,
+                seconds=seconds,
+            )
         )
         if self.debug:
-            # --debug streams every row live (pass, skip, and fail), one capped
-            # line on stderr. `extra` carries request shape (source/content/
-            # depth, keys) and is console-only: the Report keeps `detail`
-            # unchanged so --json-out output is identical with the flag on/off.
+            # --debug streams every row live (pass, skip, and fail) on stderr.
+            # `extra` (request shape) is console-only: the Report keeps `detail`
+            # unchanged so --json-out output is identical with the flag on/off,
+            # apart from the now-populated `seconds`.
+            self._debug_n += 1
             suffix = f" | {extra}" if extra else ""
+            when = f" {seconds:.2f}s" if seconds is not None else ""
             print(
-                f"[debug] {node} {kind}.{method} -> {status}: {detail}{suffix}",
+                f"[debug] #{self._debug_n} {node} {kind}.{method} "
+                f"-> {status}{when}: {detail}{suffix}",
                 file=sys.stderr,
             )
+            if status == FAIL:
+                self._debug_traceback()
+
+    def _debug_model(self, model: Any) -> None:
+        """Truncated parsed-model preview under --debug (stderr, indented).
+
+        Shows what validation produced: redacted config content, first three
+        items of a list. Full payloads live in --json-out; the console gets
+        enough to identify the model, not the data.
+        """
+        if not self.debug:
+            return
+        try:
+            items = model if isinstance(model, list) else [model]
+            rest = len(items) - 3
+            parts = [
+                json.dumps(
+                    _redact_preview(_dump_config(i)), sort_keys=True, default=str
+                )
+                for i in items[:3]
+            ]
+            if isinstance(model, list):
+                text = "[" + ",".join(parts) + "]"
+            else:
+                text = parts[0]
+            if rest > 0:
+                text += f"\n...[+{rest} more item(s)]"
+        except Exception:  # noqa: BLE001 - a preview must never fail the row
+            return
+        if len(text) > _MAX_PREVIEW_CHARS:
+            text = (
+                text[:_MAX_PREVIEW_CHARS]
+                + f"...[truncated {len(text) - _MAX_PREVIEW_CHARS} chars]"
+            )
+        for sub in text.splitlines():
+            print(f"[debug]   = {sub}", file=sys.stderr)
+
+    def _debug_traceback(self) -> None:
+        """Full traceback for a FAIL, indented under its debug line.
+
+        Only fires when an exception is actually being handled (every FAIL
+        recorded inside an `except` block). FAILs recorded outside one (e.g. a
+        digest mismatch) get the outcome line only -- `sys.exc_info()` is None
+        there and there is nothing to format.
+        """
+        exc = sys.exc_info()[1]
+        if exc is None:
+            return
+        for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+            for sub in line.splitlines():
+                print(f"[debug]   | {sub}", file=sys.stderr)
 
     def _skip(
-        self, node: str, kind: str, method: str, why: str, extra: str = ""
+        self,
+        node: str,
+        kind: str,
+        method: str,
+        why: str,
+        extra: str = "",
+        seconds: float | None = None,
     ) -> None:
         # A skip always carries its reason. A vacuous "pass" over zero nodes is
         # exactly what the old tester did and it proved nothing.
-        self._record(node, kind, method, SKIP, why, extra=extra)
+        self._record(node, kind, method, SKIP, why, extra=extra, seconds=seconds)
 
     # -- tier A: full-tree read ------------------------------------------
 
@@ -258,6 +372,7 @@ class Verifier:
             if self.is_netconf
             else f"content=config depth={self.depth}"
         )
+        start = time.perf_counter()
         try:
             if self.is_netconf:
                 result = nav.retrieve(
@@ -266,13 +381,28 @@ class Verifier:
             else:
                 result = nav.retrieve(content="config", depth=self.depth)
         except Exception as e:  # noqa: BLE001 - aggregate, never fail fast
+            elapsed = time.perf_counter() - start
             if _is_device_fault(e):
                 self._skip(
-                    label, "container", "retrieve", _device_fault_reason(e), extra=ctx
+                    label,
+                    "container",
+                    "retrieve",
+                    _device_fault_reason(e),
+                    extra=ctx,
+                    seconds=elapsed,
                 )
             else:
-                self._record(label, "container", "retrieve", FAIL, _short(e), extra=ctx)
+                self._record(
+                    label,
+                    "container",
+                    "retrieve",
+                    FAIL,
+                    _short(e),
+                    extra=ctx,
+                    seconds=elapsed,
+                )
             return
+        elapsed = time.perf_counter() - start
 
         # A list-of-items retrieve legitimately returns []; an empty container
         # returns an empty model. Neither is a pass *and* neither is a failure:
@@ -284,6 +414,7 @@ class Verifier:
                 "retrieve",
                 "device returned no data for this node",
                 extra=ctx,
+                seconds=elapsed,
             )
         elif isinstance(result, list):
             self._record(
@@ -293,7 +424,9 @@ class Verifier:
                 PASS,
                 f"{len(result)} model(s): {sorted({type(i).__name__ for i in result})}",
                 extra=ctx,
+                seconds=elapsed,
             )
+            self._debug_model(result)
         else:
             self._record(
                 label,
@@ -302,7 +435,9 @@ class Verifier:
                 PASS,
                 f"model {type(result).__name__}",
                 extra=ctx,
+                seconds=elapsed,
             )
+            self._debug_model(result)
 
     def _check_list(self, nav: Any, label: str, name: str) -> None:
         """A list collection: retrieve it, and record whether keys are known.
@@ -312,6 +447,7 @@ class Verifier:
         device. Without them a generic caller cannot address an item at all,
         which is why that is asserted rather than assumed.
         """
+        start = time.perf_counter()
         try:
             items = (
                 nav.retrieve(
@@ -320,6 +456,7 @@ class Verifier:
                 or []
             )
         except Exception as e:  # noqa: BLE001
+            elapsed = time.perf_counter() - start
             ctx = (
                 f"source={self._read_source()}"
                 if self.is_netconf
@@ -327,13 +464,27 @@ class Verifier:
             )
             if _is_device_fault(e):
                 self._skip(
-                    label, "list", "retrieve", _device_fault_reason(e), extra=ctx
+                    label,
+                    "list",
+                    "retrieve",
+                    _device_fault_reason(e),
+                    extra=ctx,
+                    seconds=elapsed,
                 )
             else:
-                self._record(label, "list", "retrieve", FAIL, _short(e), extra=ctx)
+                self._record(
+                    label,
+                    "list",
+                    "retrieve",
+                    FAIL,
+                    _short(e),
+                    extra=ctx,
+                    seconds=elapsed,
+                )
             return
 
         keys = self._item_keys(nav)
+        elapsed = time.perf_counter() - start
         if not keys:
             self._skip(
                 label,
@@ -341,6 +492,7 @@ class Verifier:
                 "call",
                 "no named key parameters on __call__, so list items cannot be "
                 "addressed by a caller",
+                seconds=elapsed,
             )
         else:
             self._record(
@@ -349,7 +501,9 @@ class Verifier:
                 "retrieve",
                 PASS,
                 f"{len(items)} item(s); keys={keys}",
+                seconds=elapsed,
             )
+            self._debug_model(items)
 
     def _item_keys(self, list_nav: Any) -> list[str]:
         """Key parameter names for a list navigator, or [] when unaddressable.
@@ -458,6 +612,7 @@ class Verifier:
     def _invoke_rpc(self, rpc_nav: Any, name: str, empty: Any) -> None:
         """Dispatch an allowlisted RPC. Always echoed first: it may be destructive."""
         print(f"  [LIVE RPC] dispatching {name}")
+        start = time.perf_counter()
         try:
             rpc_nav() if empty is None else rpc_nav(empty)
         except Exception as e:  # noqa: BLE001
@@ -466,10 +621,21 @@ class Verifier:
             # to synthesise, and an empty Input is not a meaningful call for most
             # rpcs. Reported as a skip with the reason, never as a pass.
             self._skip(
-                name, "rpc", "call", f"device rejected the invocation: {_short(e, 160)}"
+                name,
+                "rpc",
+                "call",
+                f"device rejected the invocation: {_short(e, 160)}",
+                seconds=time.perf_counter() - start,
             )
             return
-        self._record(name, "rpc", "call", PASS, "device accepted the call")
+        self._record(
+            name,
+            "rpc",
+            "call",
+            PASS,
+            "device accepted the call",
+            seconds=time.perf_counter() - start,
+        )
 
     def _rpc_input_cls(self, rpc_nav: Any) -> Any:
         return self._rpc_model(rpc_nav, "Input")
@@ -616,32 +782,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sdk-verify",
         description=(
-            "Exercise every endpoint of a generated SDK against a lab device. "
-            "LAB ONLY -- never production."
+            "Exercise every endpoint of a generated SDK against a lab device, "
+            "one endpoint at a time. LAB ONLY -- never production."
+        ),
+        epilog=(
+            "examples:\n"
+            "  sdk-verify --device g30\n"
+            "  sdk-verify --device g30 --protocol both "
+            "--json-out temp/verify/g30.json\n"
+            "  sdk-verify --device g30 --tiers read,rpc --debug\n"
+            "  sdk-verify --device g30 --tiers crud --write "
+            "--allow-restconf-writes --containers /system --debug"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--device",
         default=os.environ.get("DEVICE_NAME"),
-        help="Generated client name under --client-dir.",
+        help="Generated client package name, e.g. g30. Must match the SDK "
+        "you compiled. Falls back to $DEVICE_NAME.",
     )
     parser.add_argument(
-        "--protocol", choices=["restconf", "netconf", "both"], default="restconf"
+        "--protocol",
+        choices=["restconf", "netconf", "both"],
+        default="restconf",
+        help="Which generated client to exercise. 'both' runs RESTCONF first, "
+        "then NETCONF, in one process.",
     )
     parser.add_argument(
         "--client-dir",
         default="",
-        help="Directory holding the generated client (default temp/<protocol>_clients/<device>).",
+        help="Directory holding the generated client package. Leave empty to "
+        "use temp/<protocol>_clients/<device>.",
     )
     parser.add_argument(
-        "--tiers", default="read,rpc", help="Comma-separated: read,rpc,crud,rpc-live."
+        "--tiers",
+        default="read,rpc",
+        help="Comma-separated subset of: read (retrieve every reachable data "
+        "node; safe), rpc (build and serialise every RPC input without "
+        "sending; safe -- only RPCs named in --rpc-allowlist are dispatched), "
+        "crud (merge-back round-trip per container; writes, needs --write "
+        "plus a datastore ack flag). 'rpc-live' is accepted as an alias of "
+        "'rpc'.",
     )
     parser.add_argument(
         "--depth",
         type=int,
         default=DEFAULT_DEPTH,
-        help="Bounded read depth. Never unbounded.",
+        help="How many levels deep each retrieve goes. Higher values return "
+        "larger payloads; keep low, since a deep root read can overload the "
+        "device.",
     )
     parser.add_argument(
         "--username", default="", help="Device username. Falls back to $DEVICE_USER."
@@ -650,64 +840,96 @@ def build_parser() -> argparse.ArgumentParser:
         "--password", default="", help="Device password. Falls back to $DEVICE_PASS."
     )
     parser.add_argument(
-        "--max-depth", type=int, default=12, help="Recursion limit for the tree walk."
+        "--max-depth",
+        type=int,
+        default=12,
+        help="Safety cap on tree-walk recursion: nodes deeper than this are "
+        "reported as skips and never fetched. Tune payload size with --depth "
+        "instead; you should rarely need this.",
     )
     parser.add_argument(
-        "--write", action="store_true", help="Enable the crud tier. Mutates the device."
+        "--write",
+        action="store_true",
+        help="Allow the crud tier to write to the device. Without it, crud "
+        "records a skip for every container. Must be combined with "
+        "--allow-running-writes (NETCONF without :candidate) or "
+        "--allow-restconf-writes (RESTCONF, always live).",
     )
     parser.add_argument(
         "--allow-running-writes",
         action="store_true",
-        help="Second, explicit acknowledgement: the device has no candidate datastore, so crud edits land in running and are rolled back by re-writing the snapshot.",
+        help="Confirm crud edits may land directly in the NETCONF running "
+        "datastore (the device has no :candidate). The pre-test snapshot is "
+        "the only undo -- check it was written before relying on this.",
     )
     parser.add_argument(
         "--allow-restconf-writes",
         action="store_true",
-        help="Second acknowledgement for RESTCONF, whose PATCH/PUT/POST/DELETE have no candidate and no discard-changes.",
+        help="Confirm crud edits may go live immediately: RESTCONF has no "
+        "candidate datastore and no discard-changes.",
     )
     parser.add_argument(
         "--rpc-allowlist",
         default="",
-        help="Comma-separated RPC names to actually dispatch.",
+        help="Comma-separated RPC names to actually send to the device, e.g. "
+        "--rpc-allowlist reboot,factory-reset. Every other RPC is only "
+        "validated offline and never dispatched. Empty (the default) "
+        "dispatches nothing.",
     )
     parser.add_argument(
         "--containers",
         default="",
-        help="Comma-separated container paths for the crud tier (all when empty).",
+        help="Limit the crud tier to containers whose path contains one of "
+        "these substrings, e.g. --containers /system,interfaces. Empty (the "
+        "default) covers the whole tree.",
     )
     parser.add_argument(
-        "--snapshot", default="", help="Where to write the pre-test config snapshot."
+        "--snapshot",
+        default="",
+        help="File to write the pre-test config snapshot to (your recovery "
+        "point). Default: temp/verify/<device>-<protocol>-snapshot.json. The "
+        "crud tier refuses to write if the snapshot fails.",
     )
     parser.add_argument(
         "--verify-tls",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Verify TLS/host keys (default on, matching the generated clients; "
-        "use --no-verify-tls for lab self-signed gear only).",
+        help="Verify TLS certificates (RESTCONF) and host keys (NETCONF). "
+        "On by default; pass --no-verify-tls only for lab gear with "
+        "self-signed certificates.",
     )
     parser.add_argument(
         "--restconf-scheme",
         choices=["https", "http"],
         default="https",
-        help="RESTCONF URI scheme. 'http' is plaintext, for simulators only.",
+        help="https (default) or http. http is unencrypted: simulators only.",
     )
-    parser.add_argument("--json-out", default="", help="Write the JSON report here.")
+    parser.add_argument(
+        "--json-out",
+        default="",
+        help="Write the full machine-readable report (one row per endpoint) "
+        "to this file. With --protocol both, each protocol gets its own "
+        "file: <stem>_restconf.json and <stem>_netconf.json.",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Stream every endpoint result live to stderr (pass, skip, and fail) "
-        "with request shape. Console-only; the JSON report is unchanged. "
-        "LAB ONLY: output may include device config.",
+        help="Stream one stderr line per endpoint as it runs (pass, skip, "
+        "and fail) with timing, request shape, and a full traceback on "
+        "failure. Read this when the final counts do not explain themselves. "
+        "May include device config: lab only, never commit the output.",
     )
     return parser
 
 
-def _import_client(client_dir: Path, protocol: str) -> Any:
+def _import_client(client_dir: Path, protocol: str) -> tuple[Any, str]:
     # --protocol both runs two clients in one process, and both are packages named
     # after the device (temp/restconf_clients/g30 and temp/netconf_clients/g30).
     # A plain importlib.import_module(client_dir.name) would hand the second
     # protocol the *first* module from sys.modules, silently validating the
     # RESTCONF client twice. Import under a unique per-protocol name instead.
+    # The name is also returned so --debug can find the client's loggers: every
+    # generated module logs under this dotted prefix.
     name = f"_sdkverify_{protocol}_{client_dir.name}"
     spec = importlib.util.spec_from_file_location(
         name,
@@ -719,7 +941,21 @@ def _import_client(client_dir: Path, protocol: str) -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module
+    return module, name
+
+
+def _enable_debug_logging(stub: str) -> None:
+    """Point the generated client's loggers at stderr at DEBUG (idempotent).
+
+    Generated modules log under the import stub (`getLogger(__name__)`), so
+    setting the stub logger suffices: children inherit the level, records
+    propagate up to this one handler. Calling twice (e.g. --protocol both
+    never reuses a stub, but reruns must not double-emit) adds no handler.
+    """
+    logger = logging.getLogger(stub)
+    logger.setLevel(logging.DEBUG)
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        logger.addHandler(logging.StreamHandler(sys.stderr))
 
 
 def _resolve_credentials(args: argparse.Namespace) -> tuple[str, str]:
@@ -747,7 +983,7 @@ def run_protocol(
             f"sdk-verify: no generated {protocol} client at {client_dir}. "
             f"Run 'uv run yang2{protocol} <root.yang> ...' first."
         )
-    module = _import_client(client_dir, protocol)
+    module, stub = _import_client(client_dir, protocol)
     cls = getattr(
         module, "RestconfClient" if protocol == "restconf" else "NetconfClient", None
     )
@@ -778,6 +1014,13 @@ def run_protocol(
         "password": password,
         "verify": verify,
     }
+    if bool(getattr(args, "debug", False)):
+        # Light up wire logging on both transports. Older generated clients
+        # still gate bodies behind `log_bodies`; current ones log redacted
+        # bodies at DEBUG regardless and treat it as a deprecated alias.
+        # Logger levels are set below, which is what reaches both generations.
+        kwargs["log_bodies"] = True
+        _enable_debug_logging(stub)
     if protocol == "netconf":
         # auto_commit must stay False: with it True, edit() silently commits to
         # running after every edit, which would defeat the candidate flow.
@@ -800,15 +1043,12 @@ def run_protocol(
         debug=bool(getattr(args, "debug", False)),
     )
     if verifier.debug:
-        # Connection context without secrets: host/port/scheme/tiers only.
-        # Never log username or password here (AGENTS.md: no creds in output).
+        # Connection context without secrets: which client, where it points,
+        # and what will run. Never log username or password here (AGENTS.md:
+        # no creds in output).
+        where = f"client={client_dir}"
         if protocol == "restconf":
-            print(
-                f"[debug] {protocol} host={host} port={port} "
-                f"scheme={args.restconf_scheme} tiers={sorted(tiers)} "
-                f"depth={args.depth} max-depth={args.max_depth}",
-                file=sys.stderr,
-            )
+            where += f" base={args.restconf_scheme}://{host}:{port}/restconf"
         else:
             caps = ",".join(
                 name
@@ -822,28 +1062,53 @@ def run_protocol(
                 )
                 if getattr(client, name, False)
             )
-            print(
-                f"[debug] {protocol} host={host} port={port} "
-                f"tiers={sorted(tiers)} depth={args.depth} "
-                f"max-depth={args.max_depth} capabilities={caps or 'none'}",
-                file=sys.stderr,
-            )
+            where += f" host={host} port={port} capabilities={caps or 'none'}"
+        print(
+            f"[debug] {protocol} {where} tiers={sorted(tiers)} "
+            f"depth={args.depth} max-depth={args.max_depth}",
+            file=sys.stderr,
+        )
 
     try:
         if "read" in tiers:
             print(f"[{protocol}] walking data tree (depth={args.depth})")
-            verifier.walk_data(client.data)
+            _debug_tier(
+                verifier, protocol, "read", lambda: verifier.walk_data(client.data)
+            )
         if "rpc" in tiers or "rpc-live" in tiers:
             print(f"[{protocol}] round-tripping rpc schemas")
-            verifier.walk_rpcs(client.operations)
+            _debug_tier(
+                verifier, protocol, "rpc", lambda: verifier.walk_rpcs(client.operations)
+            )
         if "crud" in tiers:
-            _run_crud(verifier, protocol, args)
+            _debug_tier(
+                verifier, protocol, "crud", lambda: _run_crud(verifier, protocol, args)
+            )
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
 
     return report
+
+
+def _debug_tier(verifier: Verifier, protocol: str, tier: str, fn: Any) -> None:
+    """Run one tier, printing its row delta under --debug (no-op otherwise).
+
+    Long vendor trees produce hundreds of streamed lines; the per-tier summary
+    tells the operator where the run stands without waiting for the end.
+    """
+    before = verifier.report.counts() if verifier.debug else {}
+    fn()
+    if verifier.debug:
+        after = verifier.report.counts()
+        print(
+            f"[debug] {protocol} tier {tier} done: "
+            f"{after[PASS] - before.get(PASS, 0)} pass, "
+            f"{after[FAIL] - before.get(FAIL, 0)} fail, "
+            f"{after[SKIP] - before.get(SKIP, 0)} skip",
+            file=sys.stderr,
+        )
 
 
 def _run_crud(verifier: Verifier, protocol: str, args: argparse.Namespace) -> None:
@@ -1182,30 +1447,63 @@ def _crud_containers(verifier: Verifier, protocol: str, target: str) -> None:
             )
             continue
 
+        update_start = time.perf_counter()
         try:
             _update(protocol, nav, baseline, target)
         except Exception as e:  # noqa: BLE001
+            update_elapsed = time.perf_counter() - update_start
             if _is_device_fault(e):
-                verifier._skip(label, kind, "update", _device_fault_reason(e))
+                verifier._skip(
+                    label,
+                    kind,
+                    "update",
+                    _device_fault_reason(e),
+                    seconds=update_elapsed,
+                )
             else:
-                verifier._record(label, kind, "update", FAIL, _short(e))
+                verifier._record(
+                    label, kind, "update", FAIL, _short(e), seconds=update_elapsed
+                )
             continue
-        verifier._record(label, kind, "update", PASS, "idempotent merge accepted")
+        verifier._record(
+            label,
+            kind,
+            "update",
+            PASS,
+            f"idempotent merge accepted (target={target})",
+            seconds=time.perf_counter() - update_start,
+        )
 
         # The write must be observable, otherwise `update` is a silent no-op and
         # the "pass" above proved nothing.
+        read_start = time.perf_counter()
         try:
             after = _retrieve(verifier, protocol, nav)
         except Exception as e:  # noqa: BLE001
+            read_elapsed = time.perf_counter() - read_start
             if _is_device_fault(e):
-                verifier._skip(label, kind, "read-back", _device_fault_reason(e))
+                verifier._skip(
+                    label,
+                    kind,
+                    "read-back",
+                    _device_fault_reason(e),
+                    seconds=read_elapsed,
+                )
             else:
-                verifier._record(label, kind, "read-back", FAIL, _short(e))
+                verifier._record(
+                    label, kind, "read-back", FAIL, _short(e), seconds=read_elapsed
+                )
             continue
+        read_elapsed = time.perf_counter() - read_start
 
         if _fingerprint(after) == _fingerprint(baseline):
             verifier._record(
-                label, kind, "read-back", PASS, "config unchanged (as intended)"
+                label,
+                kind,
+                "read-back",
+                PASS,
+                "config unchanged (as intended)",
+                seconds=read_elapsed,
             )
             continue
 
@@ -1233,6 +1531,7 @@ def _crud_containers(verifier: Verifier, protocol: str, target: str) -> None:
             PASS,
             f"config unchanged for the {len(expected)} field(s) sent "
             f"(device added {sorted(actual - expected) or 'nothing'})",
+            seconds=read_elapsed,
         )
 
 

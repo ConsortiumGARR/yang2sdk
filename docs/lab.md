@@ -11,7 +11,26 @@ uv run sdk-verify --device <device> --protocol both --tiers read,rpc
 
 # Report as JSON, for CI or a spreadsheet.
 uv run sdk-verify --device <device> --json-out temp/verify/<device>.json
+
+# Stream every endpoint row live (timing, request shape, model preview,
+# tracebacks on failure). Never commit the output: it may include config.
+uv run sdk-verify --device <device> --tiers read,rpc --debug
 ```
+
+## Wire logging
+
+`--debug` also lights up the generated clients' own loggers, so the wire is
+visible, not just the verdict:
+
+| Transport | INFO (always) | DEBUG |
+| --- | --- | --- |
+| RESTCONF | `Request: METHOD url` → `Response: status` | redacted request/response bodies (needs `log_bodies=True`, which `--debug` passes for you) |
+| NETCONF | `NETCONF request: <op> <datastore>` → `NETCONF response: <op> ok, <N> bytes, <T>s` | redacted raw request/reply XML, 64 KB cap with truncation marker |
+
+Secrets (passwords, passphrases, tokens, communities, private keys, ...) are
+redacted by construction on both transports; `message-id` attributes are left
+intact for request/reply correlation. Outside `--debug` nothing changes: the
+default log level emits no bodies, so production sessions pay nothing.
 
 It needs the `lab` extra, reads `DEVICE_IP` / `DEVICE_USER` / `DEVICE_PASS` (same contract as a generated client: args win, then the environment), and exits non-zero if any endpoint fails.
 

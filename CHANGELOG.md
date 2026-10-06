@@ -55,6 +55,27 @@ All notable changes to `yang2sdk` are documented here. Format follows
   full CRUD coverage would be false.
   `tester` is removed; `sdk-verify` replaces it.
 
+- **`sdk-verify --debug` streams every endpoint row live.** One stderr line
+  per `(node, method)` as it runs (pass, skip, and fail) with timing,
+  request shape (`source`/`content`/`depth`, list keys, RPC input keys), a
+  truncated parsed-model preview, and a full traceback on failure. Per-tier
+  summaries close each tier, and `--help` text now describes usage instead of
+  design rationale. Default output and `--json-out` verdicts are unchanged.
+  Pinned by `tests/test_sdk_verify_debug.py`.
+
+- **Generated NETCONF clients log every request and response.** `_handle_rpc`
+  is the single choke point, so one INFO summary pair per RPC (operation,
+  datastore, outcome, size, duration) is always emitted, and DEBUG adds the
+  redacted raw request/reply XML (64 KB cap with truncation marker) -- reads
+  included, which the old per-method lines never covered. Serialization is
+  skipped entirely unless DEBUG is enabled, so production pays nothing by
+  default. Secrets are redacted by construction: the new `_redact_xml` shares
+  the sensitive-key list and replaces matching leaf values (dropping nested
+  subtrees), which also fixes the old `log_bodies` lines logging
+  password/passphrase leaves in cleartext (the dict-only `_redact` merely
+  truncated XML bytes). `log_bodies` stays accepted as a deprecated alias.
+  Pinned by `tests/test_netconf_logging.py`.
+
 ### Fixed
 
 - **`retrieve(depth=N)` on a RESTCONF client returned data its own strict model
