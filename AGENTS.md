@@ -176,8 +176,8 @@ uv run sdk-verify --device <d>  # LAB ONLY, see §11
 ### Lint — `ruff` (blocking)
 
 ```bash
-uvx ruff check .
-uvx ruff format --check .
+uv run ruff check .
+uv run ruff format --check .
 ```
 
 `ruff` is the only formatter/linter. Do not introduce black/isort/flake8 configs.
@@ -185,10 +185,17 @@ uvx ruff format --check .
 ### Type-check — `ty` + `pyrefly` (both blocking)
 
 ```bash
-uvx ty check
-uvx pyrefly check
+uv run ty check
+uv run pyrefly check
 ```
 
+- **Run the gates with `uv run`, never `uvx`.** `ruff`, `ty` and `pyrefly` are pinned
+  *exactly* in the `dev` dependency group and `CI` runs `uv sync --locked`, so CI
+  installs what `uv.lock` says. `uvx <tool>` resolves the newest release per
+  invocation and can redden `main` with no commit to explain it — measured, not
+  hypothetical: `ty` 0.0.60 passed, 0.0.86 flags a deprecated `@contextmanager`
+  overload. Bump with `uv lock --upgrade-package <tool>` (procedure in
+  `docs/dev.md`).
 - Both must pass on `src/`. Astral `ty` and Meta `pyrefly` are complementary; a pass in one does not excuse a failure in the other.
 - Tool scoping lives in `pyproject.toml`: `[tool.ruff]` pins `target-version = "py312"` and excludes ephemeral `temp/` output; `[tool.pyrefly]` excludes `temp/`; `ty` needs no section (it respects `.gitignore`, which already covers `temp/`). There is no `[tool.pyright]` — pyright is gone, do not reintroduce it.
 - Generated code under `temp/` is excluded from blocking type-checks (it is ephemeral output), but templates that *produce* it are not — template edits must still type-check at the template level and via a generated sample.

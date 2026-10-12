@@ -36,9 +36,24 @@ yang-downloader = "yang2sdk.cli.downloader:main"
 sdk-verify = "yang2sdk.cli.sdk_verify:main"
 
 [dependency-groups]
+# The four blocking gates (ruff, ruff format, ty, pyrefly) are pinned EXACTLY
+# and run from this venv via `uv run`, never `uvx`. Two reasons:
+#
+# 1. `uvx <tool>` resolves the newest release on every invocation, so a gate
+#    could start failing with no commit and no diff to explain it. That is not
+#    hypothetical: ty 0.0.60 passed, 0.0.86 flags a deprecated
+#    `@contextmanager` overload in tests/test_srl_netconf.py.
+# 2. `uv sync --locked` + exact pins makes CI hermetic — a tool release landing
+#    upstream cannot change what CI installs. Bumping is then a deliberate,
+#    visible act (see the bump procedure in docs/dev.md), never a background
+#    event.
+#
+# Bump with: uv lock --upgrade-package ty, then re-run the gates (docs/dev.md)
 dev = [
     "gitingest>=0.3.1",
-    "ruff>=0.1.0",
+    "ruff==0.16.10",
+    "ty==0.0.86",
+    "pyrefly==1.3.2",
     "pytest>=8.0.0",
     "pyyaml>=6.0.0",
 ]

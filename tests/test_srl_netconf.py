@@ -15,7 +15,7 @@ import importlib
 import socket
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -465,7 +465,7 @@ def test_candidate_lock_is_honoured(srl_client):
 
 
 @contextmanager
-def _second_session(client) -> Iterator[Any]:
+def _second_session(client) -> Generator[Any]:
     """A second NETCONF session to the same device, for lock contention tests."""
     from ncclient import manager
 
