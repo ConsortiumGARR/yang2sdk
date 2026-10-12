@@ -42,6 +42,40 @@ MINIMAL_YANG = """module tmod {
 }
 """
 
+UNWRAP_YANG = """module tunwrap {
+  prefix tu;
+  namespace "urn:test:unwrap";
+  revision 2026-01-01;
+  container top {
+    container clock {
+      leaf timezone-name {
+        type string;
+      }
+    }
+    container ntp {
+      container server {
+        leaf addr {
+          type string;
+        }
+      }
+      leaf weight {
+        type uint32;
+      }
+    }
+    container dns {
+      container server {
+        leaf addr {
+          type string;
+        }
+      }
+      leaf port {
+        type uint16;
+      }
+    }
+  }
+}
+"""
+
 NESTED_STATE_YANG = """module tcontent {
   prefix tc;
   namespace "urn:test:tcontent";
@@ -268,6 +302,182 @@ def test_generate_rpc_free_module_compiles_and_imports(fmt, tmp_path):
         assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
     finally:
         sys.path.remove(str(tmp_path))
+
+
+def _gen_restconf(yang_text: str, name: str, tmp_path):
+    """Generate a RESTCONF client and return the package root on sys.path."""
+    yang = tmp_path / f"{name}.yang"
+    yang.write_text(yang_text)
+    out = tmp_path / f"{name}_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            name,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    # Don't hardcode the version directory: the default device_version differs
+    # between the console script and run_compiler(). The manifest is the
+    # authoritative statement of what was emitted.
+    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    pkg_root = out / manifest["package_name"]
+    assert pkg_root.is_dir(), f"expected package at {pkg_root}"
+    sys.path.insert(0, str(pkg_root.parent))
+    return str(pkg_root.parent), pkg_root.name
+
+
+def test_restconf_unwraps_a_reply_nested_under_the_ancestor(tmp_path):
+    """A reply keyed by an ANCESTOR's name must still unwrap (RFC 8040 §4.2).
+
+    Regression, measured on notconf-ietf 25.x: `GET /ietf-system:system/clock`
+    answers `{"ietf-system:system": {"clock": {}}}`. The node's own name
+    (`clock`) is not a top-level key, so the old lookup fell through to "assume
+    the whole response is my node" and handed the strict `SystemClock` model an
+    envelope — which `extra="forbid"` then correctly rejected, surfacing as
+    "Extra inputs are not permitted" at a node that is perfectly conformant.
+
+    RFC 8040 §4.2 identifies a resource by its URI, so the path the navigator
+    requested is the specification for reading the reply.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        nav = __import__(f"{pkg}.data_navigators.tunwrap", fromlist=["*"])
+
+        class _Stub:
+            """Returns one canned reply; records the paths actually requested."""
+
+            def __init__(self, payload):
+                self.payload = payload
+                self.seen = []
+
+            def _request(self, method, path, params=None, json=None):
+                self.seen.append(path)
+                return self.payload
+
+        payload = {
+            "tunwrap:top": {
+                "clock": {"timezone-name": "UTC"},
+                "ntp": {"server": {"addr": "NTP-VALUE"}, "weight": 1},
+                "dns": {"server": {"addr": "DNS-VALUE"}, "port": 53},
+            }
+        }
+        client = _Stub(payload)
+        top = nav.TopNode(client, "/data/tunwrap:top", "tunwrap:top")
+
+        assert top.clock.retrieve().timezone_name == "UTC"
+        assert "/data/tunwrap:top/clock" in client.seen
+    finally:
+        sys.path.remove(sys_root)
+
+
+def test_restconf_unwrap_never_returns_a_same_named_sibling(tmp_path):
+    """Walking the path must not land on a same-named leaf elsewhere (RFC 8040 §4.2).
+
+    This is the hazard that rules out the obvious fix. `tunwrap:top` has two
+    children named `server` (`ntp/server` and `dns/server`) — mirroring
+    ietf-system, which has both `ntp/server` and `dns-resolver/server`. A
+    recursive search for the leaf name resolves the ancestor-wrapped shape but
+    silently returns whichever `server` it meets first, i.e. the NTP servers
+    when DNS servers were asked for. That turns a loud failure into a wrong
+    answer, which is worse than the bug it fixes.
+
+    Only the requested path is reachable by walking segments, so a same-named
+    sibling is structurally out of reach.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        nav = __import__(f"{pkg}.data_navigators.tunwrap", fromlist=["*"])
+
+        class _Stub:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def _request(self, method, path, params=None, json=None):
+                return self.payload
+
+        payload = {
+            "tunwrap:top": {
+                "clock": {"timezone-name": "UTC"},
+                # ntp sorts before dns, so a name search finds NTP first.
+                "ntp": {"server": {"addr": "NTP-VALUE"}, "weight": 1},
+                "dns": {"server": {"addr": "DNS-VALUE"}, "port": 53},
+            }
+        }
+        client = _Stub(payload)
+        top = nav.TopNode(client, "/data/tunwrap:top", "tunwrap:top")
+
+        assert top.dns.server.retrieve().addr == "DNS-VALUE"
+        assert top.ntp.server.retrieve().addr == "NTP-VALUE"
+    finally:
+        sys.path.remove(sys_root)
+
+
+def test_restconf_unwrap_falls_back_when_the_reply_has_no_path(tmp_path):
+    """Already-unwrapped replies must keep working — no regression (RFC 8040 §4.2).
+
+    A server may answer with the resource itself rather than nesting it, and a
+    list instance's URI carries a predicate (`interface[name=eth0]`) that has no
+    JSON counterpart. Neither can be path-walked, so the historical name lookup
+    stays as the fallback. This test pins that the fallback still runs.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        base = __import__(f"{pkg}.data_navigators._base", fromlist=["*"])
+
+        # Already unwrapped: no path structure to walk.
+        assert (
+            base._unwrap_by_path({"addr": "1.1.1.1"}, "/data/t/top/dns/server") is None
+        )
+        assert base._unwrap_by_name({"addr": "1.1.1.1"}, "server") == {
+            "addr": "1.1.1.1"
+        }
+
+        # URI predicate: not a JSON member name, so the walk declines.
+        assert (
+            base._unwrap_by_path(
+                {"tunwrap:server": [{"addr": "x"}]}, "/data/t/top/server[name=x]"
+            )
+            is None
+        )
+
+        # A top-level resource still walks, and matches the old behaviour.
+        wrapped = {"tunwrap:top": {"clock": {}}}
+        assert base._unwrap_by_path(wrapped, "/data/tunwrap:top") == {"clock": {}}
+        assert base._unwrap_by_name(wrapped, "tunwrap:top") == {"clock": {}}
+
+        # Bare vs qualified segment equivalence (RFC 7951 §4).
+        assert base._member_matches("clock", "tunwrap:clock")
+        assert base._member_matches("tunwrap:clock", "clock")
+        assert not base._member_matches("ntp", "dns")
+
+        # A reply already keyed by the TARGET cannot be path-walked (the parent
+        # segment is absent), so the path layer declines and the name layer
+        # handles it — the layering working as designed.
+        assert (
+            base._unwrap_by_path({"tunwrap:clock": {}}, "/data/tunwrap:top/clock")
+            is None
+        )
+        assert base._unwrap_by_name({"tunwrap:clock": {}}, "clock") == {}
+        assert base._unwrap_by_name({"clock": {}}, "clock") == {}
+    finally:
+        sys.path.remove(sys_root)
 
 
 def test_content_filter_prunes_nested_state(tmp_path):

@@ -64,6 +64,82 @@ def _maybe_prune(data: Any, depth: int | str) -> Any:
     return _prune_at_depth(data, requested + 1)
 
 
+def _member_matches(key: str, segment: str) -> bool:
+    """Does a JSON member `key` correspond to the URI path segment `segment`?
+
+    RFC 7951 Sec 4 qualifies a member with its module when that module differs
+    from the parent's, so the URI segment and the member name can each be the
+    bare form where the other is qualified. Both directions are accepted; this
+    is the only place the two representations are reconciled.
+    """
+    if key == segment:
+        return True
+    if ":" in segment and key == segment.split(":", 1)[1]:
+        return True
+    if ":" in key and key.split(":", 1)[1] == segment:
+        return True
+    return False
+
+
+def _unwrap_by_path(resp: dict[str, Any], path: str) -> Any:
+    """Descend the exact URI path this node requested, or return None.
+
+    RFC 8040 Sec 4.2: a resource is identified by its URI and the response body
+    mirrors that resource's subtree, so the URI we sent is the specification for
+    how to read the reply.
+
+    Some servers nest the answer under an ANCESTOR's name rather than the
+    target's -- `GET /ietf-system:system/clock` answers
+    `{"ietf-system:system": {"clock": {}}}`. A lookup keyed on the node's own
+    name cannot resolve that shape, and it used to fall through to "assume the
+    whole response is my node", handing a strict model an envelope that
+    `extra="forbid"` then correctly rejected.
+
+    Walking the path is what makes this safe. Searching the payload for the
+    leaf name would resolve the shape but silently return the WRONG node when
+    two leaves share a name under different parents -- ietf-system has both
+    `ntp/server` and `dns-resolver/server` -- and a name search takes whichever
+    it meets first. Only the requested path is reachable here, so a same-named
+    sibling is structurally out of reach.
+
+    Returns None when the path does not apply -- the response is already
+    unwrapped, is not a mapping, or the path carries a list predicate
+    (`interface[name=eth0]`) that has no JSON counterpart. The caller then
+    falls back to name-based unwrapping, which is unchanged.
+    """
+    segments = [s for s in path.split("/") if s and s != "data"]
+    if not segments:
+        return None
+    current: Any = resp
+    for segment in segments:
+        if not isinstance(current, dict):
+            return None
+        for key, value in current.items():
+            if _member_matches(key, segment):
+                current = value
+                break
+        else:
+            return None
+    return current
+
+
+def _unwrap_by_name(resp: dict[str, Any], name: str) -> Any:
+    """Unwrap by the node's own name, the original heuristic.
+
+    Kept verbatim as the fallback for responses that carry no path structure to
+    walk (already-unwrapped bodies, list predicates in the URI). Its final
+    "assume the response is the object" branch is the historical behaviour and
+    is preserved deliberately -- see `_unwrap_by_path` for why the path walk
+    runs first.
+    """
+    if name in resp:
+        return resp[name]
+    found_keys = [k for k in resp.keys() if k.endswith(f":{name}")]
+    if found_keys:
+        return resp[found_keys[0]]
+    return resp
+
+
 def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
     """Refuse a PUT that would silently delete unset fields.
 
@@ -167,21 +243,14 @@ class Node:
 
         # Handle if the response is a dictionary
         if isinstance(resp, dict):
-            # Check for exact key match
-            if self._name in resp:
-                inner = resp[self._name]
-                payload = inner
-
-            # Check for namespaced key match (e.g. ietf-hardware:slot-item)
-            else:
-                # Find any key that ends with ":name"
-                found_keys = [k for k in resp.keys() if k.endswith(f":{self._name}")]
-                if found_keys:
-                    inner = resp[found_keys[0]]
-                    payload = inner
-                else:
-                    # Fallback: Assume the response itself is the object (unwrapped)
-                    payload = resp
+            # Path first: the URI we asked for is the spec for reading the
+            # reply (RFC 8040 Sec 4.2), and it is the only unwrap that cannot
+            # land on a same-named sibling elsewhere in the tree. Falls back to
+            # the historical name lookup when the response carries no path
+            # structure to walk.
+            payload = _unwrap_by_path(resp, self._path)
+            if payload is None:
+                payload = _unwrap_by_name(resp, self._name)
 
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
