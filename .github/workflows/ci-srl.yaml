@@ -24,7 +24,7 @@ name: ci-srl
 #   deploy / readiness / get-schema / generate -> BLOCKING. Zero coverage must
 #     never render as a green run, and each of these failing means the steps
 #     after it prove nothing.
-#   pytest                                       -> non-blocking
+#   pytest / sdk-verify                         -> non-blocking
 #     (continue-on-error). Device boot timing and init races are real; a
 #     failure here is a signal to read, not a merge blocker.
 # Every blocking step must also pass for pytest to run at all (the default
@@ -124,23 +124,17 @@ jobs:
             || { echo "::error::features.json missing — <hello> capability parse failed"; exit 1; }
 
       - name: Generate the NETCONF client from the node's own models
-        # Roots are the two the test navigates to: <system> (system/name/host-name,
-        # management, logging) and the interfaces list. The closure resolver
-        # pulls in every module that augments or is used by them, without which
-        # pyang emits base-only models that reject the device's fully-augmented
-        # replies under extra="forbid".
+        # Roots are the two the tests navigate to: <system> (system/name/host-name,
+        # management, logging) and the interfaces list.
+        #
+        # yang2netconf now resolves the augment closure itself (88c2681), so the
+        # explicit closure.py step that used to live here is redundant — passing
+        # the two root files is enough. Kept as a single command so this job
+        # exercises the documented user path rather than a special one.
         run: |
-          mapfile -t FILES < <(
-            uv run python -m yang2sdk.cli.closure \
-              srl_nokia-system srl_nokia-interfaces \
-              --yang-dir temp/yang_modules/srl --format files
-          )
-          echo "augment closure: ${#FILES[@]} modules"
-          if [ "${#FILES[@]}" -lt 2 ]; then
-            echo "::error::closure resolver found no modules — cannot compile"
-            exit 1
-          fi
-          uv run yang2netconf "${FILES[@]}" \
+          uv run yang2netconf \
+            temp/yang_modules/srl/srl_nokia-system@*.yang \
+            temp/yang_modules/srl/srl_nokia-interfaces@*.yang \
             --device srl \
             --yang-dir temp/yang_modules/srl \
             --output-dir temp/netconf_clients/srl
@@ -165,13 +159,48 @@ jobs:
           NOTCONF_RUN_INTEGRATION: "1"
         run: uv run pytest tests/test_srl_netconf.py -v
 
+      - name: sdk-verify against the full vendor tree
+        # NON-BLOCKING, same severity as the pytest step above. This is the
+        # exhaustive walk — every reachable node at bounded depth, every RPC
+        # Input serialised — over a tree the notconf simulators cannot match
+        # (397 modules, deep augment closure, identityref leaves).
+        #
+        # `crud` is enabled here and only here. It is a writer: it holds the
+        # candidate lock, merges, reads back, discards, and proves restoration
+        # with a whole-tree digest, and it refuses to run without BOTH
+        # --write and a second acknowledgement (--allow-running-writes here,
+        # since SR Linux has :candidate). That is why it does not belong in the
+        # notconf smoke matrix.
+        #
+        # Measured locally against 25.10.1: 291 pass / 0 fail / 170 skip, with
+        # `verify-restore: config digest matches snapshot`.
+        id: srl-sdk-verify
+        continue-on-error: true
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          source tests/srl/.env.srl.example
+          set +a
+          uv run sdk-verify \
+            --device srl \
+            --protocol netconf \
+            --tiers read,rpc,crud \
+            --write \
+            --allow-running-writes \
+            --no-verify-tls \
+            --snapshot temp/verify/srl-netconf-crud-snapshot.json \
+            --json-out temp/verify/srl-netconf-report.json
+
       - name: Container logs
         # `failure()` alone would MISS the case that matters most: a failing
         # pytest step does not put the job in a failed state, because it is
-        # continue-on-error. Check that step's own outcome too, or a generator
-        # regression would be reported with no device logs to explain it.
-        # Runs before destroy, while the containers still exist.
-        if: failure() || steps.srl-tests.outcome == 'failure'
+        # continue-on-error. Check those steps' own outcomes too, or a
+        # generator regression would be reported with no device logs to
+        # explain it. Runs before destroy, while the containers still exist.
+        if: >-
+          failure() ||
+          steps.srl-tests.outcome == 'failure' ||
+          steps.srl-sdk-verify.outcome == 'failure'
         run: |
           docker ps -a --format '{{.Names}}' | grep -e clab- || true
           for c in $(docker ps -a --format '{{.Names}}' | grep -e clab- || true); do

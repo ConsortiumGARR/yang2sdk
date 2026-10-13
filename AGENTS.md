@@ -203,8 +203,14 @@ uv run pyrefly check
 ## Testing and CI
 
 There is a `pytest` suite plus CI. `cli/sdk_verify.py` (`sdk-verify`) is the
-lab harness for full-SDK validation and is **not** a test gate; it was never in
-CI and must not be claimed as coverage.
+full-SDK validation harness. It is **no longer outside CI**:
+`tests/test_sdk_verify_ci.py` drives its verifier from pytest against the
+notconf containers the smoke matrix already starts, so it is a **blocking**
+gate per image (`read,rpc`), and `ci-srl.yaml` runs it with `crud` against the
+full SR Linux tree. That closed the gap that let three shipped defects survive:
+the RESTCONF ancestor-envelope unwrap (`7bdb8cd`), the NETCONF augment-closure
+gap, and the `ietf-notification-capabilities` model hole. Agents must not
+describe it as unenforced coverage.
 
 - `sdk-verify` tiers (LAB ONLY, both protocols, replaces the old `tester` script):
   - `read` — recursive walk of the entire navigator tree at bounded depth,
@@ -244,7 +250,7 @@ mismatch or a missing `ietf-interfaces` navigator skips them); NMDA discriminati
 documented factory-default race; `tests/test_srl_netconf.py` runs in CI but is **non-blocking**, so it
 reports rather than gates (and it carries one skip, `test_hostname_mutate_restore`, for two reasons
 documented in that file — neither of which is a generator defect); and
-`tests/test_lab_device_netconf.py` is in no CI workflow, so anything it asserts is not gating anything.
+`tests/test_lab_device_netconf.py` is in no CI workflow, so anything it asserts is not gating anything. `tests/test_sdk_verify_ci.py` **is** blocking, per image, for every `sdk-verify` `read`/`rpc` finding.
 - **A `skip` is not a pass.** The SDK suite skips deliberately and must say why: an image that
 implements no config modules, a node the simulator cannot read, a device without `:validate`. When a
 test covers zero nodes it must `pytest.skip`, never "succeed" vacuously.

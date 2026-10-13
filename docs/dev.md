@@ -71,11 +71,14 @@ NOTCONF_SMOKE_ONLY=1 uv run pytest tests/ --integration   # one image per family
 | `tests/test_matrix.py` | nothing | yes, every PR |
 | `tests/test_notconf_protocol.py` | docker + `notconf` images | yes, smoke shards |
 | `tests/test_sdk_generate.py` | docker + `notconf` images | yes, smoke shards |
+| `tests/test_sdk_verify_ci.py` | docker + `notconf` images (reuses the container above) | yes, **blocking**, smoke shards |
 | `tests/test_srl_netconf.py` | SR Linux containerlab lab | yes, non-blocking (`ci-srl.yaml`) |
 | `tests/test_lab_device_netconf.py` | a real lab device | no, lab only |
 | `uv run sdk-verify` | a lab device (or simulator) | no, manual lab harness (see `docs/lab.md`) |
 
-CI: `ci-pr.yaml` (lint → typecheck → offline gate → smoke per family), `ci-nightly.yaml` (full 11-image matrix + `workflow_dispatch`), `ci-srl.yaml` (SR Linux; deploy/get-schema/generate block, pytest reports). `test_lab_device_netconf.py` is in no workflow — nothing it asserts gates a merge. A test that covers zero nodes skips with a reason rather than passing vacuously. Tests that build a generated client against a simulator pass `verify=False` explicitly with a comment; the `verify=True` default is never weakened for tests. NETCONF write read-backs run edit → `validate` → `commit`, skipping `validate` when `:validate` is not advertised (RFC 6241 §8.6.4.1 optional).
+CI: `ci-pr.yaml` (lint → typecheck → offline gate → smoke per family), `ci-nightly.yaml` (full 11-image matrix + `workflow_dispatch`), `ci-srl.yaml` (SR Linux; deploy/get-schema/generate block, pytest + `sdk-verify --tiers read,rpc,crud` report). `test_lab_device_netconf.py` is in no workflow — nothing it asserts gates a merge.
+
+`sdk-verify` is now a gate. `tests/test_sdk_verify_ci.py` calls the same verifier in-process, so it adds no container startup beyond what the smoke job already pays for; `ci-srl.yaml` runs the CLI itself with `crud`, which is a writer and so is confined to that lab job. It was a manual harness in no workflow until 2026-10-13, which is how the RESTCONF ancestor-envelope unwrap, the augment-closure gap, and the `ietf-notification-capabilities` model hole all shipped. A test that covers zero nodes skips with a reason rather than passing vacuously. Tests that build a generated client against a simulator pass `verify=False` explicitly with a comment; the `verify=True` default is never weakened for tests. NETCONF write read-backs run edit → `validate` → `commit`, skipping `validate` when `:validate` is not advertised (RFC 6241 §8.6.4.1 optional).
 
 Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored.
 
