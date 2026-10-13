@@ -7,16 +7,58 @@ from the environment — so the matrix carries a second ``devices`` list and
 ``lab_device`` resolves it without ever logging a credential or host value.
 """
 
+import importlib
 import json
 import os
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from yang2sdk.cli.downloader import YangDownloader
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATRIX_PATH = REPO_ROOT / "tests" / "notconf" / "matrix.json"
+
+TEMP_CLIENTS = REPO_ROOT / "temp" / "notconf_clients"
+TEMP_YANGS = REPO_ROOT / "temp" / "yang_modules"
+#: Run-local golden payloads (gitignored; strict comparison is follow-up work).
+GOLDEN_DIR = REPO_ROOT / "tests" / "fixtures" / "golden"
+
+#: Published notconf image defaults (tests/notconf/matrix.json "credentials").
+CREDS = ("admin", "admin")
+#: Interface name used by CRUD round-trips so writes never touch a real device.
+TEST_IF = "yang2sdk-test8"
+MAX_ROOTS = 6
+INFRA_PREFIXES = (
+    "ietf-netconf",
+    "ietf-restconf",
+    "ietf-yang",
+    "ietf-datastores",
+    "ietf-origin",
+    "ietf-subscribed",
+    "ietf-notification",
+    "iana-",
+    "sysrepo",
+    "notifications",
+    "nc-notifications",
+    "libnetconf2",
+    "netopeer",
+    "ietf-factory",
+    "ietf-tcp",
+    "ietf-tls",
+    "ietf-ssh",
+    "ietf-crypto",
+    "ietf-keystore",
+    "ietf-truststore",
+)
+
+#: slug -> {"image", "ep", "slug", "rest", "netc"}. Compiling a client costs
+#: minutes, so the cache is keyed by image and reused across test modules; the
+#: endpoint is refreshed on every hit because containers get ephemeral ports.
+_SDK_CACHE: dict[str, dict] = {}
 
 RUN_INTEGRATION = os.environ.get("NOTCONF_RUN_INTEGRATION") == "1"
 
@@ -209,6 +251,147 @@ def live_endpoint(notconf_image, notconf_container_factory, request):
     if "smoke" in (request.keywords or {}):
         assert entry.get("smoke", False), "smoke job got non-smoke image"
     return entry, notconf_container_factory(entry)
+
+
+# --- generated SDKs (shared by test_sdk_generate.py and test_sdk_verify_ci.py) -
+
+
+def _slug(image):
+    return f"{image['package']}_{image['tag']}".replace(".", "_").replace("-", "_")
+
+
+def _implemented_modules(ep):
+    import requests
+
+    r = requests.get(
+        ep["restconf_base"] + "/restconf/data/ietf-yang-library:modules-state",
+        auth=CREDS,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {
+        m["name"]
+        for m in r.json()["ietf-yang-library:modules-state"]["module"]
+        if m.get("implemented", True)
+    }
+
+
+def _download_yangs(ep):
+    """Download the device's YANG library using the *shipped* downloader.
+
+    This used to be a "mirror" of ``YangDownloader.download_all`` written out
+    in the test file, and the two had already diverged: the mirror deduped by
+    first-seen identifier, so it kept the *oldest* advertised revision of every
+    multi-revision module, while the shipped downloader had the same class of
+    bug differently. Duplicating the production code path meant the test could
+    go on exercising something the CLI never does. Call the real thing, so the
+    integration suite covers the code users actually run.
+    """
+    out = TEMP_YANGS / "notconf"
+    out.mkdir(parents=True, exist_ok=True)
+    # start from a clean slate: stale revisions from a previous run would be
+    # resolved by pyang and could mask a revision-selection regression.
+    for stale in out.glob("*.yang"):
+        stale.unlink()
+    dl = YangDownloader(
+        host=ep["netconf_host"],
+        port=ep["netconf_port"],
+        user=CREDS[0],
+        password=CREDS[1],
+        output_dir=out,
+    )
+    failed = dl.download_all()
+    files = sorted(out.glob("*.yang"))
+    assert files, "downloader retrieved no YANG modules"
+    assert failed == 0, f"downloader reported {failed} failed schema fetches"
+    return files
+
+
+def _pick_roots(yang_files, implemented):
+    by_name = {}
+    for f in yang_files:
+        by_name.setdefault(f.name.split("@")[0], f)
+    preferred = [n for n in ("ietf-interfaces", "ietf-system") if n in by_name]
+    vendor = [
+        n
+        for n in sorted(implemented)
+        if n in by_name
+        and not n.startswith(INFRA_PREFIXES)
+        and n not in ("ietf-interfaces", "ietf-system", "ietf-ip")
+    ]
+    names = preferred + vendor[:MAX_ROOTS]
+    if not names:  # minimal base image: first implemented modules with files
+        names = [n for n in sorted(implemented) if n in by_name][:3]
+    assert names, "no compilable root modules found"
+    return [by_name[n] for n in names]
+
+
+def _compile_all(yang_files, roots, slug):
+    """Compile via fresh interpreter per format.
+
+    In-process pyang runs cannot compile twice (global optparse registry
+    raises OptionConflictError on the second run), so each format gets its
+    own process. This also covers the real yang2restconf/yang2netconf CLIs.
+    """
+    yangs_dir = yang_files[0].parent
+    for fmt in ("restconf", "netconf"):
+        out = TEMP_CLIENTS / f"{slug}_{fmt}"
+        argv = [str(r) for r in roots] + [
+            "--device",
+            slug,
+            "--yang-dir",
+            str(yangs_dir),
+            "--output-dir",
+            str(out),
+        ]
+        code = (
+            "import sys; from yang2sdk.cli.compiler import run_compiler; "
+            f"run_compiler({fmt!r}, sys.argv[1:])"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, *argv],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=900,
+        )
+        assert proc.returncode == 0, f"{fmt} compile failed: {proc.stderr[-2000:]}"
+        assert (out / "__init__.py").exists()
+        assert (out / "session_manager.py").exists()
+        assert (out / "data_models").is_dir()
+        assert (out / "data_navigators").is_dir()
+
+
+def _import_pkg(slug, fmt):
+    if str(TEMP_CLIENTS) not in sys.path:
+        sys.path.insert(0, str(TEMP_CLIENTS))
+    return importlib.import_module(f"{slug}_{fmt}")
+
+
+@pytest.fixture(scope="function")
+def generated_sdks(live_endpoint):
+    image, ep = live_endpoint
+    slug = _slug(image)
+    if slug not in _SDK_CACHE:
+        yang_files = _download_yangs(ep)
+        assert yang_files, "get-schema returned no YANG modules"
+        implemented = _implemented_modules(ep)
+        roots = _pick_roots(yang_files, implemented)
+        _compile_all(yang_files, roots, slug)
+        rest = _import_pkg(slug, "restconf")
+        netc = _import_pkg(slug, "netconf")
+        assert rest.RestconfClient is not None and netc.NetconfClient is not None
+        _SDK_CACHE[slug] = {
+            "image": image,
+            "ep": ep,
+            "slug": slug,
+            "rest": rest,
+            "netc": netc,
+        }
+    else:
+        _SDK_CACHE[slug]["ep"] = ep  # refresh ephemeral ports per container
+    return _SDK_CACHE[slug]
 
 
 # --- real lab devices (matrix "devices" list) -------------------------------

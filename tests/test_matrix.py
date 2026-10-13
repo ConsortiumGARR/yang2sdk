@@ -4,6 +4,7 @@ import compileall
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,40 @@ MINIMAL_YANG = """module tmod {
   container top {
     leaf name {
       type string;
+    }
+  }
+}
+"""
+
+UNWRAP_YANG = """module tunwrap {
+  prefix tu;
+  namespace "urn:test:unwrap";
+  revision 2026-01-01;
+  container top {
+    container clock {
+      leaf timezone-name {
+        type string;
+      }
+    }
+    container ntp {
+      container server {
+        leaf addr {
+          type string;
+        }
+      }
+      leaf weight {
+        type uint32;
+      }
+    }
+    container dns {
+      container server {
+        leaf addr {
+          type string;
+        }
+      }
+      leaf port {
+        type uint16;
+      }
     }
   }
 }
@@ -268,6 +303,515 @@ def test_generate_rpc_free_module_compiles_and_imports(fmt, tmp_path):
         assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
     finally:
         sys.path.remove(str(tmp_path))
+
+
+def _gen_restconf(yang_text: str, name: str, tmp_path):
+    """Generate a RESTCONF client and return the package root on sys.path."""
+    yang = tmp_path / f"{name}.yang"
+    yang.write_text(yang_text)
+    out = tmp_path / f"{name}_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            name,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    # Don't hardcode the version directory: the default device_version differs
+    # between the console script and run_compiler(). The manifest is the
+    # authoritative statement of what was emitted.
+    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    pkg_root = out / manifest["package_name"]
+    assert pkg_root.is_dir(), f"expected package at {pkg_root}"
+    sys.path.insert(0, str(pkg_root.parent))
+    return str(pkg_root.parent), pkg_root.name
+
+
+def test_restconf_unwraps_a_reply_nested_under_the_ancestor(tmp_path):
+    """A reply keyed by an ANCESTOR's name must still unwrap (RFC 8040 §4.2).
+
+    Regression, measured on notconf-ietf 25.x: `GET /ietf-system:system/clock`
+    answers `{"ietf-system:system": {"clock": {}}}`. The node's own name
+    (`clock`) is not a top-level key, so the old lookup fell through to "assume
+    the whole response is my node" and handed the strict `SystemClock` model an
+    envelope — which `extra="forbid"` then correctly rejected, surfacing as
+    "Extra inputs are not permitted" at a node that is perfectly conformant.
+
+    RFC 8040 §4.2 identifies a resource by its URI, so the path the navigator
+    requested is the specification for reading the reply.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        nav = __import__(f"{pkg}.data_navigators.tunwrap", fromlist=["*"])
+
+        class _Stub:
+            """Returns one canned reply; records the paths actually requested."""
+
+            def __init__(self, payload):
+                self.payload = payload
+                self.seen = []
+
+            def _request(self, method, path, params=None, json=None):
+                self.seen.append(path)
+                return self.payload
+
+        payload = {
+            "tunwrap:top": {
+                "clock": {"timezone-name": "UTC"},
+                "ntp": {"server": {"addr": "NTP-VALUE"}, "weight": 1},
+                "dns": {"server": {"addr": "DNS-VALUE"}, "port": 53},
+            }
+        }
+        client = _Stub(payload)
+        top = nav.TopNode(client, "/data/tunwrap:top", "tunwrap:top")
+
+        assert top.clock.retrieve().timezone_name == "UTC"
+        assert "/data/tunwrap:top/clock" in client.seen
+    finally:
+        sys.path.remove(sys_root)
+
+
+def test_restconf_unwrap_never_returns_a_same_named_sibling(tmp_path):
+    """Walking the path must not land on a same-named leaf elsewhere (RFC 8040 §4.2).
+
+    This is the hazard that rules out the obvious fix. `tunwrap:top` has two
+    children named `server` (`ntp/server` and `dns/server`) — mirroring
+    ietf-system, which has both `ntp/server` and `dns-resolver/server`. A
+    recursive search for the leaf name resolves the ancestor-wrapped shape but
+    silently returns whichever `server` it meets first, i.e. the NTP servers
+    when DNS servers were asked for. That turns a loud failure into a wrong
+    answer, which is worse than the bug it fixes.
+
+    Only the requested path is reachable by walking segments, so a same-named
+    sibling is structurally out of reach.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        nav = __import__(f"{pkg}.data_navigators.tunwrap", fromlist=["*"])
+
+        class _Stub:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def _request(self, method, path, params=None, json=None):
+                return self.payload
+
+        payload = {
+            "tunwrap:top": {
+                "clock": {"timezone-name": "UTC"},
+                # ntp sorts before dns, so a name search finds NTP first.
+                "ntp": {"server": {"addr": "NTP-VALUE"}, "weight": 1},
+                "dns": {"server": {"addr": "DNS-VALUE"}, "port": 53},
+            }
+        }
+        client = _Stub(payload)
+        top = nav.TopNode(client, "/data/tunwrap:top", "tunwrap:top")
+
+        assert top.dns.server.retrieve().addr == "DNS-VALUE"
+        assert top.ntp.server.retrieve().addr == "NTP-VALUE"
+    finally:
+        sys.path.remove(sys_root)
+
+
+def test_restconf_unwrap_falls_back_when_the_reply_has_no_path(tmp_path):
+    """Already-unwrapped replies must keep working — no regression (RFC 8040 §4.2).
+
+    A server may answer with the resource itself rather than nesting it, and a
+    list instance's URI carries a predicate (`interface[name=eth0]`) that has no
+    JSON counterpart. Neither can be path-walked, so the historical name lookup
+    stays as the fallback. This test pins that the fallback still runs.
+    """
+    sys_root, pkg = _gen_restconf(UNWRAP_YANG, "tunwrap", tmp_path)
+    try:
+        base = __import__(f"{pkg}.data_navigators._base", fromlist=["*"])
+
+        # Already unwrapped: no path structure to walk.
+        assert (
+            base._unwrap_by_path({"addr": "1.1.1.1"}, "/data/t/top/dns/server") is None
+        )
+        assert base._unwrap_by_name({"addr": "1.1.1.1"}, "server") == {
+            "addr": "1.1.1.1"
+        }
+
+        # URI predicate: not a JSON member name, so the walk declines.
+        assert (
+            base._unwrap_by_path(
+                {"tunwrap:server": [{"addr": "x"}]}, "/data/t/top/server[name=x]"
+            )
+            is None
+        )
+
+        # A top-level resource still walks, and matches the old behaviour.
+        wrapped = {"tunwrap:top": {"clock": {}}}
+        assert base._unwrap_by_path(wrapped, "/data/tunwrap:top") == {"clock": {}}
+        assert base._unwrap_by_name(wrapped, "tunwrap:top") == {"clock": {}}
+
+        # Bare vs qualified segment equivalence (RFC 7951 §4).
+        assert base._member_matches("clock", "tunwrap:clock")
+        assert base._member_matches("tunwrap:clock", "clock")
+        assert not base._member_matches("ntp", "dns")
+
+        # A reply already keyed by the TARGET cannot be path-walked (the parent
+        # segment is absent), so the path layer declines and the name layer
+        # handles it — the layering working as designed.
+        assert (
+            base._unwrap_by_path({"tunwrap:clock": {}}, "/data/tunwrap:top/clock")
+            is None
+        )
+        assert base._unwrap_by_name({"tunwrap:clock": {}}, "clock") == {}
+        assert base._unwrap_by_name({"clock": {}}, "clock") == {}
+    finally:
+        sys.path.remove(sys_root)
+
+
+AUGMENTED_YANG = """module tbase {
+  prefix tb;
+  namespace "urn:test:tbase";
+  revision 2026-01-01;
+  container sysinfo {
+    leaf hostname {
+      type string;
+    }
+  }
+}
+"""
+
+AUGMENTING_YANG = """module tadd {
+  prefix ta;
+  namespace "urn:test:tadd";
+  import tbase { prefix tb; }
+  revision 2026-01-01;
+  augment "/tb:sysinfo" {
+    leaf load {
+      type uint32;
+    }
+  }
+}
+"""
+
+
+def test_augment_closure_is_expanded_by_default(tmp_path):
+    """A root module alone emits a model missing the augment's children.
+
+    RFC 7950 Sec 7.17: pyang expands an `augment` into its target only when
+    the augmenting module is on the command line. Naming `tbase` alone
+    produced a model with no `load` field, so a device answering with it --
+    which is conformant -- was rejected by `extra="forbid"`.
+
+    Measured on notconf-ietf: compiling `ietf-system` +
+    `ietf-system-capabilities` left `subscription-capabilities` entirely out of
+    the model, and reading `/system-capabilities/datastore-capabilities` failed
+    with six "Extra inputs are not permitted" errors.
+    """
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tbase.yang"]
+    expanded, provenance = expand_augment_closure(roots, tmp_path)
+
+    names = sorted(p.name for p in expanded)
+    assert names == ["tadd.yang", "tbase.yang"], names
+    assert provenance.get("tadd") == ["tbase"]
+
+
+def test_augment_closure_opt_out_keeps_the_requested_roots(tmp_path):
+    """--no-augment-closure must leave the caller's input untouched."""
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tbase.yang", tmp_path / "tadd.yang"]
+    expanded, _prov = expand_augment_closure(roots, tmp_path)
+    # Already complete: nothing to add, and both roots survive.
+    assert sorted(p.name for p in expanded) == ["tadd.yang", "tbase.yang"]
+
+
+def test_augment_closure_survives_an_unresolvable_root(tmp_path):
+    """An unreadable/foreign root degrades to a warning, never a failed compile."""
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    bogus = tmp_path / "not-a-module.yang"
+    bogus.write_text("this is not YANG\n")
+    roots = [bogus]
+    expanded, prov = expand_augment_closure(roots, tmp_path)
+    assert expanded == roots
+    assert prov == {}
+
+
+@pytest.mark.parametrize("no_closure", [False, True])
+def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
+    """The *compiler command* must pull the augment in, not just the helper.
+
+    The unit tests above pin `expand_augment_closure`; this pins that
+    `run_compiler` actually calls it. Without this, the wiring could be
+    reverted while every helper test still passed.
+    """
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    out = tmp_path / "tbase_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    cmd = [
+        sys.executable,
+        "-c",
+        code,
+        str(tmp_path / "tbase.yang"),
+        "--device",
+        "tbase",
+        "--yang-dir",
+        str(tmp_path),
+        "--output-dir",
+        str(out),
+    ]
+    if no_closure:
+        cmd.append("--no-augment-closure")
+    proc = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=300
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+
+    models = next(out.glob("*/data_models/tbase.py"), None)
+    assert models is not None, f"no generated model for tbase under {out}"
+    text = models.read_text()
+    has_augmented_field = "load" in text
+    # Default: the augment IS resolved into the model.
+    # --no-augment-closure: base only, which is exactly the defect being fixed.
+    assert has_augmented_field is not no_closure, (
+        f"no_closure={no_closure}: augmented field present={has_augmented_field}\n{text[:600]}"
+    )
+
+
+USED_ONLY_YANG = """module tused {
+  prefix td;
+  namespace "urn:test:tused";
+  import tgrp { prefix tg; }
+  revision 2026-01-01;
+  container holder {
+    uses tg:shared;
+  }
+}
+"""
+
+USED_ONLY_REFINED_YANG = """module tusedref {
+  prefix tur;
+  namespace "urn:test:tusedref";
+  import tgrp { prefix tg; }
+  revision 2026-01-01;
+  container holder {
+    uses tg:shared {
+      refine tag {
+        default "refined";
+      }
+    }
+  }
+}
+"""
+
+GROUPING_YANG = """module tgrp {
+  prefix tg;
+  namespace "urn:test:tgrp";
+  revision 2026-01-01;
+  grouping shared {
+    leaf tag {
+      type string;
+    }
+  }
+  container unrelated {
+    leaf other {
+      type string;
+    }
+  }
+}
+"""
+
+
+def test_augment_closure_excludes_uses_only_modules(tmp_path):
+    """A module reached only via `uses` must NOT become a compile root.
+
+    pyang resolves `uses`/`import` from the search path on its own, so listing
+    those modules on the command line is not needed to resolve them -- it only
+    promotes their own top-level nodes into the generated model. Measured on
+    the G30: walking the `uses` edge widened a 2-module compile to 108 and left
+    the emitted `ne` model byte-identical, i.e. all extra surface, no extra
+    correctness. `cli/closure.py` still offers the full closure via
+    `include_uses=True` for the cases that do need it.
+    """
+    (tmp_path / "tused.yang").write_text(USED_ONLY_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tused.yang"]
+    expanded, _prov = expand_augment_closure(roots, tmp_path)
+    assert [p.name for p in expanded] == ["tused.yang"], (
+        "a uses-only module was promoted to a root"
+    )
+
+    # The resolver still offers the wider closure when a caller asks for it.
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, _p = resolve_closure(["tused"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tused.yang"]
+
+
+def test_uses_regex_accepts_quoted_unquoted_and_refined(tmp_path):
+    """`_USES_RE` must see every legal `uses` form, and only cross-module ones.
+
+    Three real gaps, each found by running the pattern against the vendor trees
+    rather than by reading it:
+
+    * Unquoted `uses p:grouping;` (RFC 7950 Sec 6.2.1 permits it) matched
+      nothing. The old pattern hard-required quotes, so SR Linux and the notconf
+      images scored **0** uses references — the uses edge was dead for both.
+    * `uses p:grouping { refine ...; }` (RFC 7950 Sec 7.12) terminates with `{`,
+      not `;`. Requiring `;` dropped 60 references from the G30.
+    * `refuses "a:b";` must not match, hence the word boundary.
+    """
+    from yang2sdk.cli.closure import _USES_RE
+
+    def uses(text):
+        return _USES_RE.findall(text)
+
+    # All three terminator/quoting styles are cross-module references.
+    assert uses('uses "tg:shared";') == ["tg:shared"]
+    assert uses("uses tg:shared;") == ["tg:shared"]
+    assert uses('uses "tg:shared" {') == ["tg:shared"]
+    assert uses('uses\t"a:b";') == ["a:b"]
+
+    # Unprefixed: a grouping in the module's own namespace. Not an edge.
+    assert uses('uses "capabilities";') == []
+    assert uses('uses "fault-management" {') == []
+
+    # A longer identifier ending in the same text is captured whole.
+    assert uses('uses "tg:shared-extra";') == ["tg:shared-extra"]
+
+    # Keyword-embedded text is not a statement.
+    assert uses('refuses "a:b";') == []
+
+    # KNOWN LIMITATION, pinned deliberately: none of the patterns in
+    # closure.py strip comments or string literals, so a `description` that
+    # quotes YANG verbatim is read as a real reference. That is over-inclusive,
+    # never under-inclusive -- pyang still resolves the module either way, the
+    # worst case is one unnecessary module on the command line. Fixing it
+    # properly means stripping comments for every pattern here, which is a
+    # separate change; this assertion exists so the behaviour is recorded
+    # rather than discovered later.
+    assert uses('description "uses a:b;";') == ["a:b"]
+
+
+def test_uses_edge_pulls_in_unquoted_references(tmp_path):
+    """End-to-end: an unquoted `uses` must reach the resolver's fixpoint."""
+    (tmp_path / "tused.yang").write_text(USED_ONLY_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, prov = resolve_closure(["tused"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tused.yang"]
+    assert prov.get("tgrp") == ["tused"]
+
+
+def test_uses_edge_pulls_in_a_refined_uses(tmp_path):
+    """`uses "p:g" { refine ... }` terminates with `{`, not `;` (RFC 7950 §7.12)."""
+    (tmp_path / "tusedref.yang").write_text(USED_ONLY_REFINED_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, prov = resolve_closure(["tusedref"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tusedref.yang"]
+    assert prov.get("tgrp") == ["tusedref"]
+
+
+CASE_COLLIDE_BASE_YANG = """module tcollide {
+  prefix tc;
+  namespace "urn:test:case-collide";
+  revision 2026-01-01;
+  grouping shared {
+    leaf a {
+      type string;
+    }
+  }
+  container parent {
+    container CamelCase-items {
+      uses tc:shared;
+    }
+    container camelcase-items {
+      uses tc:shared;
+    }
+  }
+}
+"""
+
+
+def test_case_differing_siblings_are_not_merged_into_one_model(tmp_path):
+    """Two YANG nodes differing only in case must NOT share a model class.
+
+    Regression, measured on Cisco NX-OS 10.4-4 (2026-10-13). That model declares
+    BOTH `container gTimers-items` and `container gtimers-items`. YANG
+    identifiers are case-sensitive (RFC 7950 Sec 6.2), as are XML element
+    names, but both fold to the Python class name `GtimersItems`. The
+    equivalence check compared fields only, judged them equivalent, and
+    `_register_model` reused the first -- so the second node was silently
+    dropped and every read of it failed:
+
+        ParsingError: root element not found
+        (actual: ...gtimers-items, expected: ...gTimers-items)
+
+    Both models must survive, each with its own wire tag.
+    """
+    (tmp_path / "tcollide.yang").write_text(CASE_COLLIDE_BASE_YANG)
+    out = tmp_path / "tcollide_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(tmp_path / "tcollide.yang"),
+            "--device",
+            "tcollide",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    model = next(out.glob("*/data_models/tcollide.py"))
+    text = model.read_text()
+
+    classes = re.findall(r"^class (\w+)\(.*?tag=\"([^\"]+)\"", text, re.MULTILINE)
+    tags = [t for _, t in classes]
+    assert "camelcase-items" in tags, f"lowercase node lost its model: {classes}"
+    assert "CamelCase-items" in tags, f"camelCase node lost its model: {classes}"
+    # Distinct classes, not one reused twice.
+    assert len({t for t in tags}) == len(tags)
 
 
 def test_content_filter_prunes_nested_state(tmp_path):

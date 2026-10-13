@@ -35,7 +35,20 @@ _AUGMENT_RE = re.compile(r'augment\s+"([^"]+)"')
 # its data tree this way (one `ne:ne` container + `uses` of groupings exported
 # by ~60 modules), so an augment-only closure silently produced a model with
 # an empty container.
-_USES_RE = re.compile(r'uses\s+"([\w-]+:[\w-]+)"')
+#
+# The target may be unquoted (RFC 7950 Sec 6.2.1 permits an unquoted
+# identifier when it does not start with a digit), so the quotes are optional
+# here exactly as they are in _MODULE_RE / _SELF_PREFIX_RE / _IMPORT_RE above.
+# Requiring them missed every `uses p:grouping;` a vendor wrote unquoted.
+# An unprefixed `uses "local-grouping";` is deliberately NOT matched: it
+# refers to a grouping in the module's own namespace and pulls in nothing
+# external, so the closure must not treat it as a dependency edge.
+#
+# The statement terminates with `;` OR with a `{` opening a `refine` block
+# (RFC 7950 Sec 7.12: `uses grouping-name { refine ...; }`). Requiring `;`
+# alone silently dropped every refined `uses` -- 60 of them in the G30.
+# `\b` keeps `refuses "a:b";` from matching.
+_USES_RE = re.compile(r'\buses\s+"?([\w-]+:[\w-]+)"?\s*[;{]')
 _TARGET_PREFIX_RE = re.compile(r"([\w-]+):")
 
 
@@ -86,9 +99,11 @@ def _index_yang_dirs(
 
 
 def resolve_closure(
-    root_modules: list[str], yang_dirs: list[Path]
+    root_modules: list[str],
+    yang_dirs: list[Path],
+    include_uses: bool = True,
 ) -> tuple[list[Path], dict[str, list[str]]]:
-    """Resolve the transitive augment **and uses** closure over root modules.
+    """Resolve the transitive augment closure over root modules.
 
     Returns (ordered file list, provenance {included_module: [why-modules]}).
     Fixpoint over two edges:
@@ -97,6 +112,13 @@ def resolve_closure(
       ``/srl-system:system/srl-ssh:ssh-server`` where ``srl-ssh`` itself augments.
     * ``uses "p:grouping"`` — Groove G30: one ``ne:ne`` container pulls in ~60
       modules through groupings.
+
+    ``include_uses=False`` walks the augment edge only. That is the edge pyang
+    genuinely needs on the command line: it expands an augment into its target
+    only when the augmenting module is listed. ``uses``/``import`` are resolved
+    by pyang from the search path on its own, so adding those modules as roots
+    is not needed to resolve them -- on the G30 it widened a 2-module compile
+    to 108 with no change to the emitted ``ne`` model.
 
     ``if-feature``/deviations are recorded, not filtered here; the device
     feature set is applied by pyang at compile time (see ``cli/features.py``).
@@ -116,6 +138,8 @@ def resolve_closure(
             # grouping it instantiates, otherwise pyang cannot resolve the
             # reference and the container comes out empty.
             if mod in included:
+                if not include_uses:
+                    continue
                 for target in uses:
                     for pfx in _TARGET_PREFIX_RE.findall(target):
                         resolved = prefixes.get(pfx)

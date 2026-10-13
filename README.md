@@ -12,7 +12,7 @@ flowchart LR
 ```
 
 - **For network engineers:** [get an SDK in 4 commands](#for-network-engineers) · [write safely](docs/usage.md#netconf-write-safety) · [validate on lab](docs/lab.md)
-- **For contributors:** [gates and tests](#for-contributors) · [`docs/dev.md`](docs/dev.md) · [`AGENTS.md`](AGENTS.md)
+- **For contributors:** [gates and tests](#for-contributors) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`docs/dev.md`](docs/dev.md) · [`AGENTS.md`](AGENTS.md) · [`SECURITY.md`](SECURITY.md)
 
 Both targets share the same navigator intent — `retrieve` / `update` / `replace` / `create` / `delete`, RPC `__call__` — but the per-class surface is asymmetrical by protocol (e.g. RESTCONF plural lists expose `create`, not `update`; NETCONF plural lists expose `update`, not `delete`); only transport/encoding differs (JSON vs XML). See `docs/usage.md` and `AGENTS.md` parity table.
 
@@ -81,14 +81,18 @@ One package per device **and** OS version — different YANG revisions produce d
 ## For contributors
 
 ```bash
-uvx ruff check .
-uvx ruff format --check .
-uvx ty check
-uvx pyrefly check
-uv run pytest tests/test_matrix.py   # offline gate: no docker, no device
+uv sync --locked --group dev --extra lab
+uv run ruff check . && uv run ruff format --check . \
+  && uv run ty check && uv run pyrefly check \
+  && uv run pytest tests/test_matrix.py   # offline gate: no docker, no device
 ```
 
-`ruff` is the only linter/formatter. `ty` and `pyrefly` must both pass on `src/` (`temp/` output is excluded). Live-matrix tests need docker / lab gear — see [`docs/dev.md`](docs/dev.md) for the test/CI matrix and [`AGENTS.md`](AGENTS.md) for the normative generator contract.
+`ruff` is the only linter/formatter. `ty` and `pyrefly` must both pass on `src/`
+(`temp/` output is excluded). The four gates are pinned exactly and run from the
+venv, never via `uvx` — see [`docs/dev.md`](docs/dev.md#gates) for why, and for
+the bump procedure. Live-matrix tests need docker / lab gear — see
+[`docs/dev.md`](docs/dev.md) for the test/CI matrix and [`AGENTS.md`](AGENTS.md)
+for the normative generator contract.
 
 ## Docs
 
@@ -96,8 +100,10 @@ uv run pytest tests/test_matrix.py   # offline gate: no docker, no device
 | --- | --- | --- |
 | [`docs/usage.md`](docs/usage.md) | network engineer | Credentials, transport defaults, NETCONF write safety, RPCs/actions, packaging, HAL |
 | [`docs/lab.md`](docs/lab.md) | network engineer | `sdk-verify` tiers and write gates, simulator matrix, SR Linux job |
-| [`docs/dev.md`](docs/dev.md) | contributor | Lint, type-check, tests, CI, contribution guardrails |
+| [`docs/dev.md`](docs/dev.md) | contributor | Gates, tool pinning and the bump procedure, tests, CI |
 | [`AGENTS.md`](AGENTS.md) | contributor | Normative generator contract (IR ↔ templates, RFC compliance, safety) |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributor | Setup, the gate checklist, house rules |
+| [`SECURITY.md`](SECURITY.md) | security reporter | Scope, private reporting, credential and transport-default guarantees |
 
 ## Status
 

@@ -176,8 +176,8 @@ uv run sdk-verify --device <d>  # LAB ONLY, see §11
 ### Lint — `ruff` (blocking)
 
 ```bash
-uvx ruff check .
-uvx ruff format --check .
+uv run ruff check .
+uv run ruff format --check .
 ```
 
 `ruff` is the only formatter/linter. Do not introduce black/isort/flake8 configs.
@@ -185,10 +185,17 @@ uvx ruff format --check .
 ### Type-check — `ty` + `pyrefly` (both blocking)
 
 ```bash
-uvx ty check
-uvx pyrefly check
+uv run ty check
+uv run pyrefly check
 ```
 
+- **Run the gates with `uv run`, never `uvx`.** `ruff`, `ty` and `pyrefly` are pinned
+  *exactly* in the `dev` dependency group and `CI` runs `uv sync --locked`, so CI
+  installs what `uv.lock` says. `uvx <tool>` resolves the newest release per
+  invocation and can redden `main` with no commit to explain it — measured, not
+  hypothetical: `ty` 0.0.60 passed, 0.0.86 flags a deprecated `@contextmanager`
+  overload. Bump with `uv lock --upgrade-package <tool>` (procedure in
+  `docs/dev.md`).
 - Both must pass on `src/`. Astral `ty` and Meta `pyrefly` are complementary; a pass in one does not excuse a failure in the other.
 - Tool scoping lives in `pyproject.toml`: `[tool.ruff]` pins `target-version = "py312"` and excludes ephemeral `temp/` output; `[tool.pyrefly]` excludes `temp/`; `ty` needs no section (it respects `.gitignore`, which already covers `temp/`). There is no `[tool.pyright]` — pyright is gone, do not reintroduce it.
 - Generated code under `temp/` is excluded from blocking type-checks (it is ephemeral output), but templates that *produce* it are not — template edits must still type-check at the template level and via a generated sample.
@@ -196,8 +203,14 @@ uvx pyrefly check
 ## Testing and CI
 
 There is a `pytest` suite plus CI. `cli/sdk_verify.py` (`sdk-verify`) is the
-lab harness for full-SDK validation and is **not** a test gate; it was never in
-CI and must not be claimed as coverage.
+full-SDK validation harness. It is **no longer outside CI**:
+`tests/test_sdk_verify_ci.py` drives its verifier from pytest against the
+notconf containers the smoke matrix already starts, so it is a **blocking**
+gate per image (`read,rpc`), and `ci-srl.yaml` runs it with `crud` against the
+full SR Linux tree. That closed the gap that let three shipped defects survive:
+the RESTCONF ancestor-envelope unwrap (`7bdb8cd`), the NETCONF augment-closure
+gap, and the `ietf-notification-capabilities` model hole. Agents must not
+describe it as unenforced coverage.
 
 - `sdk-verify` tiers (LAB ONLY, both protocols, replaces the old `tester` script):
   - `read` — recursive walk of the entire navigator tree at bounded depth,
@@ -237,7 +250,7 @@ mismatch or a missing `ietf-interfaces` navigator skips them); NMDA discriminati
 documented factory-default race; `tests/test_srl_netconf.py` runs in CI but is **non-blocking**, so it
 reports rather than gates (and it carries one skip, `test_hostname_mutate_restore`, for two reasons
 documented in that file — neither of which is a generator defect); and
-`tests/test_lab_device_netconf.py` is in no CI workflow, so anything it asserts is not gating anything.
+`tests/test_lab_device_netconf.py` is in no CI workflow, so anything it asserts is not gating anything. `tests/test_sdk_verify_ci.py` **is** blocking, per image, for every `sdk-verify` `read`/`rpc` finding.
 - **A `skip` is not a pass.** The SDK suite skips deliberately and must say why: an image that
 implements no config modules, a node the simulator cannot read, a device without `:validate`. When a
 test covers zero nodes it must `pytest.skip`, never "succeed" vacuously.
