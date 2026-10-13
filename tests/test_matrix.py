@@ -4,6 +4,7 @@ import compileall
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -737,6 +738,80 @@ def test_uses_edge_pulls_in_a_refined_uses(tmp_path):
     wide, prov = resolve_closure(["tusedref"], [tmp_path], include_uses=True)
     assert sorted(p.name for p in wide) == ["tgrp.yang", "tusedref.yang"]
     assert prov.get("tgrp") == ["tusedref"]
+
+
+CASE_COLLIDE_BASE_YANG = """module tcollide {
+  prefix tc;
+  namespace "urn:test:case-collide";
+  revision 2026-01-01;
+  grouping shared {
+    leaf a {
+      type string;
+    }
+  }
+  container parent {
+    container CamelCase-items {
+      uses tc:shared;
+    }
+    container camelcase-items {
+      uses tc:shared;
+    }
+  }
+}
+"""
+
+
+def test_case_differing_siblings_are_not_merged_into_one_model(tmp_path):
+    """Two YANG nodes differing only in case must NOT share a model class.
+
+    Regression, measured on Cisco NX-OS 10.4-4 (2026-10-13). That model declares
+    BOTH `container gTimers-items` and `container gtimers-items`. YANG
+    identifiers are case-sensitive (RFC 7950 Sec 6.2), as are XML element
+    names, but both fold to the Python class name `GtimersItems`. The
+    equivalence check compared fields only, judged them equivalent, and
+    `_register_model` reused the first -- so the second node was silently
+    dropped and every read of it failed:
+
+        ParsingError: root element not found
+        (actual: ...gtimers-items, expected: ...gTimers-items)
+
+    Both models must survive, each with its own wire tag.
+    """
+    (tmp_path / "tcollide.yang").write_text(CASE_COLLIDE_BASE_YANG)
+    out = tmp_path / "tcollide_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(tmp_path / "tcollide.yang"),
+            "--device",
+            "tcollide",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    model = next(out.glob("*/data_models/tcollide.py"))
+    text = model.read_text()
+
+    classes = re.findall(r"^class (\w+)\(.*?tag=\"([^\"]+)\"", text, re.MULTILINE)
+    tags = [t for _, t in classes]
+    assert "camelcase-items" in tags, f"lowercase node lost its model: {classes}"
+    assert "CamelCase-items" in tags, f"camelCase node lost its model: {classes}"
+    # Distinct classes, not one reused twice.
+    assert len({t for t in tags}) == len(tags)
 
 
 def test_content_filter_prunes_nested_state(tmp_path):

@@ -291,6 +291,17 @@ class IRBuilder:
 
     def _models_are_equivalent(self, m1: IRModel, m2: IRModel) -> bool:
         """Determines if two models are semantically equivalent."""
+        # The wire name is part of the model's identity. YANG identifiers are
+        # case-sensitive (RFC 7950 Sec 6.2) and XML element names likewise, so
+        # `gTimers-items` and `gtimers-items` are two DISTINCT nodes that both
+        # fold to the same Python class name. Comparing fields alone judged them
+        # equivalent and _register_model then reused the first class, silently
+        # dropping the second: measured on Cisco NX-OS 10.4-4, reading
+        # /System/mldsnoop-items/inst-items/dom-items/gl-items/gtimers-items
+        # failed with "root element not found (actual: ...gtimers-items,
+        # expected: ...gTimers-items)" — the model kept the igmpsnoop tag.
+        if m1.yang_name != m2.yang_name:
+            return False
         if m1.is_rpc_envelope != m2.is_rpc_envelope:
             return False
         if m1.rpc_input_cls != m2.rpc_input_cls:
