@@ -600,6 +600,145 @@ def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
     )
 
 
+USED_ONLY_YANG = """module tused {
+  prefix td;
+  namespace "urn:test:tused";
+  import tgrp { prefix tg; }
+  revision 2026-01-01;
+  container holder {
+    uses tg:shared;
+  }
+}
+"""
+
+USED_ONLY_REFINED_YANG = """module tusedref {
+  prefix tur;
+  namespace "urn:test:tusedref";
+  import tgrp { prefix tg; }
+  revision 2026-01-01;
+  container holder {
+    uses tg:shared {
+      refine tag {
+        default "refined";
+      }
+    }
+  }
+}
+"""
+
+GROUPING_YANG = """module tgrp {
+  prefix tg;
+  namespace "urn:test:tgrp";
+  revision 2026-01-01;
+  grouping shared {
+    leaf tag {
+      type string;
+    }
+  }
+  container unrelated {
+    leaf other {
+      type string;
+    }
+  }
+}
+"""
+
+
+def test_augment_closure_excludes_uses_only_modules(tmp_path):
+    """A module reached only via `uses` must NOT become a compile root.
+
+    pyang resolves `uses`/`import` from the search path on its own, so listing
+    those modules on the command line is not needed to resolve them -- it only
+    promotes their own top-level nodes into the generated model. Measured on
+    the G30: walking the `uses` edge widened a 2-module compile to 108 and left
+    the emitted `ne` model byte-identical, i.e. all extra surface, no extra
+    correctness. `cli/closure.py` still offers the full closure via
+    `include_uses=True` for the cases that do need it.
+    """
+    (tmp_path / "tused.yang").write_text(USED_ONLY_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tused.yang"]
+    expanded, _prov = expand_augment_closure(roots, tmp_path)
+    assert [p.name for p in expanded] == ["tused.yang"], (
+        "a uses-only module was promoted to a root"
+    )
+
+    # The resolver still offers the wider closure when a caller asks for it.
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, _p = resolve_closure(["tused"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tused.yang"]
+
+
+def test_uses_regex_accepts_quoted_unquoted_and_refined(tmp_path):
+    """`_USES_RE` must see every legal `uses` form, and only cross-module ones.
+
+    Three real gaps, each found by running the pattern against the vendor trees
+    rather than by reading it:
+
+    * Unquoted `uses p:grouping;` (RFC 7950 Sec 6.2.1 permits it) matched
+      nothing. The old pattern hard-required quotes, so SR Linux and the notconf
+      images scored **0** uses references — the uses edge was dead for both.
+    * `uses p:grouping { refine ...; }` (RFC 7950 Sec 7.12) terminates with `{`,
+      not `;`. Requiring `;` dropped 60 references from the G30.
+    * `refuses "a:b";` must not match, hence the word boundary.
+    """
+    from yang2sdk.cli.closure import _USES_RE
+
+    def uses(text):
+        return _USES_RE.findall(text)
+
+    # All three terminator/quoting styles are cross-module references.
+    assert uses('uses "tg:shared";') == ["tg:shared"]
+    assert uses("uses tg:shared;") == ["tg:shared"]
+    assert uses('uses "tg:shared" {') == ["tg:shared"]
+    assert uses('uses\t"a:b";') == ["a:b"]
+
+    # Unprefixed: a grouping in the module's own namespace. Not an edge.
+    assert uses('uses "capabilities";') == []
+    assert uses('uses "fault-management" {') == []
+
+    # A longer identifier ending in the same text is captured whole.
+    assert uses('uses "tg:shared-extra";') == ["tg:shared-extra"]
+
+    # Keyword-embedded text is not a statement.
+    assert uses('refuses "a:b";') == []
+
+    # KNOWN LIMITATION, pinned deliberately: none of the patterns in
+    # closure.py strip comments or string literals, so a `description` that
+    # quotes YANG verbatim is read as a real reference. That is over-inclusive,
+    # never under-inclusive -- pyang still resolves the module either way, the
+    # worst case is one unnecessary module on the command line. Fixing it
+    # properly means stripping comments for every pattern here, which is a
+    # separate change; this assertion exists so the behaviour is recorded
+    # rather than discovered later.
+    assert uses('description "uses a:b;";') == ["a:b"]
+
+
+def test_uses_edge_pulls_in_unquoted_references(tmp_path):
+    """End-to-end: an unquoted `uses` must reach the resolver's fixpoint."""
+    (tmp_path / "tused.yang").write_text(USED_ONLY_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, prov = resolve_closure(["tused"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tused.yang"]
+    assert prov.get("tgrp") == ["tused"]
+
+
+def test_uses_edge_pulls_in_a_refined_uses(tmp_path):
+    """`uses "p:g" { refine ... }` terminates with `{`, not `;` (RFC 7950 §7.12)."""
+    (tmp_path / "tusedref.yang").write_text(USED_ONLY_REFINED_YANG)
+    (tmp_path / "tgrp.yang").write_text(GROUPING_YANG)
+    from yang2sdk.cli.closure import resolve_closure
+
+    wide, prov = resolve_closure(["tusedref"], [tmp_path], include_uses=True)
+    assert sorted(p.name for p in wide) == ["tgrp.yang", "tusedref.yang"]
+    assert prov.get("tgrp") == ["tusedref"]
+
+
 def test_content_filter_prunes_nested_state(tmp_path):
     """model_dump(content=...) prunes state nodes at every depth (RFC 8040 §4.5.2).
 

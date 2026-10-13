@@ -48,7 +48,7 @@ _AUGMENT_RE = re.compile(r'augment\s+"([^"]+)"')
 # (RFC 7950 Sec 7.12: `uses grouping-name { refine ...; }`). Requiring `;`
 # alone silently dropped every refined `uses` -- 60 of them in the G30.
 # `\b` keeps `refuses "a:b";` from matching.
-_USES_RE = re.compile(r'uses\s+"([\w-]+:[\w-]+)"')
+_USES_RE = re.compile(r'\buses\s+"?([\w-]+:[\w-]+)"?\s*[;{]')
 _TARGET_PREFIX_RE = re.compile(r"([\w-]+):")
 
 
