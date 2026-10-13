@@ -480,6 +480,126 @@ def test_restconf_unwrap_falls_back_when_the_reply_has_no_path(tmp_path):
         sys.path.remove(sys_root)
 
 
+AUGMENTED_YANG = """module tbase {
+  prefix tb;
+  namespace "urn:test:tbase";
+  revision 2026-01-01;
+  container sysinfo {
+    leaf hostname {
+      type string;
+    }
+  }
+}
+"""
+
+AUGMENTING_YANG = """module tadd {
+  prefix ta;
+  namespace "urn:test:tadd";
+  import tbase { prefix tb; }
+  revision 2026-01-01;
+  augment "/tb:sysinfo" {
+    leaf load {
+      type uint32;
+    }
+  }
+}
+"""
+
+
+def test_augment_closure_is_expanded_by_default(tmp_path):
+    """A root module alone emits a model missing the augment's children.
+
+    RFC 7950 Sec 7.17: pyang expands an `augment` into its target only when
+    the augmenting module is on the command line. Naming `tbase` alone
+    produced a model with no `load` field, so a device answering with it --
+    which is conformant -- was rejected by `extra="forbid"`.
+
+    Measured on notconf-ietf: compiling `ietf-system` +
+    `ietf-system-capabilities` left `subscription-capabilities` entirely out of
+    the model, and reading `/system-capabilities/datastore-capabilities` failed
+    with six "Extra inputs are not permitted" errors.
+    """
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tbase.yang"]
+    expanded, provenance = expand_augment_closure(roots, tmp_path)
+
+    names = sorted(p.name for p in expanded)
+    assert names == ["tadd.yang", "tbase.yang"], names
+    assert provenance.get("tadd") == ["tbase"]
+
+
+def test_augment_closure_opt_out_keeps_the_requested_roots(tmp_path):
+    """--no-augment-closure must leave the caller's input untouched."""
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    roots = [tmp_path / "tbase.yang", tmp_path / "tadd.yang"]
+    expanded, _prov = expand_augment_closure(roots, tmp_path)
+    # Already complete: nothing to add, and both roots survive.
+    assert sorted(p.name for p in expanded) == ["tadd.yang", "tbase.yang"]
+
+
+def test_augment_closure_survives_an_unresolvable_root(tmp_path):
+    """An unreadable/foreign root degrades to a warning, never a failed compile."""
+    from yang2sdk.cli.compiler import expand_augment_closure
+
+    bogus = tmp_path / "not-a-module.yang"
+    bogus.write_text("this is not YANG\n")
+    roots = [bogus]
+    expanded, prov = expand_augment_closure(roots, tmp_path)
+    assert expanded == roots
+    assert prov == {}
+
+
+@pytest.mark.parametrize("no_closure", [False, True])
+def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
+    """The *compiler command* must pull the augment in, not just the helper.
+
+    The unit tests above pin `expand_augment_closure`; this pins that
+    `run_compiler` actually calls it. Without this, the wiring could be
+    reverted while every helper test still passed.
+    """
+    (tmp_path / "tbase.yang").write_text(AUGMENTED_YANG)
+    (tmp_path / "tadd.yang").write_text(AUGMENTING_YANG)
+    out = tmp_path / "tbase_restconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    cmd = [
+        sys.executable,
+        "-c",
+        code,
+        str(tmp_path / "tbase.yang"),
+        "--device",
+        "tbase",
+        "--yang-dir",
+        str(tmp_path),
+        "--output-dir",
+        str(out),
+    ]
+    if no_closure:
+        cmd.append("--no-augment-closure")
+    proc = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=300
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+
+    models = next(out.glob("*/data_models/tbase.py"), None)
+    assert models is not None, f"no generated model for tbase under {out}"
+    text = models.read_text()
+    has_augmented_field = "load" in text
+    # Default: the augment IS resolved into the model.
+    # --no-augment-closure: base only, which is exactly the defect being fixed.
+    assert has_augmented_field is not no_closure, (
+        f"no_closure={no_closure}: augmented field present={has_augmented_field}\n{text[:600]}"
+    )
+
+
 def test_content_filter_prunes_nested_state(tmp_path):
     """model_dump(content=...) prunes state nodes at every depth (RFC 8040 §4.5.2).
 

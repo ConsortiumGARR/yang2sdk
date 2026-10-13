@@ -273,6 +273,17 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         help="Ignore <yang-dir>/features.json and compile with pyang defaults.",
     )
     parser.add_argument(
+        "--no-augment-closure",
+        dest="no_augment_closure",
+        action="store_true",
+        help=(
+            "Compile exactly the root modules named, without pulling in the "
+            "modules that augment them. Only use when you deliberately want a "
+            "base-only model; RFC 7950 Sec 7.17 augments the device implements "
+            'will then be missing and extra="forbid" will reject its replies.'
+        ),
+    )
+    parser.add_argument(
         "--ignore-error",
         dest="ignore_errors",
         action="append",
@@ -320,9 +331,18 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         use_device_features=parsed_args.use_device_features,
     )
 
+    # RFC 7950 Sec 7.17: pyang expands an `augment` only when the augmenting
+    # module is on the command line. Without this, a root module alone emits a
+    # model missing the augmented children the device actually returns, and
+    # `extra="forbid"` then rejects a conformant reply.
+    roots: list[str] = [str(r) for r in parsed_args.yang_modules]
+    if not parsed_args.no_augment_closure:
+        expanded, _prov = expand_augment_closure([Path(r) for r in roots], yang_dir)
+        roots = [str(p) for p in expanded]
+
     compile_in_process(
         format_type=format_type,
-        yang_modules=parsed_args.yang_modules,
+        yang_modules=roots,
         device=parsed_args.device,
         yang_dir=str(yang_dir),
         output_dir=parsed_args.output_dir,
@@ -466,6 +486,71 @@ def _run_model_gap_check(
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def expand_augment_closure(
+    roots: Sequence[Path], yang_dir: Path
+) -> tuple[list[Path], dict[str, list[str]]]:
+    """Add every module that augments the requested roots (transitively).
+
+    Walks the augment edge only -- see the ``include_uses=False`` note at the
+    call site for why `uses` is deliberately excluded.
+
+    pyang expands an `augment` into its target only when the *augmenting*
+    module is also on the command line (RFC 7950 Sec 7.17). Naming a root
+    module alone therefore emits a model carrying only the base children,
+    while the device answers with the fully-augmented subtree -- and strict
+    `extra="forbid"` models reject that reply. Measured on notconf-ietf
+    (2026-10-13): compiling `ietf-system` + `ietf-system-capabilities`
+    produced a model with no `subscription-capabilities` field at all, so
+    reading `/system-capabilities/datastore-capabilities` failed with six
+    "Extra inputs are not permitted" errors. With the closure applied the
+    same read passes.
+
+    This is the same resolution `cli/closure.py` performs, and the same one
+    `ci-srl.yaml` currently has to run by hand. Doing it here means a caller
+    cannot generate a silently-wrong model by forgetting to.
+
+    Resolution failure is deliberately non-fatal: a module that cannot be
+    read, or a root named by a file outside `yang_dir`, leaves the caller's
+    input untouched rather than failing a compile that would otherwise work.
+    """
+    from yang2sdk.cli.closure import _parse_yang, resolve_closure
+
+    root_names: list[str] = []
+    seen: set[str] = set()
+    for path in roots:
+        module, _, _, _ = _parse_yang(Path(path))
+        if module and module not in seen:
+            seen.add(module)
+            root_names.append(module)
+    if not root_names:
+        return list(roots), {}
+
+    try:
+        # include_uses=False: the augment edge is what pyang needs on the
+        # command line. `uses`/`import` resolve from the search path on their
+        # own, and adding those modules as roots widened a G30 2-module compile
+        # to 108 without changing the emitted model.
+        files, provenance = resolve_closure(
+            root_names, [Path(yang_dir)], include_uses=False
+        )
+    except (FileNotFoundError, OSError) as e:
+        print(
+            f"Warning: augment-closure resolution skipped ({e}); compiling the "
+            "requested roots only.",
+            file=sys.stderr,
+        )
+        return list(roots), {}
+
+    requested = {str(Path(p).resolve()) for p in roots}
+    added = [f for f in files if str(f.resolve()) not in requested]
+    if added:
+        print(
+            f"augment closure: {len(roots)} root(s) -> {len(files)} module(s) "
+            f"(+{len(added)} pulled in by augment)"
+        )
+    return list(files), provenance
 
 
 def restconf() -> None:
