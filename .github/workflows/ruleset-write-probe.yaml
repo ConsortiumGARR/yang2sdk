@@ -1,0 +1,43 @@
+# STRESS-TEST PROBE — temporary, safe to delete.
+# Verifies that a GITHUB_TOKEN with `permissions: rules: write` can actually
+# PUT a ruleset from an Actions context. It reads the ruleset and writes the
+# identical object back (no semantic change), then reports the HTTP status.
+name: ruleset-write-probe
+
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  rules: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: No-op ruleset round-trip PUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="ConsortiumGARR/yang2sdk"
+          RULESET="25119636"
+          echo "before: $(gh api repos/$REPO/rulesets/$RULESET --jq '.rules | map(.type) | join(",")')"
+          gh api "repos/$REPO/rulesets/$RULESET" > /tmp/ruleset.json
+          # writable shape = exactly the fields the PUT endpoint accepts
+          jq '{name, target, enforcement, conditions, bypass_actors, rules}' /tmp/ruleset.json > /tmp/writable.json
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/writable.json \
+            "https://api.github.com/repos/$REPO/rulesets/$RULESET")
+          echo "PUT status: $code"
+          head -c 400 /tmp/resp.json; echo
+          echo "after: $(gh api repos/$REPO/rulesets/$RULESET --jq '.rules | map(.type) | join(",")')"
+          if [ "$code" != "200" ]; then
+            echo "::error::GITHUB_TOKEN rules:write NOT honored (HTTP $code)"
+            exit 1
+          fi
+          echo "::notice::GITHUB_TOKEN rules:write HONORED (HTTP $code, no-op round-trip OK)"
