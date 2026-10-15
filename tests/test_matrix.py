@@ -4,6 +4,7 @@ import compileall
 import importlib
 import inspect
 import json
+import os
 import re
 import subprocess
 import sys
@@ -598,6 +599,176 @@ def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
     # --no-augment-closure: base only, which is exactly the defect being fixed.
     assert has_augmented_field is not no_closure, (
         f"no_closure={no_closure}: augmented field present={has_augmented_field}\n{text[:600]}"
+    )
+
+
+def test_generated_package_name_matches_the_matrix_slug():
+    """`--device` + `--device-version` must yield exactly `_slug(image)`.
+
+    `core.py` builds the package name as
+    `_sanitize_pkg(f"{device}_{device_version}")`, while `conftest._slug`
+    names the output directory `f"{package}_{tag}"`. If the two drift, the
+    installable package (`out/<package_name>/`) is named differently from the
+    directory the tests import, and the generated README advertises an import
+    name that does not match what `uv add` installs.
+
+    Measured before this was pinned: notconf-cisco-nx 10.4-4 produced
+    `notconf_cisco_nx_10_4_4_0_0_0` where the slug is `notconf_cisco_nx_10_4_4`
+    -- the version appeared twice because the version-bearing slug was passed
+    as `--device` AND the version was appended again.
+
+    Runs offline over every matrix entry, so the awkward tags are covered
+    (`21.1R1`, `10.4-4`, `762`, `latest`) without paying for a compile.
+
+    NOTE: this is a naming-scheme cross-check only. It holds by construction
+    and therefore does NOT catch the `--device` wiring regression; that is
+    what `test_compile_all_names_the_installable_package_from_the_matrix_slug`
+    pins, by actually compiling.
+    """
+    from tests.conftest import _slug, load_matrix
+    from yang2sdk.plugin.src.core import _sanitize_pkg
+
+    images = load_matrix()["images"]
+    assert images, "matrix declares no images"
+    for image in images:
+        want = _slug(image)
+        got = _sanitize_pkg(f"{image['package']}_{image['tag']}")
+        assert got == want, (
+            f"{image['package']}:{image['tag']}: package name {got!r} != "
+            f"directory slug {want!r}; the installable copy and the imported "
+            f"directory would disagree"
+        )
+
+
+def test_compile_all_names_the_installable_package_from_the_matrix_slug(
+    tmp_path, monkeypatch
+):
+    """`_compile_all` must make the installable package name == the slug.
+
+    The installable copy is `out/<package_name>/` (core.py "Namespaced
+    installable copy") while the tests import the flat copy at `out/`. If
+    those two names drift, `uv add` installs a package under one name and the
+    generated README tells the consumer to import another.
+
+    Measured before this was fixed: notconf-cisco-nx 10.4-4 produced
+    `notconf_cisco_nx_10_4_4_0_0_0` where the slug is `notconf_cisco_nx_10_4_4`
+    -- the version appeared twice, because the version-bearing slug was passed
+    as `--device` and then the version was appended again. `4.8.0` from an
+    unrelated `$DEVICE_VERSION` made it worse.
+
+    This compiles a real (tiny) module through the real `_compile_all`, so it
+    fails if the `--device` / `--device-version` wiring is reverted. It is
+    offline and takes seconds; the version-prefix invariant itself is checked
+    for every matrix tag by the sibling test above.
+    """
+    from tests import conftest
+
+    (tmp_path / "tmod.yang").write_text(MINIMAL_YANG)
+    monkeypatch.setattr(conftest, "TEMP_CLIENTS", tmp_path / "clients")
+    image = {"package": "notconf-cisco-nx", "tag": "10.4-4"}
+
+    conftest._compile_all([tmp_path / "tmod.yang"], [tmp_path / "tmod.yang"], image)
+
+    slug = conftest._slug(image)
+    out = tmp_path / "clients" / f"{slug}_restconf"
+    assert (out / "__init__.py").exists(), "flat importable copy missing"
+    # The installable copy is named from --device/--device-version, NOT from
+    # the slug passed as --device. This is the assertion that catches the bug.
+    assert (out / slug).is_dir(), (
+        f"installable copy is not named {slug}; found "
+        f"{sorted(p.name for p in out.iterdir())}"
+    )
+    assert not (out / f"{slug}_0_0_0").exists(), "device version double-encoded"
+    pyproject = (out / "pyproject.toml").read_text()
+    assert f'name = "{slug}"' in pyproject, pyproject[:400]
+    assert f'packages = ["{slug}"]' in pyproject, pyproject[:400]
+    # PEP 440: 10.4-4 -> 10.4.4
+    assert 'version = "10.4.4"' in pyproject, pyproject[:400]
+
+
+def test_device_version_env_fallback_is_scoped_to_its_own_device(monkeypatch):
+    """`$DEVICE_VERSION` must only apply to the device `$DEVICE_NAME` names.
+
+    The two are one pair describing ONE lab device -- `.env.example` exports
+    them beside DEVICE_IP / DEVICE_USER / DEVICE_PASS -- and `--device`
+    inherits `$DEVICE_NAME`. Before this, any compile in a `.env`-loaded shell
+    stamped that single device's OS version onto EVERY client: a
+    notconf-cisco-nx 10.4-4 image produced package `notconf_cisco_nx_10_4_4_4_8_0`,
+    version `4.8.0`, and a README claiming "version 4.8.0".
+
+    The wrong value lands in the package name, the package version and the
+    generated README -- publishable metadata -- so this is a provenance bug,
+    not a cosmetic one. Models and navigators never saw the value.
+    """
+    from yang2sdk.cli.compiler import _resolve_device_version
+
+    # conftest loads an untracked local .env into os.environ, so both names must
+    # be cleared before each case or this passes locally and fails in CI.
+    monkeypatch.delenv("DEVICE_NAME", raising=False)
+    monkeypatch.delenv("DEVICE_VERSION", raising=False)
+
+    # Nothing in the environment: never a version, whatever the device.
+    assert _resolve_device_version(None, "cisco-nx") == ""
+
+    monkeypatch.setenv("DEVICE_NAME", "g30lab")
+    monkeypatch.setenv("DEVICE_VERSION", "1.4.0")
+
+    # The device those variables actually describe: documented behaviour, kept.
+    assert _resolve_device_version(None, "g30lab") == "1.4.0"
+    # Any other device must not inherit it. This is the regression.
+    assert _resolve_device_version(None, "cisco-nx") == ""
+    # An explicit flag always wins, for any device.
+    assert _resolve_device_version("9.9.9", "cisco-nx") == "9.9.9"
+    assert _resolve_device_version("9.9.9", "g30lab") == "9.9.9"
+    # An explicit "" is a deliberate "no version", not a request to fall back:
+    # otherwise `--device-version ""` would silently resurrect the env value.
+    assert _resolve_device_version("", "g30lab") == ""
+
+
+def test_cli_does_not_stamp_a_foreign_device_version(tmp_path):
+    """Wiring: `run_compiler` must actually apply the scoping above.
+
+    The unit test pins `_resolve_device_version`; this pins that the CLI calls
+    it. Without this the scoping could be reverted while every helper test
+    still passed -- the same failure mode `test_cli_applies_augment_closure_
+    end_to_end` guards against for the augment closure.
+    """
+    (tmp_path / "tmod.yang").write_text(MINIMAL_YANG)
+    out = tmp_path / "out"
+    env = {**os.environ, "DEVICE_NAME": "g30lab", "DEVICE_VERSION": "9.9.9"}
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('restconf', sys.argv[1:])"
+    )
+    cmd = [
+        sys.executable,
+        "-c",
+        code,
+        str(tmp_path / "tmod.yang"),
+        "--device",
+        "someotherdevice",
+        "--yang-dir",
+        str(tmp_path),
+        "--output-dir",
+        str(out),
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    pyproject = (out / "pyproject.toml").read_text()
+    assert "9.9.9" not in pyproject, (
+        f"foreign DEVICE_VERSION leaked into the package metadata:\n{pyproject}"
+    )
+    readme = (out / "README.md").read_text()
+    assert "9.9.9" not in readme, (
+        f"foreign DEVICE_VERSION leaked into the generated README:\n{readme[:600]}"
     )
 
 
