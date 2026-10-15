@@ -1,0 +1,77 @@
+name: release
+
+# Publishes to PyPI when a `v*` tag is pushed. Nothing here runs on a PR, so
+# this workflow is deliberately NOT part of `ci-pr`'s `ci-gate` needs list
+# (AGENTS.md: `main` requires only that one stable check name).
+#
+# Tagging without this workflow shipped nothing — the repo had no publish job
+# at all, which is why v0.1.0 needed one written from scratch.
+#
+# One-time setup (PyPI side, not automatable from this repo):
+#   * Preferred: configure "Trusted Publishing" for this repo on PyPI. No
+#     secret is needed at all, and the `PYPI_TOKEN` environment reference
+#     below stays empty.
+#   * Otherwise create a PyPI API token scoped to this project and add it as
+#     the repository secret `PYPI_TOKEN`.
+#   Either way the `environment: pypi` gate below should be created in the
+#   repo settings so publishing requires an approver.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Read pyproject version
+        id: version
+        run: |
+          uv run python -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])'
+
+      - name: Fail if the tag does not match pyproject
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          if [ "$want" != "${{ steps.version.outputs.value }}" ]; then
+            echo "tag $GITHUB_REF_NAME implies $want but pyproject.toml says ${{ steps.version.outputs.value }}" >&2
+            exit 1
+          fi
+
+      - run: uv build --out-dir dist
+
+      # --strict: fail on anything PyPI would reject, so a rejected upload is
+      # caught here rather than after the tag is already public.
+      - run: uv run --with twine twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      # id-token is what Trusted Publishing needs; harmless when a token is used.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # With no `password` this uses Trusted Publishing (OIDC). With
+      # PYPI_TOKEN set in the environment it falls back to that token. The
+      # value is passed via `env`, never interpolated into the `with:` block,
+      # so it cannot be echoed into a log.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}

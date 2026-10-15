@@ -82,6 +82,46 @@ CI: `ci-pr.yaml` (lint → typecheck → offline gate → smoke per family), `ci
 
 Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored.
 
+## Releasing
+
+There was no release process before `v0.1.0` (2026-10-15): no publish workflow,
+no tag convention, and 57KB of changelog sitting under `[Unreleased]`. This is it.
+
+**Tag convention:** `v<MAJOR>.<MINOR>.<PATCH>`, matching `pyproject.toml`'s
+`version` exactly — `v0.1.0`, never `0.1.0` and never a bare `0.1.0-dev`. The
+`release.yaml` build job asserts `tag == pyproject version` and fails the run on
+mismatch, so a drifted tag cannot publish.
+
+Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
+conference tags, not releases. They do not match a version and nothing
+publishes from them (`release.yaml` triggers only on `v*`).
+
+**Procedure:**
+
+1. Land the code, gates green, on `main`.
+2. Promote `## [Unreleased]` in `CHANGELOG.md` to `## [<version>] - <YYYY-MM-DD>`
+   and leave a fresh empty `## [Unreleased]` above it.
+3. Bump `version` in `pyproject.toml` if it does not already match.
+4. `git tag -a v<version> -m "<version>"` and `git push origin main --tags`.
+
+Pushing the tag triggers `.github/workflows/release.yaml`, which builds,
+runs `twine check --strict`, and publishes to PyPI.
+
+**What the workflow does not do:** it cannot create the PyPI-side configuration.
+Either enable Trusted Publishing for the repo (recommended; no secret needed) or
+add a project-scoped API token as the `PYPI_TOKEN` repository secret, and create
+the `pypi` environment so publishing needs an approver.
+
+**Verify a release locally before tagging:**
+
+```bash
+uv build --out-dir dist && uv run --with twine twine check --strict dist/*
+```
+
+Then, in a scratch venv outside the repo, install the wheel and generate a
+client from a small module — that proves the *published* artifact works, which
+is a different claim from "the gates pass in the source tree".
+
 ## Contributing
 
 `AGENTS.md` is the contract: extend `IRBuilder` (`src/yang2sdk/plugin/src/ir.py`) before templates, keep `ir.py` ↔ Jinja in sync with a generated sample that imports, cite real RFC sections for protocol changes, and never weaken secure defaults (`verify=True`, no embedded credentials, `auto_commit=False`, the `replace()` completeness guard). Preserve strictness (`extra="forbid"`, `validate_assignment`, alias/tag/ns plumbing, `is_config` filtering, choice-exclusion, 64-bit serializers). Vendor quirks belong in downstream adapters, not the generic path. Minimal diffs, no new runtime deps without justification. Commit messages: concise (`git log --oneline -10` first); never commit secrets, `temp/`, or `.venv/`.

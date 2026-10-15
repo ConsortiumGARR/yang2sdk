@@ -6,6 +6,28 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
+First release. Everything below accumulated since inception and was previously
+recorded only under `[Unreleased]`. This is a `0.x` pre-1.0 release: breaking
+changes are allowed and will be documented.
+
+Known limitations, recorded honestly rather than deferred (see `AGENTS.md` for
+the full statements):
+
+- **NMDA (RFC 8526) datastore paths have no live device coverage.** Every
+  simulator image and SR Linux advertise the legacy RFC 6241 datastores; SR
+  Linux ships the `ietf-netconf-nmda` *module* without advertising `:nmda:1.0`.
+  The `has_nmda` routing branch is covered offline only.
+- **Golden snapshots are run-local and gitignored**, so no regression corpus
+  exists yet. There is no tracked YANG corpus either (`git ls-files '*.yang'`
+  returns 0), which is why template/IR changes are still verified by generating
+  a sample and inspecting it.
+- **`closure.py` matches `uses`/module references inside comments and strings.**
+  Deliberately pinned (`test_uses_regex_accepts_quoted_unquoted_and_refined`);
+  over-inclusive, never under-inclusive — measured 0 mis-keyed module names
+  across the 583 vendor YANG files on hand.
+
 ### Changed
 
 - **`temp/` is now an untracked workspace created on demand.** The five
