@@ -14,7 +14,9 @@ requires-python = ">=3.12"
 # the project by.
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "Matteo Colantonio", email = "colantoniomatteo@gmail.com" }]
+# Name only, no contact address: package metadata is public and permanent, so
+# no email is declared here. SECURITY.md is where reports should go.
+authors = [{ name = "Matteo Colantonio" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
