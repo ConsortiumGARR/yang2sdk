@@ -686,6 +686,48 @@ def test_compile_all_names_the_installable_package_from_the_matrix_slug(
     assert 'version = "10.4.4"' in pyproject, pyproject[:400]
 
 
+def test_golden_shape_failure_names_only_the_differing_keys():
+    """The golden mismatch message must name the difference, not both lists.
+
+    The original assertion was `f"...stored={stored} current={shape}"`, which
+    dumps both lists whole. The cisco-nx System container has 225 top-level
+    keys, so a real failure produced ~4500 characters with the one changed key
+    at the very end -- the assertion's entire purpose arriving last. This
+    becomes the primary diagnostic for a generator regression once the golden
+    fixtures are promoted from run-local to checked-in and blocking.
+
+    Runs offline; the golden test itself is `pytest.mark.integration`.
+    """
+    from tests.test_sdk_generate import _check_golden_shape
+
+    shape = ["a", "b", "c"]
+    golden = Path("x.json")
+
+    # No change: silent pass.
+    _check_golden_shape(["a", "b", "c"], shape, "n", golden)
+    # Order is not a difference (the golden is stored sorted).
+    _check_golden_shape(["c", "b", "a"], shape, "n", golden)
+
+    with pytest.raises(AssertionError) as exc:
+        _check_golden_shape(["a", "b"], shape, "n", golden)
+    msg = str(exc.value)
+    assert "missing=['c']" in msg, msg
+    assert "added=[]" in msg, msg
+    # The whole point: the full lists must NOT be dumped.
+    assert "stored=['a', 'b', 'c']" not in msg, msg
+
+    with pytest.raises(AssertionError) as exc:
+        _check_golden_shape(["a", "b", "c", "d"], shape, "n", golden)
+    assert "added=['d']" in str(exc.value), str(exc.value)
+
+    # A pre-fix snapshot (payload dump, not a key list) gets an actionable
+    # message, not a phantom shape diff.
+    with pytest.raises(AssertionError) as exc:
+        _check_golden_shape({"interface": []}, shape, "n", golden)
+    assert "stale golden" in str(exc.value), str(exc.value)
+    assert "Delete tests/fixtures/golden" in str(exc.value), str(exc.value)
+
+
 def test_device_version_env_fallback_is_scoped_to_its_own_device(monkeypatch):
     """`$DEVICE_VERSION` must only apply to the device `$DEVICE_NAME` names.
 
