@@ -1,46 +1,22 @@
-# STRESS-TEST PROBE (control) — temporary, safe to delete.
-# Isolates why the v1 probe never loaded, and tests what a GITHUB_TOKEN can
-# actually do with rulesets in this repo:
-#   job A: valid scoped permissions -> proves the workflow loads (control)
-#   job B: inherited (default) permissions -> attempts a no-op ruleset PUT
+# STRESS-TEST PROBE (minimal) — temporary, safe to delete.
+# Isolation test: does a brand-new workflow introduced via PR run at all?
+# No permissions block, no API calls, just proves execution.
 name: ruleset-write-probe
 
 on:
   pull_request:
 
 jobs:
-  control-scoped:
-    permissions:
-      contents: read
+  alive:
     runs-on: ubuntu-latest
     steps:
-      - name: Proves workflow loads with valid permissions
-        run: echo "loaded OK with scoped permissions"
-
-  control-inherit:
-    permissions: inherit
-    runs-on: ubuntu-latest
-    steps:
-      - name: No-op ruleset PUT with inherited token
+      - name: Prove execution
+        run: echo "PROBE ALIVE — event=${{ github.event_name }} repo=${{ github.repository }} token-scope-test=next"
+      - name: Can this GITHUB_TOKEN read the ruleset?
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
-          REPO="ConsortiumGARR/yang2sdk"
-          RULESET="25119636"
-          gh api "repos/$REPO/rulesets/$RULESET" > /tmp/ruleset.json || { echo "GET failed"; exit 1; }
-          jq '{name, target, enforcement, conditions, bypass_actors, rules}' /tmp/ruleset.json > /tmp/writable.json
-          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
-            -X PUT \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            --data @/tmp/writable.json \
-            "https://api.github.com/repos/$REPO/rulesets/$RULESET")
-          echo "PUT status with INHERITED token: $code"
-          head -c 400 /tmp/resp.json; echo
-          if [ "$code" != "200" ]; then
-            echo "RESULT: inherited GITHUB_TOKEN CANNOT write rulesets"
-          else
-            echo "RESULT: inherited GITHUB_TOKEN CAN write rulesets (no-op verified, nothing changed)"
-          fi
+          code=$(curl -sS -o /tmp/r.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/ConsortiumGARR/yang2sdk/rulesets/25119636")
+          echo "GET ruleset with default token -> HTTP $code"
