@@ -13,6 +13,7 @@ no-ops. Reads are depth-bounded named subtrees, never root `/`.
 """
 
 import importlib
+import json
 import time
 
 import pytest
@@ -62,22 +63,18 @@ def test_restconf_sdk_retrieve_and_validate(generated_sdks):
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     golden = GOLDEN_DIR / f"{mod['slug']}_restconf_{name}.json"
     payload = model.model_dump(mode="json", by_alias=True)
+    shape = sorted(payload)
     if golden.exists():
-        import json
-
         stored = json.loads(golden.read_text())
         # This used to assert only that the file parsed, so a completely
         # different model still passed. Compare the *shape* of the payload
         # (key names), which is stable across runs and catches a model that
         # silently stops validating a subtree.
-        assert sorted(stored) == sorted(payload), (
-            f"golden snapshot shape changed for {name}: "
-            f"stored={sorted(stored)} current={sorted(payload)}"
+        assert stored == shape, (
+            f"golden snapshot shape changed for {name}: stored={stored} current={shape}"
         )
     else:
-        import json
-
-        golden.write_text(json.dumps(payload, indent=2, default=str)[:20000])
+        golden.write_text(json.dumps(shape, indent=2) + "\n")
 
 
 def test_netconf_sdk_retrieve_and_validate(generated_sdks):
