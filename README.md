@@ -108,3 +108,5 @@ for the normative generator contract.
 ## Status
 
 Public prototype. Both protocols generate; wire shapes are pinned offline in `tests/test_matrix.py` and exercised live against `notconf` simulators, SR Linux (full vendor tree, non-NMDA), and the Groove G30. Alternatives ([pydantify](https://github.com/pydantify/pydantify), [pyangbind](https://github.com/robshakir/pyangbind)) cover data modelling but not network operations — this project generates models **and** the operation code on top of [pyang](https://github.com/mbj4668/pyang).
+
+<!-- stress-test verification PR: ci-gate single required check. Close me. -->
