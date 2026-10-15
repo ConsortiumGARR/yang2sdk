@@ -1,22 +1,38 @@
-# STRESS-TEST PROBE (minimal) — temporary, safe to delete.
-# Isolation test: does a brand-new workflow introduced via PR run at all?
-# No permissions block, no API calls, just proves execution.
+# STRESS-TEST PROBE (write test) — temporary, safe to delete.
+# Decisive test: can the DEFAULT (unscoped) GITHUB_TOKEN WRITE the ruleset?
+# No permissions key (adding one broke workflow loading in earlier attempts).
+# Does a no-op PUT (read object, write identical object back) and reports status.
 name: ruleset-write-probe
 
 on:
   pull_request:
 
 jobs:
-  alive:
+  write-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Prove execution
-        run: echo "PROBE ALIVE — event=${{ github.event_name }} repo=${{ github.repository }} token-scope-test=next"
-      - name: Can this GITHUB_TOKEN read the ruleset?
+      - name: No-op ruleset PUT with default token
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          code=$(curl -sS -o /tmp/r.json -w '%{http_code}' \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/ConsortiumGARR/yang2sdk/rulesets/25119636")
-          echo "GET ruleset with default token -> HTTP $code"
+          set -uo pipefail
+          REPO="ConsortiumGARR/yang2sdk"
+          RULESET="25119636"
+          echo "before rules: $(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' https://api.github.com/repos/$REPO/rulesets/$RULESET | jq -c '[.rules[].type]')"
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' https://api.github.com/repos/$REPO/rulesets/$RULESET > /tmp/ruleset.json
+          jq '{name, target, enforcement, conditions, bypass_actors, rules}' /tmp/ruleset.json > /tmp/writable.json
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/writable.json \
+            "https://api.github.com/repos/$REPO/rulesets/$RULESET")
+          echo "PUT ruleset with DEFAULT token -> HTTP $code"
+          echo "response: $(head -c 300 /tmp/resp.json)"
+          echo "after rules: $(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' https://api.github.com/repos/$REPO/rulesets/$RULESET | jq -c '[.rules[].type]')"
+          if [ "$code" = "200" ]; then
+            echo "VERDICT: default GITHUB_TOKEN CAN write rulesets (no-op, nothing changed)"
+          else
+            echo "VERDICT: default GITHUB_TOKEN CANNOT write rulesets (HTTP $code)"
+          fi
