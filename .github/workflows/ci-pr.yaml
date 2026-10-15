@@ -58,3 +58,23 @@ jobs:
           NOTCONF_RUN_INTEGRATION: "1"
           NOTCONF_IMAGE_PACKAGE: ${{ matrix.image.package }}
           NOTCONF_IMAGE_TAG: ${{ matrix.image.tag }}
+
+  # ci-gate: the single required check on main. It `needs` every other job in
+  # this workflow, so the branch ruleset only has to require this one stable
+  # name instead of one context per job/matrix shard. When you add a job to
+  # this workflow, add it to ci-gate's `needs` in the same PR (forgetting it
+  # fails open: the new job simply isn't gated).
+  ci-gate:
+    needs: [lint-typecheck, offline-tests, smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every ci-pr job succeeded
+        run: |
+          needs='${{ toJSON(needs) }}'
+          echo "$needs" | jq -c 'with_entries(.value = .value.result)'
+          if ! echo "$needs" | jq -e 'all(.[]; .result == "success")' > /dev/null; then
+            echo "::error::ci-gate: one or more ci-pr jobs did not succeed"
+            exit 1
+          fi
+          echo "all ci-pr jobs succeeded"
