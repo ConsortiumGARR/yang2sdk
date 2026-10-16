@@ -95,7 +95,14 @@ published: the first tag was pushed as `v2026.10.16` while `pyproject.toml`
 still said `0.1.0`, and the guard caught it.
 
 The `release.yaml` build job asserts `tag == pyproject version` exactly and
-fails the run on mismatch, so a drifted tag cannot publish. Four consequences
+fails the run on mismatch, so a drifted tag cannot publish. It is shell, not a
+declaration, so it is pinned by
+`tests/test_matrix.py::test_release_tag_guard_passes_on_a_matching_tag` (with
+mismatch and missing-version cases alongside): the test parses the workflow and
+runs both steps under GitHub's `$GITHUB_OUTPUT` semantics. That matters — the
+guard shipped broken and failed *every* tag, because a step that `print()`s a
+bare value records no output, so the comparison was against `""`. Fixed in
+`fix/release-version-guard-output`. Four consequences
 worth knowing before you tag:
 
 - **The tag must point at the commit carrying the version.** `git tag -f` onto
