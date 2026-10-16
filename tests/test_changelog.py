@@ -19,6 +19,7 @@ Offline: no network, no docker, no device.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from datetime import date
@@ -278,12 +279,22 @@ def _changelog_check_step() -> str:
     return str(step["run"])
 
 
-def test_release_workflow_gates_on_the_changelog() -> None:
+def test_release_workflow_gates_on_the_changelog(tmp_path: Path) -> None:
     """A tag pushed by hand, around scripts/release.py, is still refused.
 
     Parsed from the workflow, never copied: a copy would let the workflow drift
     from the rule these tests execute, which is the failure this pin exists to
     prevent -- the same reasoning as the tag-guard tests.
+
+    Run against a changelog of known shape in a temporary directory rather than
+    against the repository's own. The step's paths are relative, so the cwd is
+    what selects the file, and the repository's own changelog is *not* releasable
+    between releases -- content under `## [Unreleased]` is the normal state and
+    the gate refuses it by design. Running it here would therefore have asserted
+    "nobody has written down a change yet", which is the opposite of what this
+    repository wants. The real file, in the state the tag is pushed from, is
+    checked by
+    `test_release_script.py::test_the_real_changelog_becomes_releasable_once_the_version_is_promoted`.
 
     `${{ steps.version.outputs.value }}` is substituted into the script text
     before bash ever sees it, exactly as GitHub does it. Left in place, bash
@@ -292,27 +303,28 @@ def test_release_workflow_gates_on_the_changelog() -> None:
     against "" and so failed for every tag including the correct ones.
     """
     run = _changelog_check_step().replace(
-        "${{ steps.version.outputs.value }}", _pyproject_version()
+        "${{ steps.version.outputs.value }}", "1999.1.2"
     )
     assert "scripts/changelog.py" in run and "--check" in run
     assert "${{" not in run, "version expression was not substituted"
 
-    # Run against the repository's own CHANGELOG.md and its own declared
-    # version: this asserts the invariant that makes the gate meaningful, namely
-    # that `main` is always in a releasable state for the version it declares.
-    # A release PR that forgets the notes fails here, on the PR, not on the tag.
-    version = _pyproject_version()
+    (tmp_path / "scripts").mkdir()
+    shutil.copy(REPO_ROOT / "scripts" / "changelog.py", tmp_path / "scripts")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n\n## [1999.1.2] - 1999-01-02\n\n- a documented change\n"
+    )
+
     proc = subprocess.run(
         ["bash", "-e", "-c", run],
-        cwd=REPO_ROOT,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         check=False,
         timeout=120,
     )
     assert proc.returncode == 0, (
-        f"CHANGELOG.md does not document {version}, so this branch could not "
-        f"be released: {proc.stderr[-2000:]}"
+        f"the workflow's own changelog step refused a documented version: "
+        f"{proc.stderr[-2000:]}"
     )
 
 
@@ -322,6 +334,9 @@ def test_the_workflow_gate_refuses_an_undocumented_version() -> None:
     Without this, `test_release_workflow_gates_on_the_changelog` would also pass
     if the step had become a no-op -- the failure mode this whole suite exists
     to prevent.
+
+    This one *does* run against the repository, because the version it asks
+    about is documented nowhere, so no amount of local state can make it pass.
     """
     run = _changelog_check_step().replace(
         "${{ steps.version.outputs.value }}", "1999.1.1"

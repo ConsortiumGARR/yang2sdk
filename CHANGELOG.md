@@ -7,11 +7,6 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
-## [2026.10.16.1] - 2026-10-16
-
-Second publication. No behavioural change to the generator relative to
-`2026.10.16` beyond the entries below, two of which are **breaking**.
-
 ### Removed (breaking)
 
 - **`yang2netconf` and `yang2restconf` are gone; `yang2sdk --protocol` replaces
@@ -48,6 +43,34 @@ Second publication. No behavioural change to the generator relative to
   assertion is a claim requiring proof from source or demonstration. Stated as a
   principle rather than a procedure, because procedures get satisfied on paper.
 
+- **`yang2sdk --version`.** Reads the installed distribution's metadata via
+  `importlib.metadata`, so it reports what is actually installed rather than a
+  string compiled into the source. Every release after `2026.10.16` is checked
+  with it against the artifact pulled from PyPI, which is what makes a console
+  script missing from the wheel a release-time failure instead of a user's.
+- **`scripts/changelog.py` and `scripts/release.py`.** The release procedure was
+  five hand-run steps with a hand-typed tag and a hand-typed version, and it
+  failed on its first use: `v2026.10.16.1` was pushed one commit before the bump
+  landed and the build died on `tag ... implies 2026.10.16.1 but pyproject.toml
+  says 2026.10.16`. Both numbers are now derived from a single source of truth —
+  the version from the date plus what PyPI already holds, the tag from the
+  version — and every way the release can go wrong is checked before anything is
+  pushed. The version derivation reports each candidate it skipped and *why*, so
+  a collision with a movable tag is distinguishable from one with a permanent
+  PyPI filename.
+- **A changelog gate, enforced twice.** `CHANGELOG.md` must carry a non-empty
+  `## [<version>]` section whose date matches the CalVer version, and
+  `## [Unreleased]` must be empty. `release.py` applies it before tagging and
+  `release.yaml` re-applies it in the build job, so a tag pushed around the
+  script is still refused. Subheadings do not count as entries: `### Added` alone
+  is a promise, not a release note.
+- **`verify-published` and `github-release` jobs.** The first installs the
+  published wheel *from PyPI* — no `checkout` step, so it cannot be satisfied by
+  the source tree — checks `yang2sdk --version`, generates a client from a
+  one-container module and imports it. The second creates the GitHub Release from
+  the same changelog section, so the page and the repository cannot drift.
+- **Dependabot**, weekly and grouped, for `uv` and `github-actions`.
+
 ### Changed
 
 - **A compile that pyang rejects now refuses to generate.** pyang prints
@@ -74,6 +97,20 @@ Second publication. No behavioural change to the generator relative to
   `is_config` as state deleted every RPC input, so every RPC reached the device
   with an empty payload.
 
+- **Releasing is two commands and a review.** `--bump` writes the notes, derives
+  the version, re-locks and commits on a branch; after the merge, the bare
+  invocation derives the tag and pushes it. The split is forced: the ruleset
+  requires a pull request for `main`, and the bump is the commit the tag will
+  name, so it is the step that deserves the review. `release.py` previously did
+  both in one run, which could never succeed on this repository.
+- **`scripts/` is a source root for `ty` and `pyrefly`** (`[tool.ty.environment]`,
+  `[tool.pyrefly] search-path`, and `sys.path` in `tests/conftest.py`). `ty` used
+  to need no section because it respected `.gitignore`, which covered `temp/`;
+  that stopped being true once release tooling imported a sibling module. The
+  wheel still ships `src/yang2sdk` only.
+- `AGENTS.md` and `docs/dev.md` state the release contract — when it is enforced,
+  by what, and which failures motivated each guard.
+
 ### Fixed
 
 - **The generated sdist shipped the package twice.** The emitter writes the
@@ -86,6 +123,24 @@ Second publication. No behavioural change to the generator relative to
   PATCH/PUT bodies" was false.** A presence container with a defaulted leaf
   validates to `{"feat": {"enabled": false}}`, which a PUT sends as a real value
   while an omitted container means deletion (RFC 8040 §4.5).
+
+- **`--dry-run` on the tag phase pushed the tag.** The flag was honoured only in
+  the bump phase, so the rehearsal of the one irreversible step performed it. It
+  survived discovery only because the test fixture records `run()` argv instead
+  of executing it.
+- **`--bump --dry-run` could never pass.** It checked `uv.lock` against a version
+  that only `bump()` creates, so every rehearsal refused — precisely when a
+  rehearsal is wanted. It now checks what the current commit must satisfy.
+- **`--notes` flattened every release** and `--promote` emitted each entry twice.
+- **`uv pip install --no-project` is not a real flag.** It was written into
+  `release.yaml`'s `verify-published` job and rejects on uv 0.11.7, so the job
+  would have failed on its first step of every release. Deleted rather than
+  worked around; uv's `pip` interface does not discover a project anyway.
+- **Both post-publish jobs read `steps.version`, which does not exist outside
+  `build`.** They would have installed `yang2sdk==` with no constraint and
+  asserted the CLI reports an empty string.
+- The offline suite wrote to the repository: the `no_writes` fixture stubbed
+  `run()` but not `bump()`, which edits `pyproject.toml`, re-locks and commits.
 
 ### Verified
 
@@ -105,12 +160,27 @@ Second publication. No behavioural change to the generator relative to
   extract, build, contents correct, then `uv add <sdist>` in a clean project
   imports it.
 
-### Known limitations, unchanged
+- 46 new tests for the two gates (`tests/test_changelog.py`,
+  `tests/test_release_script.py`), several with negative controls that sabotage
+  the gate and assert it goes red. The whole flow was rehearsed against a scratch
+  bare remote with this repository untouched: dry run, bump on a branch, the tag
+  phase refusing off `main`, merge, and a pushed tag confirmed by
+  `git ls-remote --tags origin 'v…^{}'` to name exactly `main`'s HEAD.
+- `verify-published`'s logic was exercised against a locally built wheel —
+  `yang2sdk --version`, generate, `from verify_1_0_0 import RestconfClient`,
+  `compileall` — because the published `2026.10.16` predates the CLI merge and
+  has no `yang2sdk` binary to check.
+
+### Known limitations
 
 - NMDA (RFC 8526) paths still have no live coverage; the `has_nmda` branch is
   covered offline only.
 - Golden snapshots remain run-local and gitignored, and there is still no
   tracked YANG corpus (`git ls-files '*.yang'` returns 0).
+
+- **No release has yet run through the new workflow.** `verify-published` and
+  `github-release` are unexecuted until the next tag; their logic is proven
+  locally, their execution is not.
 
 ## [2026.10.16] - 2026-10-16
 

@@ -31,16 +31,21 @@ way this can go wrong is checked BEFORE anything is pushed:
 Usage — two phases, because the version bump is a code change and this repo's
 ruleset requires a pull request for `main`::
 
-    uv run python scripts/release.py --bump 2026.11.1   # on a branch: notes, bump, commit
+    uv run python scripts/release.py --bump       # on a branch: notes, derive the
+                                                  # version, bump, commit
     #   ... open the PR, merge it ...
-    uv run python scripts/release.py                   # on main: derive the tag, push it
-    uv run python scripts/release.py --dry-run         # check only, change nothing
+    uv run python scripts/release.py              # on main: derive the tag, push it
+    uv run python scripts/release.py --dry-run    # check only, change nothing
 
-That is one command and a review for the tag, which is the whole point: the
-failure this script exists to prevent was a tag typed one commit ahead of the
-version it named. The bump goes through review because the bump is what the tag
-will name; the tag itself needs none, since it is derived and every check on it
-has already run.
+Neither the version nor the tag is typed, and for the same reason. Under CalVer
+the version *is* the date, so the only thing to decide is the same-day sequence
+number — and PyPI already records which ones are used. `--bump 2026.11.1` still
+works, for the rare deliberate jump, but the default derives.
+
+The tag needs no review once the bump has had one: it is computed from the
+version, and every check on it has already run by then. The failure this script
+exists to prevent was a tag typed one commit ahead of the version it named; a
+version typed by hand is the same failure one step earlier.
 
 Not shipped in the wheel (it lives outside `src/`), so it costs a consumer
 nothing.
@@ -54,6 +59,7 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 # Importable as a sibling script. `python scripts/release.py` already puts
@@ -65,6 +71,12 @@ import changelog
 
 REPO = Path(__file__).resolve().parent.parent
 PYPI_URL = "https://pypi.org/pypi/yang2sdk/{version}/json"
+
+# What `taken()` reports for the unresolvable collision. A named constant so
+# callers can branch on it without matching against prose: the tag collision is
+# recoverable and the PyPI one is not, and confusing the two would either refuse
+# a release that could proceed or proceed with one that cannot.
+PUBLISHED = "already on PyPI"
 
 
 class Failure(Exception):
@@ -152,12 +164,80 @@ def check_lock_matches(version: str) -> None:
         raise Failure(f"`uv lock --check` failed:\n{result.stderr[-500:]}")
 
 
-def check_tag_absent(tag: str) -> bool:
-    exists = (
+def tag_exists(tag: str) -> bool:
+    """Is `tag` on origin? Asked once per candidate, so it is named, not inlined."""
+    return (
         run("git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}").stdout.strip()
         != ""
     )
-    return not exists
+
+
+def check_tag_absent(tag: str) -> bool:
+    return not tag_exists(tag)
+
+
+def taken(version: str) -> list[str]:
+    """Every reason `version` cannot be released; empty means it is free.
+
+    PyPI is listed first because it is the one that cannot be undone: filenames
+    there are permanent, so a collision is final. A tag collision is merely in
+    the way -- a human may move it -- but it still cannot be released over.
+    """
+    reasons = []
+    if published(version):
+        reasons.append(PUBLISHED)
+    if tag_exists(f"v{version}"):
+        reasons.append(f"tag v{version} exists on origin")
+    return reasons
+
+
+def next_version(on: date | None = None) -> tuple[str, list[str]]:
+    """Today's version, derived. Returns it and the candidates skipped.
+
+    Under CalVer the version *is* the date, so there is nothing here for a human
+    to decide: the only free variable is the same-day sequence number, and what
+    is already taken answers it. Asking to be told `2026.10.16.1` is asking the
+    operator to do arithmetic the script already holds the inputs for — the same
+    defect as the hand-typed tag this file exists to remove, one step earlier.
+
+    The skips are returned rather than printed so the caller decides when the
+    operator sees them, and so this stays testable without capturing stdout.
+    """
+    # UTC for the same reason `changelog.promote` uses it: a release cut at
+    # 23:30 must not be named differently for whoever is in another zone.
+    day = on or datetime.now(tz=UTC).date()
+    base = f"{day.year}.{day.month}.{day.day}"
+    skipped: list[str] = []
+    for sequence in range(1000):
+        candidate = base if sequence == 0 else f"{base}.{sequence}"
+        reasons = taken(candidate)
+        if not reasons:
+            return candidate, skipped
+        skipped.append(f"{candidate} ({', '.join(reasons)})")
+    raise Failure(
+        f"every version from {base} to {base}.999 is taken. Something is wrong "
+        "that another version number will not fix -- check PyPI and the tags."
+    )
+
+
+def _refuse_published(version: str) -> Failure:
+    return Failure(
+        f"{version} is already published on PyPI. PyPI filenames are "
+        "permanent -- a re-upload fails with 400 File already exists, and "
+        "yanking does not free the name. Pick a new version "
+        "(e.g. the next date under CalVer) and pass --bump."
+    )
+
+
+def _report_skipped(skipped: list[str]) -> None:
+    """Show the arithmetic behind a derived version; silent if there was none.
+
+    Reported rather than silent because the operator's expectation and the
+    derivation can disagree -- most sharply when a *tag* is what blocked a
+    candidate, since that is a decision they may already have made.
+    """
+    if skipped:
+        print(f"skipped    {'; '.join(skipped)}")
 
 
 def bump(version: str) -> None:
@@ -235,8 +315,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--bump",
+        nargs="?",
+        const="",
+        default=None,
         metavar="VERSION",
-        help="Write VERSION into pyproject.toml, re-lock, commit, then tag.",
+        help=(
+            "Write VERSION into pyproject.toml, re-lock, commit, then stop. "
+            "With no VERSION, derive today's version (CalVer) from what is "
+            "already taken on PyPI and in the tags."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -255,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         # Doing both in one run -- as the first version of this script did --
         # could therefore never succeed here, and the two-phase shape is what
         # makes "push a tag" one command instead of five.
-        if args.bump:
+        if args.bump is not None:
             return _bump_phase(args)
         return _tag_phase(dry_run=bool(args.dry_run))
 
@@ -266,14 +353,20 @@ def main(argv: list[str] | None = None) -> int:
 
 def _bump_phase(args: argparse.Namespace) -> int:
     """Write the version and the notes, commit, and stop before the tag."""
-    target = str(args.bump)
-    if published(target):
-        raise Failure(
-            f"{target} is already published on PyPI. PyPI filenames are "
-            "permanent -- a re-upload fails with 400 File already exists, and "
-            "yanking does not free the name. Pick a new version "
-            "(e.g. the next date under CalVer) and pass --bump."
-        )
+    skipped: list[str] = []
+    if args.bump:
+        # An explicit version is the operator overriding the derivation, so a
+        # stale tag is *reported* rather than refused: the tag is not pushed
+        # until another phase, and they may intend to move it. The derivation
+        # never arrives here with one -- it skips such candidates -- so this
+        # note only ever appears when the version was named by hand.
+        target = str(args.bump)
+        for reason in taken(target):
+            if reason == PUBLISHED:
+                raise _refuse_published(target)
+            skipped.append(f"{target} ({reason})")
+    else:
+        target, skipped = next_version()
 
     if args.dry_run:
         prepare_notes(target, may_promote=True, write=False)
@@ -286,6 +379,7 @@ def _bump_phase(args: argparse.Namespace) -> int:
         check_lock_matches(declared_version())
         print(f"version    {target} (would bump from {declared_version()})")
         print(f"tag        v{target} (after the merge, not now)")
+        _report_skipped(skipped)
         print(f"lock       matches pyproject (will re-lock for {target})")
         print("changelog  documents this version")
         print(f"pypi       {target} not published")
@@ -299,6 +393,7 @@ def _bump_phase(args: argparse.Namespace) -> int:
     check_lock_matches(target)
 
     print(f"version    {target}")
+    _report_skipped(skipped)
     print("lock       matches pyproject")
     print("changelog  documents this version")
     print(
@@ -315,12 +410,7 @@ def _tag_phase(*, dry_run: bool) -> int:
 
     target = declared_version()
     if published(target):
-        raise Failure(
-            f"{target} is already published on PyPI. PyPI filenames are "
-            "permanent -- a re-upload fails with 400 File already exists, and "
-            "yanking does not free the name. Pick a new version "
-            "(e.g. the next date under CalVer) and pass --bump."
-        )
+        raise _refuse_published(target)
 
     tag = f"v{target}"
     if not check_tag_absent(tag):

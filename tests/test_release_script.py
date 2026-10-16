@@ -19,11 +19,14 @@ Offline: `published()` is stubbed, no git remote is contacted, nothing is tagged
 from __future__ import annotations
 
 import email.message
+import hashlib
 import importlib.util
 import subprocess
 import sys
 import tomllib
 import urllib.error
+from collections.abc import Iterable, Iterator
+from datetime import UTC, date
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,24 @@ def _load_release() -> Any:
 
 
 release = _load_release()
+
+# The writers, captured before any fixture replaces them, so a test can assert
+# the fixture really did. `run()` is included: it is the only one of the three
+# that reaches git.
+_WRITERS = ("run", "bump", "prepare_notes")
+_ORIGINAL = {name: getattr(release, name) for name in _WRITERS}
+
+# Everything a bump is allowed to change. `no_writes` digests these on entry and
+# again on teardown, so a writer it does not know about is a failing test rather
+# than a dirty tree.
+BUMP_WRITES = ("pyproject.toml", "uv.lock", "CHANGELOG.md")
+
+
+def _digests() -> dict[str, str]:
+    return {
+        name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
+        for name in BUMP_WRITES
+    }
 
 
 def _done(stdout: str = "", stderr: str = "", code: int = 0) -> Any:
@@ -103,22 +124,44 @@ def on_a_clean_main(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(release, "check_clean_tree", lambda: None)
     monkeypatch.setattr(release, "check_on_main", lambda: None)
     monkeypatch.setattr(release, "check_up_to_date", lambda: None)
-    monkeypatch.setattr(release, "check_tag_absent", lambda tag: True)
+    # `tag_exists` rather than `check_tag_absent`, which is now only a wrapper:
+    # the derivation asks the same question of every candidate version, and a
+    # stub on the wrapper would leave `next_version` reaching for the real
+    # remote from inside a unit test.
+    monkeypatch.setattr(release, "tag_exists", lambda tag: False)
 
 
 @pytest.fixture
-def no_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
-    """Record every `run()` argv instead of executing it.
+def no_writes(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[tuple[str, ...]]]:
+    """Record every `run()` argv instead of executing it — and write nothing.
 
-    Also stubs `bump()`, which is a real writer: it edits `pyproject.toml`, runs
-    `uv lock`, and commits. A test that reaches it dirties the working tree of
-    whoever is running the suite — which is exactly what happened the first time
-    this fixture existed, leaving the repo's own version bumped by a test run.
+    Both halves were learned the hard way. `bump()` edits `pyproject.toml`, runs
+    `uv lock` and commits, so the first version of this fixture — which stubbed
+    only `run()` — left the repository's own version bumped by a suite run. Then
+    `prepare_notes(write=True)`, reached by `test_a_bump_does_not_tag`, promoted
+    the repository's own `CHANGELOG.md` and left it rewritten, visible only as a
+    diff nobody made.
+
+    Stubbing a named writer is a promise to remember the next one, and that
+    promise is what failed twice. The teardown digest is a check that does not
+    depend on remembering: a writer added later fails the test that reaches it,
+    and names the file, instead of dirtying the tree for the next run.
     """
+    before = _digests()
     seen: list[tuple[str, ...]] = []
     monkeypatch.setattr(release, "run", lambda *a, **k: seen.append(a) or _done())
     monkeypatch.setattr(release, "bump", lambda version: None)
-    return seen
+    monkeypatch.setattr(release, "prepare_notes", lambda *a, **k: None)
+    yield seen
+
+    after = _digests()
+    dirty = [name for name in BUMP_WRITES if before[name] != after[name]]
+    assert not dirty, (
+        f"a test using `no_writes` modified {', '.join(dirty)}. The fixture "
+        "stubs `run()`, `bump()` and `prepare_notes()`; whatever wrote this is a "
+        "writer it does not know about, and the next suite run would fail on the "
+        "dirt left behind."
+    )
 
 
 # --- the git-state guards ----------------------------------------------------
@@ -254,6 +297,128 @@ def test_published_really_is_asked_about_pypi() -> None:
     assert "https://pypi.org/pypi/yang2sdk/{version}/json" in source
 
 
+# --- the derived version ------------------------------------------------------
+
+
+def _stub_taken(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pypi: Iterable[str] = (),
+    tags: Iterable[str] = (),
+) -> None:
+    """Answer both collision questions from fixed sets, with no network."""
+    published_here, tagged_here = set(pypi), set(tags)
+    monkeypatch.setattr(release, "published", lambda v: v in published_here)
+    monkeypatch.setattr(release, "tag_exists", lambda t: t in tagged_here)
+
+
+def test_the_first_release_of_a_day_is_the_date_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_taken(monkeypatch)
+    version, skipped = release.next_version(date(2026, 11, 1))
+    assert version == "2026.11.1"
+    assert skipped == []
+
+
+def test_a_second_release_the_same_day_takes_the_next_sequence_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The question this answers: "is it `.1` or `.2` today?" Nobody should have to ask."""
+    _stub_taken(monkeypatch, pypi={"2026.10.16"})
+    assert release.next_version(date(2026, 10, 16))[0] == "2026.10.16.1"
+
+
+def test_the_sequence_keeps_counting_past_the_first_re_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_taken(monkeypatch, pypi={"2026.10.16", "2026.10.16.1"})
+    assert release.next_version(date(2026, 10, 16))[0] == "2026.10.16.2"
+
+
+def test_a_tag_alone_blocks_a_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing was published under `2026.10.16.1`, but a tag claims it.
+
+    The tag is movable and the version is not, so this is the case where the
+    operator may disagree with the derivation. It must therefore say *why* it
+    skipped, not just pick the next number.
+    """
+    _stub_taken(monkeypatch, pypi={"2026.10.16"}, tags={"v2026.10.16.1"})
+    version, skipped = release.next_version(date(2026, 10, 16))
+    assert version == "2026.10.16.2"
+    assert skipped == [
+        "2026.10.16 (already on PyPI)",
+        "2026.10.16.1 (tag v2026.10.16.1 exists on origin)",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("day", "expected"),
+    [
+        (date(2026, 1, 5), "2026.1.5"),
+        (date(2026, 10, 16), "2026.10.16"),
+        (date(2026, 12, 31), "2026.12.31"),
+    ],
+)
+def test_the_derived_version_is_not_zero_padded(
+    monkeypatch: pytest.MonkeyPatch, day: date, expected: str
+) -> None:
+    """PEP 440 orders these numerically, so padding would only help a filename sort."""
+    _stub_taken(monkeypatch)
+    assert release.next_version(day)[0] == expected
+
+
+def test_the_derived_version_round_trips_through_the_changelog_date_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two implementations of "which date is this version?", asserted against each other.
+
+    `next_version` writes the date into the version; `changelog.expected_date`
+    reads it back out and the gate compares it to the heading. Disagree and the
+    promotion stamps a heading that the gate it feeds then refuses — so the
+    round trip is the property, not either half of it.
+    """
+    _stub_taken(monkeypatch)
+    for day in (date(2026, 1, 5), date(2026, 10, 16), date(2026, 12, 31)):
+        version, _ = release.next_version(day)
+        assert changelog.expected_date(version) == day.isoformat()
+
+
+def test_the_default_date_is_taken_in_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A release cut at 23:30 must not be named for a different day by zone.
+
+    `changelog.promote` stamps UTC for exactly this reason. If the version were
+    derived in local time the two could disagree, and the gate would refuse the
+    release the operator had just derived — for a date neither of them chose.
+    Asserted by capturing the `tz` the code passes, so it holds at any hour.
+    """
+    seen: dict[str, Any] = {}
+    real = release.datetime
+
+    class Spy(real):  # type: ignore[misc, valid-type]
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            seen["tz"] = tz
+            return real.now(tz=tz)
+
+    _stub_taken(monkeypatch)
+    monkeypatch.setattr(release, "datetime", Spy)
+    release.next_version()
+    assert seen["tz"] is UTC
+
+
+def test_an_exhausted_sequence_says_so_instead_of_looping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse with an explanation; a bound is what stops this being a hang."""
+    _stub_taken(monkeypatch, pypi={"x"})
+    monkeypatch.setattr(release, "published", lambda v: True)
+    with pytest.raises(release.Failure, match="every version from 2026.10.16"):
+        release.next_version(date(2026, 10, 16))
+
+
 # --- notes -------------------------------------------------------------------
 
 
@@ -287,30 +452,81 @@ def test_a_bare_tag_run_never_rewrites_the_changelog(
     assert target.read_text() == original
 
 
-def test_the_real_changelog_is_releasable_for_the_declared_version() -> None:
-    """`main` is always in a releasable state for the version it declares."""
+def test_the_real_changelog_is_well_formed() -> None:
+    """What holds on `main` at all times, which is less than "releasable".
+
+    The declared version has notes, and every dated heading in the file agrees
+    with its own version. The `## [Unreleased]`-must-be-empty rule is *not*
+    asserted here, deliberately: it is a release-time rule, and between releases
+    unreleased content is the normal state. It is also the state this repository
+    spent eight commits failing to record, with `## [Unreleased]` sitting empty
+    while `main` changed — which is what the gate exists to catch. An assertion
+    here would have gone red the moment anyone wrote down what they had done.
+    The release-time rule is pinned in `tests/test_changelog.py` and re-applied
+    by `release.yaml`'s build job.
+    """
     version = str(
         tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["version"]
     )
     text = (REPO_ROOT / "CHANGELOG.md").read_text()
-    assert changelog.require_release_notes(text, version).notes(text)
+
+    section = changelog.find(text, version)
+    assert section is not None, f"no section for the declared version {version}"
+    assert section.notes(text)
+
+    for other in changelog.parse(text):
+        want = changelog.expected_date(other.version)
+        if want is not None:
+            assert other.date == want, (
+                f"'## [{other.version}] - {other.date}' should be dated {want}"
+            )
+
+
+def test_the_real_changelog_becomes_releasable_once_the_version_is_promoted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The release-time invariant, against the repository's own file.
+
+    Content under `## [Unreleased]` is normal between releases, so "main is
+    releasable" is not the invariant and never was -- asserting it here is what
+    made the previous version of this test fail the moment a change was written
+    down. The invariant is: *main plus the promotion the bump performs* is
+    releasable, which is the state the tag is pushed from. Checks the real
+    `CHANGELOG.md`, at the real version the tool would derive.
+    """
+    _stub_taken(monkeypatch, pypi={"2026.10.16"}, tags={"v2026.10.16.1"})
+    version, _ = release.next_version()
+
+    text = (REPO_ROOT / "CHANGELOG.md").read_text()
+    promoted = changelog.promote(text, version)
+    assert changelog.require_release_notes(promoted, version).notes(promoted)
+    pending = changelog.unreleased(promoted)
+    assert pending is not None, "promotion must leave a fresh [Unreleased] behind"
+    assert not pending.notes(promoted), (
+        "promotion must leave [Unreleased] empty, or the next release ships "
+        "this one's notes again"
+    )
 
 
 # --- the whole thing, dry ---------------------------------------------------
 
 
-def test_the_suite_never_writes_to_the_repository() -> None:
-    """A test that bumps the version is a test that breaks the next run.
+def test_the_no_writes_fixture_stubs_every_writer(
+    no_writes: list[tuple[str, ...]],
+) -> None:
+    """Pinned by its effect, not by grepping its own source.
 
-    Found the hard way: an early version of `no_writes` stubbed `run()` but not
-    `bump()`, which is itself a writer, so a suite run left `pyproject.toml` and
-    `uv.lock` modified and the *next* run failed on the dirt it had caused.
+    The previous version of this test asserted that the string `setattr(release,
+    "bump"` appeared in this file. It did, and it did not help: `prepare_notes`
+    is a second writer, it was not stubbed, and `test_a_bump_does_not_tag`
+    promoted the repository's own `CHANGELOG.md` while this test stayed green.
+    Found by hashing that file before and after a run, not by reading the fixture.
     """
-    source = Path(__file__).read_text()
-    assert 'monkeypatch.setattr(release, "bump"' in source, (
-        "the no_writes fixture must stub bump(); it edits pyproject.toml, "
-        "runs `uv lock`, and commits"
-    )
+    for name in _WRITERS:
+        assert getattr(release, name) is not _ORIGINAL[name], (
+            f"`no_writes` must stub `{name}()`; a test that reaches the real one "
+            "writes to the repository"
+        )
 
 
 def test_a_dry_run_reports_the_tag_and_writes_nothing(
@@ -319,7 +535,15 @@ def test_a_dry_run_reports_the_tag_and_writes_nothing(
     no_writes: list[tuple[str, ...]],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The rehearsal: no tag, no push, no commit, no re-lock."""
+    """The rehearsal: no tag, no push, no commit, no re-lock.
+
+    `prepare_notes` is stubbed by `no_writes`; its own rules are tested in
+    `tests/test_changelog.py`, and the repository's live changelog is not
+    releasable between releases by design — content under `## [Unreleased]` is
+    the normal state and the gate refuses it on purpose. Running the real one
+    here would make this test measure how recently somebody wrote a changelog
+    entry instead of whether the tag phase writes anything.
+    """
     assert release.main(["--dry-run"]) == 0
     assert published_off == [release.declared_version()]
 
@@ -363,6 +587,59 @@ def test_the_dry_run_of_a_bump_is_not_blocked_by_the_bump_it_previews(
 
 
 # --- the two phases ----------------------------------------------------------
+
+
+def test_bump_with_no_argument_derives_the_version(
+    on_a_clean_main: None,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The change in one test: `--bump` takes no version, and still gets one.
+
+    `2026.10.16` is genuinely on PyPI, so the derivation has to reach
+    `2026.10.16.1` — and the changelog documents that version, which is what
+    lets the dry run get past the notes gate. Both halves have to be true for
+    this to exit 0, so a derivation that returned the base version, or one that
+    was computed and then ignored, fails here.
+    """
+    _stub_taken(monkeypatch, pypi={"2026.10.16"})
+    assert release.main(["--bump", "--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "version    2026.10.16.1" in out
+    assert "skipped    2026.10.16 (already on PyPI)" in out
+
+
+def test_a_stale_tag_on_an_explicit_version_is_reported_not_refused(
+    published_off: list[str],
+    on_a_clean_main: None,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the operator knows whether to move the tag or burn the number.
+
+    The derivation never lands here — it skips tag-blocked candidates — so this
+    path is reached only when a version was named by hand. Refusing would be
+    wrong at this point: the tag is not pushed until the other phase, which is
+    where an existing one becomes fatal.
+    """
+    monkeypatch.setattr(release, "tag_exists", lambda t: t == "v2026.10.16.1")
+    assert release.main(["--bump", "2026.10.16.1", "--dry-run"]) == 0
+    assert (
+        "skipped    2026.10.16.1 (tag v2026.10.16.1 exists on origin)"
+        in capsys.readouterr().out
+    )
+
+
+def test_a_dry_run_of_the_derived_version_writes_nothing_either(
+    on_a_clean_main: None,
+    no_writes: list[tuple[str, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run that reaches the network does not get to write on the way back."""
+    _stub_taken(monkeypatch, pypi={"2026.10.16"})
+    assert release.main(["--bump", "--dry-run"]) == 0
+    assert not [a for a in no_writes if a[:2] in {("git", "tag"), ("git", "push")}]
 
 
 def test_a_bump_does_not_tag(
