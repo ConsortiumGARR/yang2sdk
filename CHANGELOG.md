@@ -7,6 +7,111 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.10.16.1] - 2026-10-16
+
+Second publication. No behavioural change to the generator relative to
+`2026.10.16` beyond the entries below, two of which are **breaking**.
+
+### Removed (breaking)
+
+- **`yang2netconf` and `yang2restconf` are gone; `yang2sdk --protocol` replaces
+  both.** They were the same program with a hardcoded transport, so a third
+  transport would have meant a third copy of twelve flags. Every flag except
+  `--protocol` forwards verbatim to `cli.compiler.run_compiler`, which is how the
+  two surfaces are kept from drifting. `--protocol netconf` is the literal
+  replacement for `yang2netconf`; `--protocol restconf` for `yang2restconf`.
+  `ci-srl.yaml` was updated in the same change, so the blocking lab job
+  compiles through the new entry point.
+
+### Added
+
+- **Interactive root-module picker.** `run_compiler` needs *root* modules — the
+  ones pyang is told about directly, because pyang expands an `augment` only
+  when the augmenting module is also named (RFC 7950 §7.17) — and picking them
+  was the last hand-fed step in the pipeline. Omit `--roots` and the modules
+  that actually declare top-level data **or** operations are proposed (38 of 357
+  on an SR Linux tree, including both roots `ci-srl` compiles). `ietf-netconf*`
+  transport RPCs are excluded, since compiling them is how a G30 tree ended up
+  with 18 of 19 top-level navigators being protocol plumbing; an
+  `ietf-netconf*` module that also carries data stays a candidate, because that
+  data is the device's. `--list-roots` prints and exits. With no TTY (CI) and no
+  `--roots`, it exits 2 with the candidates on stderr rather than blocking on a
+  read that will never come. Cost is the same as the step it replaces: 16.7s for
+  38 numbered rows, against 15.3s for `pyang -f tree`'s 18,604 lines to read by
+  hand. **No `--yes`** — it meant "compile everything suggested", which on SRL
+  compiles three competing interface models with nothing in the output saying
+  which one the device populates.
+- **`yang2sdk --version`.** Reads `importlib.metadata`, so it cannot report a
+  version the installed package does not carry. This is what the release
+  workflow asserts after installing the published wheel from PyPI.
+- **`## Trust protocol` in `AGENTS.md`.** Agents operate at Trust 0: every
+  assertion is a claim requiring proof from source or demonstration. Stated as a
+  principle rather than a procedure, because procedures get satisfied on paper.
+
+### Changed
+
+- **A compile that pyang rejects now refuses to generate.** pyang prints
+  errors, calls the emitter anyway, and only exits non-zero afterwards, so the
+  same run wrote a complete client *and* reported failure — misleading in both
+  directions. Measured: a `confirmation` statement produced models byte-identical
+  to a clean compile with exit 1. Both emitters now check before writing, so a
+  refused compile leaves no directory behind and announces nothing. The check
+  mirrors pyang's own filtering (`--ignore-errors`, per-tag `--ignore-error`, and
+  `implicit_errors=False`, which keeps errors from imported-but-unnamed modules
+  out of the failure set) and distinguishes warnings from errors by `err_level` —
+  without that, SR Linux's 43 warnings looked like 43 failures.
+  `--ignore-error` remains the documented escape hatch.
+- **NETCONF honours `content=` client-side.** `content="nonconfig"` is not
+  expressible over legacy NETCONF: RFC 6241 §7.7 defines `<get>` as state *and*
+  running configuration, with no state-only read, so a legacy nonconfig read
+  arrives with config mixed in. `prune_xml_to_content` now applies the rule
+  RESTCONF already used, so the two transports agree;
+  `test_netconf_and_restconf_content_pruning_agree` compiles one module for both
+  and compares which paths survive, so they cannot drift. Two corrections found
+  by demonstration: testing `is_config` on complex nodes deleted a state-only
+  container whole (YANG inherits `config true` onto containers per RFC 7950
+  §7.21.6, even when every child is `config false`), and treating a *missing*
+  `is_config` as state deleted every RPC input, so every RPC reached the device
+  with an empty payload.
+
+### Fixed
+
+- **The generated sdist shipped the package twice.** The emitter writes the
+  client flat (so the lab harness can import it) and namespaced (so pip installs
+  it). The wheel carried only the namespaced copy, but hatchling puts the whole
+  project tree in an sdist — measured 25 entries with two `data_models/`, two
+  `data_navigators/`, two `__init__.py`. Two identical-looking trees in one
+  artifact is also a trap for anyone hand-editing before publishing.
+- **A RESTCONF model comment claiming an emptied container is "harmless in
+  PATCH/PUT bodies" was false.** A presence container with a defaulted leaf
+  validates to `{"feat": {"enabled": false}}`, which a PUT sends as a real value
+  while an omitted container means deletion (RFC 8040 §4.5).
+
+### Verified
+
+- 136 offline tests, `ruff` / `ruff format` / `ty` / `pyrefly` clean.
+- `content="nonconfig"` proven **live** on SR Linux 25.10.1 — the only device in
+  reach that can run it. notconf answers 404 for `?content=nonconfig` on `/data`
+  and 500 on `/ds`, while `?content=config` returns 200, so it is specifically
+  that value; and NETCONF's `<get>` works but the image holds no entries carrying
+  both a config and a state leaf. On the live node raw `<get>` for
+  `/system/acl` returns `acl-filter`, `policers` and `egress-mac-filtering`
+  (config) together with `datapath-programming` (state), and the prune separates
+  them. Passed in 4.85s. `tests/test_srl_netconf.py`, non-blocking in `ci-srl`.
+- The new `yang2sdk` CLI compiles the SR Linux client to a **byte-identical**
+  output — 210 files, zero differing hashes — versus `yang2netconf` on the same
+  modules.
+- The wheel built from the extracted sdist is unaffected by the exclusion:
+  extract, build, contents correct, then `uv add <sdist>` in a clean project
+  imports it.
+
+### Known limitations, unchanged
+
+- NMDA (RFC 8526) paths still have no live coverage; the `has_nmda` branch is
+  covered offline only.
+- Golden snapshots remain run-local and gitignored, and there is still no
+  tracked YANG corpus (`git ls-files '*.yang'` returns 0).
+
 ## [2026.10.16] - 2026-10-16
 
 First release. Everything below accumulated since inception and was previously

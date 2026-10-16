@@ -21,6 +21,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .. import __version__
 from . import rootpicker
 from .compiler import run_compiler
 
@@ -67,6 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
             "  yang2sdk --protocol netconf --device srl --help\n"
             "      every other flag is forwarded unchanged to the compiler\n"
         ),
+    )
+    # `action="version"` rather than a flag handled in main(): it must work with
+    # no `--protocol` and exit 0. The release workflow installs the published
+    # wheel from PyPI and asserts this string, which is the only check that an
+    # artifact's metadata describes that artifact. `--version` reads
+    # `importlib.metadata`, the same pyproject the build read, so it cannot
+    # report a version the package does not carry.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"yang2sdk {__version__}",
+        help="Print the installed version and exit.",
     )
     parser.add_argument(
         "--protocol",

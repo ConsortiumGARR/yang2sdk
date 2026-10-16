@@ -1,0 +1,57 @@
+# Dependency updates arrive as pull requests, not as background events.
+#
+# AGENTS.md records a gate turning `main` red overnight with no commit to explain
+# it: `uvx ty` resolved 0.0.86 where 0.0.60 had passed. The fix was to pin the
+# gates exactly in `uv.lock` and run them with `uv run`. Pinning stops the drift;
+# this stops the pinning from becoming manual archaeology, because every bump is
+# now a reviewable diff against a known-good `uv.lock`.
+#
+# Weekly rather than daily: these are all libraries whose releases are not
+# synchronized with anything, and a daily PR train on six dependencies is noise
+# nobody reads. Grouped so one PR covers a coordinated set (pyyaml and pyang
+# release together; the Actions runtime majors move together).
+version: 2
+
+updates:
+  # Runtime, lab extra, and the dev group (ruff, ty, pyrefly) all come from the
+  # same pyproject, so one ecosystem entry covers the lot.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      gates:
+        # The three tools that decide whether a PR is mergeable. Grouped because
+        # a coordinated bump is one review, and a half-upgraded gate set is the
+        # state where "it passed" means nothing.
+        patterns: ["ruff", "ty", "pyrefly"]
+      yang:
+        # pyang and its pyyaml dependency release together, and tests/test_matrix.py
+        # parses both workflows and pyproject with yaml.
+        patterns: ["pyang", "pyyaml"]
+      pydantic:
+        # pydantic and pydantic-xml must move together: the generated models are
+        # strict (extra="forbid", validate_assignment, defer_build) and a
+        # mismatch between the two is a generator bug wearing a dependency
+        # update's clothes.
+        patterns: ["pydantic", "pydantic-xml"]
+      transport:
+        # Everything that opens a session to a device. A bump here is the one
+        # most likely to need a lab re-run, so it is reviewed as a set.
+        patterns: ["ncclient", "requests", "lxml"]
+      tooling:
+        patterns: ["jinja2", "python-dotenv", "pytest"]
+
+  # The workflows pin actions by tag (v4, v5, release/v1). A moved action tag is
+  # a supply-chain change to the thing that publishes to PyPI, so it gets the
+  # same review as a code change rather than arriving silently.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["actions/*", "pypa/*", "astral-sh/*"]

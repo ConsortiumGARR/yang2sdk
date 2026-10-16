@@ -22,6 +22,13 @@ from yang2sdk.cli.downloader import YangDownloader
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATRIX_PATH = REPO_ROOT / "tests" / "notconf" / "matrix.json"
 
+# `scripts/` is a source root for `changelog` (imported by tests/test_changelog.py
+# and by scripts/release.py). The type-checkers are told about it in pyproject
+# (`[tool.ty.environment] extra-paths`, `[tool.pyrefly] search-path`); pytest
+# needs it at runtime. Done here, once, rather than with a sys.path line in each
+# test module that would also need a suppression.
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
 TEMP_CLIENTS = REPO_ROOT / "temp" / "notconf_clients"
 TEMP_YANGS = REPO_ROOT / "temp" / "yang_modules"
 #: Run-local golden payloads (gitignored; strict comparison is follow-up work).

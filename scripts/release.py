@@ -15,6 +15,12 @@ way this can go wrong is checked BEFORE anything is pushed:
     origin -- refuse;
   * `uv.lock` disagrees with `pyproject.toml` -- refuse, because `ci-pr` runs
     `uv sync --locked` and would go red on the commit we just tagged;
+  * `CHANGELOG.md` does not document this version -- refuse. This is the gap
+    that actually bit: eight commits landed on `main` after `v2026.10.16`, two
+    of them breaking, while `## [Unreleased]` sat empty. A version number is a
+    claim about what changed, and an undocumented one cannot be checked. The
+    rules live in `scripts/changelog.py` and are enforced again in CI, so a tag
+    pushed around this script is still refused;
   * the tag already exists -- refuse, so a re-run cannot silently rewrite a
     public ref;
   * the version is already on PyPI -- refuse, because PyPI filenames are
@@ -41,6 +47,13 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Importable as a sibling script. `python scripts/release.py` already puts
+# `scripts/` on sys.path[0], but leaning on that makes the module untestable from
+# anywhere else, so it is stated rather than assumed.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import changelog
 
 REPO = Path(__file__).resolve().parent.parent
 PYPI_URL = "https://pypi.org/pypi/yang2sdk/{version}/json"
@@ -140,7 +153,12 @@ def check_tag_absent(tag: str) -> bool:
 
 
 def bump(version: str) -> None:
-    """Write the version into pyproject.toml, re-lock, commit."""
+    """Write the version into pyproject.toml, re-lock, commit.
+
+    `CHANGELOG.md` is committed in the same commit when it was promoted here, so
+    the tree is clean again by the time anything is tagged. Splitting them would
+    put a half-finished release on main.
+    """
     path = REPO / "pyproject.toml"
     text = path.read_text()
     old = declared_version()
@@ -167,6 +185,38 @@ def bump(version: str) -> None:
             f"git commit failed:\n{committed.stdout[-400:]}{committed.stderr[-400:]}"
         )
     print(f"committed version {old} -> {version}")
+
+
+def prepare_notes(version: str, may_promote: bool, write: bool) -> None:
+    """Make `CHANGELOG.md` releasable for `version`, or explain why it is not.
+
+    With `--bump`, an unwritten `[Unreleased]` is promoted into the version's
+    section -- the heading is mechanical, the prose is the author's. Without
+    `--bump` nothing is promoted: a bare tag run only checks, so it can never
+    rewrite the changelog of a release someone else wrote by hand.
+
+    `write=False` is the dry run. It reports the promotion it *would* make and
+    validates the result in memory, because a dry run that refuses for something
+    the real run would fix is lying about the release.
+    """
+    text = changelog.CHANGELOG.read_text()
+    if changelog.find(text, version) is None and may_promote:
+        try:
+            promoted = changelog.promote(text, version)
+        except changelog.ChangelogError as exc:
+            raise Failure(str(exc)) from exc
+        text = promoted
+        if write:
+            changelog.CHANGELOG.write_text(promoted)
+            run("git", "add", "CHANGELOG.md")
+        print(
+            f"promote    [Unreleased] -> ## [{version}]"
+            f"{'' if write else ' (dry run: not written)'}"
+        )
+    try:
+        changelog.require_release_notes(text, version)
+    except changelog.ChangelogError as exc:
+        raise Failure(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -214,23 +264,40 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.bump:
-            bump(target)
+            prepare_notes(target, may_promote=True, write=not args.dry_run)
+            if args.dry_run:
+                # The bump has not run, so `uv.lock` cannot yet carry the new
+                # version -- `bump()` is what re-locks it. Checking the lock
+                # against `target` here would refuse every `--bump --dry-run`,
+                # which makes the dry run useless precisely when it is wanted
+                # most: before committing a release. Instead check what the
+                # *current* commit must satisfy -- `ci-pr` runs
+                # `uv sync --locked` on it -- and report the re-lock as pending.
+                check_lock_matches(declared_version())
+            else:
+                bump(target)
+                if declared_version() != target:
+                    raise Failure(
+                        f"bump did not take: pyproject.toml says {declared_version()!r}"
+                    )
+                check_lock_matches(target)
+        else:
+            check_lock_matches(target)
 
-        version = declared_version()
-        if version != target:
-            raise Failure(f"bump did not take: pyproject.toml says {version!r}")
-        check_lock_matches(version)
-
-        print(f"version    {version}")
+        print(f"version    {target}")
         print(f"tag        {tag}")
-        print("lock       matches pyproject")
-        print(f"pypi       {version} not published")
+        if args.bump and args.dry_run:
+            print(f"lock       matches pyproject (will re-lock for {target})")
+        else:
+            print("lock       matches pyproject")
+        print("changelog  documents this version")
+        print(f"pypi       {target} not published")
         print("tag        not on origin yet")
         if args.dry_run:
             print("\ndry run: nothing changed")
             return 0
 
-        annotated = run("git", "tag", "-a", tag, "-m", version)
+        annotated = run("git", "tag", "-a", tag, "-m", target)
         if annotated.returncode != 0:
             raise Failure(f"git tag failed:\n{annotated.stderr[-400:]}")
         pushed = run("git", "push", "origin", tag)
