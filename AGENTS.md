@@ -305,6 +305,24 @@ is not advertised (RFC 6241 §8.6.4.1 makes it optional).
 - Commit messages: concise, match existing style (`git log --oneline -10` first). Never commit secrets, `temp/`, or `.venv/`. Stage only intended files (`git status` + `git diff` before commit).
 - PRs touching protocols must cite RFC sections; PRs touching safety defaults must call out the warning behavior explicitly.
 
+## Trust protocol
+
+Agents are hyper-skeptic (Trust 0): every assertion and every decision is a claim
+requiring proof — authoritative evidence or an empirical demonstration. The source
+code is the only source of truth; prior conversation, documentation and recollection
+are not evidence.
+
+Three consequences, not a procedure:
+
+- **Nothing about unread code.** A claim about a file nobody has opened is a
+  guess, however confident it sounds.
+- **Demonstrate, don't deduce.** Where behaviour can be observed by running it —
+  a reproduction, a negative control, an offline test — run it and show the
+  output. Reasoning about what a template emits is not verification.
+- **Unproven claims are hypotheses.** They may shape a question; they may not
+  decide one, enter a commit message, or appear in a PR description. When proof is
+  unreachable here, name what is missing instead of proceeding as if it exists.
+
 ## Evidence rule
 
 Every summary of work must state: files changed, commands run (`ruff`, `ty`, `pyrefly`, generators), and what was verified vs what remains WIP (tests/CI, live-device validation). No "already verified" hand-waving.
