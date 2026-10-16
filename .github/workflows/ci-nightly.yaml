@@ -23,8 +23,8 @@ jobs:
           - { package: notconf-cisco-xr, tag: "2531" }
           - { package: notconf-cisco-nx, tag: 10.4-4 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked --group dev --extra lab
       - run: >-
           uv run pytest tests/test_notconf_protocol.py tests/test_sdk_generate.py

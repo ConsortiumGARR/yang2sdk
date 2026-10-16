@@ -28,8 +28,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
 
       # GitHub records a `run` step's outputs ONLY from `name=value` lines on
       # stdout (or the deprecated `::set-output::`). A bare `print()` writes
@@ -79,7 +79,7 @@ jobs:
       # caught here rather than after the tag is already public.
       - run: uv run --with twine twine check --strict dist/*
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
@@ -92,7 +92,7 @@ jobs:
       # id-token is what Trusted Publishing needs; harmless when a token is used.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
@@ -128,7 +128,7 @@ jobs:
     needs: publish
     runs-on: ubuntu-24.04
     steps:
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       # No checkout: everything below must come from PyPI, and a stray
       # `uv sync` or an editable install from the workspace would make the whole
@@ -186,7 +186,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       - name: Publish the release notes from the changelog section
