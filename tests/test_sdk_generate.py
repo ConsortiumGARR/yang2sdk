@@ -13,6 +13,7 @@ no-ops. Reads are depth-bounded named subtrees, never root `/`.
 """
 
 import importlib
+import json
 import time
 
 import pytest
@@ -31,6 +32,39 @@ def _first_data_navigator(client):
             assert fget is not None
             return name, fget(client.data)
     raise AssertionError("generated Data has no navigable properties")
+
+
+def _check_golden_shape(stored, shape, name, golden) -> None:
+    """Assert the golden key list matches, reporting only the *difference*.
+
+    The obvious `assert stored == shape, f"...stored={stored} current={shape}"`
+    dumps both lists in full. The cisco-nx System container has 225 top-level
+    keys, so a real failure was ~4500 characters of scrolled-past text with
+    the one key that changed at the very end -- the assertion's entire purpose
+    arriving last. Naming the symmetric difference instead makes the failure
+    one line, with the answer first.
+
+    That matters most once the golden fixtures are promoted from run-local to
+    checked-in and blocking (still open in AGENTS.md): this message is then
+    how a generator regression across a whole model tree gets diagnosed.
+
+    `stored` is a list because the golden stores the sorted key list. Snapshots
+    written before that change stored the payload dump instead; say so plainly
+    rather than reporting them as a spurious shape diff.
+    """
+    assert isinstance(stored, list), (
+        f"stale golden {golden.name}: stores a "
+        f"{type(stored).__name__}, expected a list of top-level keys "
+        f"(older snapshots stored the payload dump). "
+        f"Delete tests/fixtures/golden/*.json and re-run to regenerate."
+    )
+    missing = [k for k in shape if k not in stored]
+    added = [k for k in stored if k not in shape]
+    assert not missing and not added, (
+        f"golden snapshot shape changed for {name}: "
+        f"missing={missing} added={added} "
+        f"({len(stored)} stored vs {len(shape)} current)"
+    )
 
 
 def _navigators_matching(client, include, exclude=()):
@@ -62,22 +96,16 @@ def test_restconf_sdk_retrieve_and_validate(generated_sdks):
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     golden = GOLDEN_DIR / f"{mod['slug']}_restconf_{name}.json"
     payload = model.model_dump(mode="json", by_alias=True)
+    shape = sorted(payload)
     if golden.exists():
-        import json
-
         stored = json.loads(golden.read_text())
         # This used to assert only that the file parsed, so a completely
         # different model still passed. Compare the *shape* of the payload
         # (key names), which is stable across runs and catches a model that
         # silently stops validating a subtree.
-        assert sorted(stored) == sorted(payload), (
-            f"golden snapshot shape changed for {name}: "
-            f"stored={sorted(stored)} current={sorted(payload)}"
-        )
+        _check_golden_shape(stored, shape, name, golden)
     else:
-        import json
-
-        golden.write_text(json.dumps(payload, indent=2, default=str)[:20000])
+        golden.write_text(json.dumps(shape, indent=2) + "\n")
 
 
 def test_netconf_sdk_retrieve_and_validate(generated_sdks):

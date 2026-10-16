@@ -6,6 +6,28 @@ All notable changes to `yang2sdk` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
+First release. Everything below accumulated since inception and was previously
+recorded only under `[Unreleased]`. This is a `0.x` pre-1.0 release: breaking
+changes are allowed and will be documented.
+
+Known limitations, recorded honestly rather than deferred (see `AGENTS.md` for
+the full statements):
+
+- **NMDA (RFC 8526) datastore paths have no live device coverage.** Every
+  simulator image and SR Linux advertise the legacy RFC 6241 datastores; SR
+  Linux ships the `ietf-netconf-nmda` *module* without advertising `:nmda:1.0`.
+  The `has_nmda` routing branch is covered offline only.
+- **Golden snapshots are run-local and gitignored**, so no regression corpus
+  exists yet. There is no tracked YANG corpus either (`git ls-files '*.yang'`
+  returns 0), which is why template/IR changes are still verified by generating
+  a sample and inspecting it.
+- **`closure.py` matches `uses`/module references inside comments and strings.**
+  Deliberately pinned (`test_uses_regex_accepts_quoted_unquoted_and_refined`);
+  over-inclusive, never under-inclusive — measured 0 mis-keyed module names
+  across the 583 vendor YANG files on hand.
+
 ### Changed
 
 - **`temp/` is now an untracked workspace created on demand.** The five
@@ -77,6 +99,47 @@ All notable changes to `yang2sdk` are documented here. Format follows
   Pinned by `tests/test_netconf_logging.py`.
 
 ### Fixed
+
+- **`$DEVICE_VERSION` leaked one lab device's OS version onto every generated
+  client.** `$DEVICE_NAME` and `$DEVICE_VERSION` are one pair describing one
+  device (`.env.example` puts them beside `DEVICE_IP`/`DEVICE_USER`/`DEVICE_PASS`),
+  but the `--device-version` fallback was unconditional: any compile in a
+  `.env`-loaded shell stamped that single device's version onto whatever device
+  was requested. The value lands in the package name, the package version and
+  the generated README — all publishable metadata. Measured on a
+  notconf-cisco-nx 10.4-4 image: package `notconf_cisco_nx_10_4_4_4_8_0`,
+  version `4.8.0`, README "version `4.8.0`", for a device that is 10.4-4. The
+  fallback is now scoped to the device `$DEVICE_NAME` actually names; an
+  explicit `--device-version` still always wins, and an explicit `""` still
+  means "no version" rather than "fall back". Models and navigators never saw
+  the value, so this is provenance, not model correctness.
+  Pinned by `test_matrix.py::test_device_version_env_fallback_is_scoped_to_its_own_device`.
+- **Generated package name double-encoded the version.**
+  `core.py` builds the name as `_sanitize_pkg(f"{device}_{device_version}")`,
+  and `tests/conftest.py` passed the *slug* — which already contains the tag —
+  as `--device`, so notconf-cisco-nx 10.4-4 came out as
+  `notconf_cisco_nx_10_4_4_0_0_0` rather than `notconf_cisco_nx_10_4_4`. That
+  also made the installable copy (`out/<package_name>/`, what `uv add`
+  installs) disagree with the directory the suite imports, and the README
+  advertise an import name that is not the installed distribution.
+  `_compile_all` now takes the matrix entry and derives the slug, `--device`
+  and `--device-version` from it. Regenerated cisco-nx 10.4-4 metadata:
+  `name = "notconf_cisco_nx_10_4_4"`, `version = "10.4.4"`.
+  Pinned by `test_matrix.py::test_compile_all_names_the_installable_package_from_the_matrix_slug`
+  (compiles for real) and `::test_generated_package_name_matches_the_matrix_slug`
+  (naming scheme across all 11 tags).
+- **Golden snapshots wrote invalid JSON for payloads over 20000 characters.**
+  `test_sdk_generate.py` truncated `json.dumps(...)` at 20000 characters
+  mid-token, then read it back with `json.loads`, so the next local run raised
+  `JSONDecodeError ... (char 20000)`. The cap existed to bound file size, but
+  the assertion only ever consumes *top-level key names*, so a truncated dump
+  held a strict subset of them and could not have compared equal even when it
+  parsed. What is stored is now the sorted key list — bounded by the model's
+  field count, so no cap is needed. On the one image affected (cisco-nx 10.4-4,
+  225 keys) the stored file is 4073 bytes of valid JSON and byte-identical
+  across runs. Note this was invisible to CI twice over: the directory is
+  gitignored *and* `pytest.mark.integration`, so no run could ever compare
+  against a golden.
 
 - **`retrieve(depth=N)` on a RESTCONF client returned data its own strict model
   rejected.** RFC 8040 §4.8.2 makes `depth` a server-side ceiling: a compliant

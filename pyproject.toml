@@ -8,6 +8,25 @@ version = "0.1.0"
 description = "Generate a Pydantic-based IDE-friendly SDK from YANG modules."
 readme = "README.md"
 requires-python = ">=3.12"
+# PEP 639 SPDX expression. The LICENSE/NOTICE files were already being packed
+# (hatchling auto-detects them, hence `License-File:` in the built METADATA)
+# but no license *expression* was declared, so PyPI had nothing to classify
+# the project by.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+# Name only, no contact address: package metadata is public and permanent, so
+# no email is declared here. SECURITY.md is where reports should go.
+authors = [{ name = "Matteo Colantonio" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Telecommunications Industry",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+]
 dependencies = [
     "jinja2>=3.1.6",
     "pyang>=2.7.1",
@@ -15,6 +34,11 @@ dependencies = [
     "pydantic-xml>=2.21.0",
     "requests>=2.32.5",
 ]
+
+[project.urls]
+Repository = "https://github.com/ConsortiumGARR/yang2sdk"
+Changelog = "https://github.com/ConsortiumGARR/yang2sdk/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ConsortiumGARR/yang2sdk/issues"
 
 [project.optional-dependencies]
 # Lab-only tooling (downloader/tester + live-simulator tests). Kept out of the

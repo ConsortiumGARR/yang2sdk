@@ -201,6 +201,37 @@ class Compiler:
             sys.exit(1)
 
 
+def _resolve_device_version(supplied: str | None, device: str) -> str:
+    """Resolve `--device-version`, scoping the ambient fallback to one device.
+
+    ``$DEVICE_NAME`` and ``$DEVICE_VERSION`` are one pair describing ONE lab
+    device -- ``.env.example`` exports them next to ``DEVICE_IP``,
+    ``DEVICE_USER`` and ``DEVICE_PASS``. ``--device`` inherits ``$DEVICE_NAME``,
+    so the two must be scoped together: a shell with ``.env`` loaded would
+    otherwise stamp that single device's OS version onto EVERY generated
+    client, whatever device was requested.
+
+    That is metadata, not model content, but it is publishable metadata: the
+    value lands in the package name, the package version and the generated
+    README. Measured on a notconf-cisco-nx 10.4-4 image compiled from a
+    ``.env``-loaded shell -- it produced ``notconf_cisco_nx_10_4_4_4_8_0``
+    with version ``4.8.0`` and a README claiming "version 4.8.0", for a
+    device that is 10.4-4.
+
+    Precedence:
+      * ``supplied is not None`` -- an explicit ``--device-version`` always wins.
+      * device == ``$DEVICE_NAME`` -- inherit ``$DEVICE_VERSION`` (the documented
+        behaviour, unchanged for the device those variables actually describe).
+      * otherwise -- no version. ``core.py`` turns empty into ``0.0.0``, so the
+        package is honestly marked unknown rather than mislabelled.
+    """
+    if supplied is not None:
+        return supplied
+    if os.environ.get("DEVICE_NAME") == device:
+        return os.environ.get("DEVICE_VERSION", "")
+    return ""
+
+
 def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -> None:
     """Unified configuration resolver and driver execution block.
 
@@ -231,8 +262,12 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
     )
     parser.add_argument(
         "--device-version",
-        default=os.environ.get("DEVICE_VERSION", ""),
-        help="Device OS version for package provenance (MANIFEST + package name).",
+        # None = "not supplied on the command line". Resolved after parsing by
+        # _resolve_device_version(); see its docstring for why the ambient
+        # fallback cannot be a plain default here.
+        default=None,
+        help="Device OS version for package provenance (MANIFEST + package name). "
+        "Falls back to $DEVICE_VERSION only when the target device is $DEVICE_NAME.",
     )
     parser.add_argument(
         "--package-version",
@@ -313,6 +348,9 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
     )
 
     parsed_args = parser.parse_args(argv)
+    parsed_args.device_version = _resolve_device_version(
+        parsed_args.device_version, parsed_args.device
+    )
 
     if not parsed_args.device:
         print(

@@ -326,19 +326,32 @@ def _pick_roots(yang_files, implemented):
     return [by_name[n] for n in names]
 
 
-def _compile_all(yang_files, roots, slug):
+def _compile_all(yang_files, roots, image):
     """Compile via fresh interpreter per format.
 
     In-process pyang runs cannot compile twice (global optparse registry
     raises OptionConflictError on the second run), so each format gets its
     own process. This also covers the real yang2restconf/yang2netconf CLIs.
+
+    `image` is the matrix entry, and the three names are deliberately derived
+    from it rather than passed separately: `slug` names the on-disk directory
+    (and the import path `_import_pkg` uses), while `--device` /
+    `--device-version` are what core.py builds the package NAME from
+    (`<device>_<device_version>` -> `_sanitize_pkg`). Passing the version-
+    bearing slug as `--device` double-encodes it: notconf-cisco-nx 10.4-4
+    became `notconf_cisco_nx_10_4_4_0_0_0` instead of `notconf_cisco_nx_10_4_4`,
+    shipping a README that claimed version `0.0.0` and an import name that
+    did not match the installed distribution.
     """
+    slug = _slug(image)
     yangs_dir = yang_files[0].parent
     for fmt in ("restconf", "netconf"):
         out = TEMP_CLIENTS / f"{slug}_{fmt}"
         argv = [str(r) for r in roots] + [
             "--device",
-            slug,
+            image["package"],
+            "--device-version",
+            image["tag"],
             "--yang-dir",
             str(yangs_dir),
             "--output-dir",
@@ -378,7 +391,7 @@ def generated_sdks(live_endpoint):
         assert yang_files, "get-schema returned no YANG modules"
         implemented = _implemented_modules(ep)
         roots = _pick_roots(yang_files, implemented)
-        _compile_all(yang_files, roots, slug)
+        _compile_all(yang_files, roots, image)
         rest = _import_pkg(slug, "restconf")
         netc = _import_pkg(slug, "netconf")
         assert rest.RestconfClient is not None and netc.NetconfClient is not None
