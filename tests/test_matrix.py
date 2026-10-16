@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +26,135 @@ from yang2sdk.cli.model_gaps import run_gap_check
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATRIX = REPO_ROOT / "tests" / "notconf" / "matrix.json"
+RELEASE_WF = REPO_ROOT / ".github" / "workflows" / "release.yaml"
 T_RESTCONF_SM = (
     REPO_ROOT / "src/yang2sdk/plugin/src/templates/restconf/session_manager.py.jinja"
 )
 T_NETCONF_SM = (
     REPO_ROOT / "src/yang2sdk/plugin/src/templates/netconf/session_manager.py.jinja"
 )
+
+
+def _release_guard_scripts() -> tuple[str, str]:
+    """Return the (version-read, tag-guard) `run` scripts from release.yaml.
+
+    Parsed, never copied: a copy would let the workflow drift away from what
+    these tests execute, which is the failure this pin exists to prevent.
+    """
+    import yaml
+
+    doc = yaml.safe_load(RELEASE_WF.read_text())
+    build = doc["jobs"]["build"]
+    read_step = next(s for s in build["steps"] if s.get("id") == "version")
+    guard_step = next(
+        s
+        for s in build["steps"]
+        if s.get("name") == "Fail if the tag does not match pyproject"
+    )
+    return str(read_step["run"]), str(guard_step["run"])
+
+
+def _run_release_guard(
+    tmp_path: Path, ref_name: str, pyproject_version: str | None
+) -> subprocess.CompletedProcess[str]:
+    """Run both release.yaml steps the way GitHub runs them.
+
+    Two GitHub semantics are emulated because ignoring either hides the bug:
+
+    1. A `run` step's outputs come from `name=value` lines written to
+       `$GITHUB_OUTPUT`. A bare value on stdout is log output, not an output.
+    2. `${{ steps.version.outputs.value }}` is substituted into the guard's
+       script text before bash ever sees it.
+    """
+    read_script, guard_script = _release_guard_scripts()
+    body = '[project]\nname = "yang2sdk"\n'
+    if pyproject_version is not None:
+        body += f'version = "{pyproject_version}"\n'
+    (tmp_path / "pyproject.toml").write_text(body)
+    outputs = tmp_path / "github_output"
+    outputs.write_text("")
+
+    env = {
+        **os.environ,
+        "GITHUB_REF_NAME": ref_name,
+        "GITHUB_OUTPUT": str(outputs),
+    }
+    read = subprocess.run(
+        ["bash", "-e", "-c", read_script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if read.returncode != 0:
+        return read
+
+    step_value = ""
+    for line in outputs.read_text().splitlines():
+        if line.startswith("value="):
+            step_value = line.split("=", 1)[1]
+            break
+    return subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-c",
+            guard_script.replace("${{ steps.version.outputs.value }}", step_value),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+
+def test_release_tag_guard_passes_on_a_matching_tag(tmp_path: Path) -> None:
+    """A tag equal to `pyproject.toml`'s version must let the release build.
+
+    Regression: the version step used to `print()` a bare value, which GitHub
+    does not record as a step output, so `steps.version.outputs.value` was
+    always empty and the guard failed for *every* tag. Run 38891426993 failed
+    with `pyproject.toml says ` and nothing after it; run 38893814299 failed
+    identically after the tag was corrected to `v2026.10.16` and the version
+    bumped to match. The guard was comparing against "", never a version.
+    """
+    version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+        "version"
+    ]
+    proc = _run_release_guard(tmp_path, f"v{version}", version)
+    assert proc.returncode == 0, (
+        f"guard rejected tag v{version} against matching version {version}: "
+        f"{proc.stderr[-2000:]}"
+    )
+
+
+def test_release_tag_guard_rejects_a_mismatched_tag(tmp_path: Path) -> None:
+    """Still fails when tag and version genuinely disagree.
+
+    The fix must not turn the guard into a no-op that lets a drifted tag
+    publish. Here the output IS read; the comparison is what rejects.
+    """
+    proc = _run_release_guard(tmp_path, "v0.1.0", "2026.10.16")
+    assert proc.returncode == 1, proc.stderr[-2000:]
+    assert "0.1.0" in proc.stderr and "2026.10.16" in proc.stderr, proc.stderr[-2000:]
+
+
+def test_release_tag_guard_rejects_a_missing_version(tmp_path: Path) -> None:
+    """An unreadable version fails loudly instead of comparing as "".
+
+    Without the explicit check, a `pyproject.toml` missing
+    `[project].version` left the output empty and the guard failed naming no
+    version at all -- the same unreadable log line that hid the real bug
+    across two runs.
+    """
+    proc = _run_release_guard(tmp_path, "v2026.10.16", None)
+    assert proc.returncode == 1, proc.stderr[-2000:]
+    assert "could not read" in proc.stderr, proc.stderr[-2000:]
+
 
 MINIMAL_YANG = """module tmod {
   prefix tm;

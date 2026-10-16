@@ -31,10 +31,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
 
+      # GitHub records a `run` step's outputs ONLY from `name=value` lines on
+      # stdout (or the deprecated `::set-output::`). A bare `print()` writes
+      # nothing to $GITHUB_OUTPUT, so `steps.version.outputs.value` below was
+      # always empty and the guard failed for EVERY tag -- including one that
+      # matched -- which is why the first release run (38891426993) failed with
+      # "pyproject.toml says " and an empty version rather than the real
+      # mismatch. Write the output explicitly, and fail here if it is empty
+      # instead of letting the comparison below treat "" as a version.
+      #
+      # `python3`, not `uv run`: tomllib is stdlib on the runner's 3.12, so the
+      # guard needs no synced environment, and the step then runs offline in
+      # `tests/test_matrix.py::test_release_tag_guard_*` without nesting uv.
       - name: Read pyproject version
         id: version
         run: |
-          uv run python -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])'
+          v="$(python3 -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text()).get("project",{}).get("version",""))')"
+          if [ -z "$v" ]; then
+            echo "could not read [project].version from pyproject.toml" >&2
+            exit 1
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
 
       - name: Fail if the tag does not match pyproject
         run: |
