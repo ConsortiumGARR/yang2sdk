@@ -9,6 +9,8 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [2026.10.16.1] - 2026-10-16
 
+### Removed (breaking)
+
 - **`yang2netconf` and `yang2restconf` are gone; `yang2sdk --protocol` replaces
   both.** They were the same program with a hardcoded transport, so a third
   transport would have meant a third copy of twelve flags. Every flag except
@@ -18,6 +20,7 @@ documented — a date-versioned scheme carries no compatibility promise.
   `ci-srl.yaml` was updated in the same change, so the blocking lab job
   compiles through the new entry point.
 
+### Added
 
 - **Interactive root-module picker.** `run_compiler` needs *root* modules — the
   ones pyang is told about directly, because pyang expands an `augment` only
@@ -70,6 +73,7 @@ documented — a date-versioned scheme carries no compatibility promise.
   the same changelog section, so the page and the repository cannot drift.
 - **Dependabot**, weekly and grouped, for `uv` and `github-actions`.
 
+### Changed
 
 - **A compile that pyang rejects now refuses to generate.** pyang prints
   errors, calls the emitter anyway, and only exits non-zero afterwards, so the
@@ -109,6 +113,7 @@ documented — a date-versioned scheme carries no compatibility promise.
 - `AGENTS.md` and `docs/dev.md` state the release contract — when it is enforced,
   by what, and which failures motivated each guard.
 
+### Fixed
 
 - **The generated sdist shipped the package twice.** The emitter writes the
   client flat (so the lab harness can import it) and namespaced (so pip installs
@@ -138,7 +143,28 @@ documented — a date-versioned scheme carries no compatibility promise.
   asserted the CLI reports an empty string.
 - The offline suite wrote to the repository: the `no_writes` fixture stubbed
   `run()` but not `bump()`, which edits `pyproject.toml`, re-locks and commits.
+- **Every `ci-pr` run failed at `uv run ruff check .` — on `main`, and therefore
+  on every branch and every dependabot PR.** `scripts/changelog.py` was added
+  carrying a `#!/usr/bin/env python3` shebang at mode 644, which is ruff's
+  `EXE001`. It was invisible locally: the same ruff binary, on the same file at
+  the same mode, reports the violation inside a container and reports nothing on
+  the developer host, with `os.access(path, X_OK)` false and `stat` reporting
+  644 in both. Found by reproducing CI in a container and bisecting the workflow
+  runs — `575f798` passes, `bdd3978` fails, and that is the commit that added
+  the file. Fixed with `chmod +x`, and the offline suite now asserts the
+  invariant from the git index, which is what a checkout reproduces.
+- **The offline CI job ran a single test file.** `pytest tests/test_matrix.py`
+  meant every test added outside it never ran in CI — 46 of them, covering the
+  release gates themselves. It now runs the whole offline suite.
+- **`promote()` discarded every `###` heading, which is why this section was 170
+  flat bullets with no categories.** `Section.notes()` strips headings on
+  purpose: it answers "does this section document anything", and a heading does
+  not document anything. That is right for the emptiness check and wrong for the
+  text written out. The check keeps `notes()`; the output takes the body
+  verbatim. The categories below were restored from the pre-promotion text, and
+  the entries are byte-identical.
 
+### Verified
 
 - 136 offline tests, `ruff` / `ruff format` / `ty` / `pyrefly` clean.
 - `content="nonconfig"` proven **live** on SR Linux 25.10.1 — the only device in
@@ -167,6 +193,7 @@ documented — a date-versioned scheme carries no compatibility promise.
   `compileall` — because the published `2026.10.16` predates the CLI merge and
   has no `yang2sdk` binary to check.
 
+### Known limitations
 
 - NMDA (RFC 8526) paths still have no live coverage; the `has_nmda` branch is
   covered offline only.
@@ -176,7 +203,6 @@ documented — a date-versioned scheme carries no compatibility promise.
 - **No release has yet run through the new workflow.** `verify-published` and
   `github-release` are unexecuted until the next tag; their logic is proven
   locally, their execution is not.
-
 ## [2026.10.16] - 2026-10-16
 
 First release. Everything below accumulated since inception and was previously
