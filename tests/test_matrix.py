@@ -140,10 +140,15 @@ def test_every_tracked_file_with_a_shebang_is_executable() -> None:
         check=False,
     )
     if listed.returncode != 0:
+        # Git refusing is not the same as there being no index, and the
+        # difference matters to whoever reads this: the common cause is running
+        # as a user that does not own the checkout ("dubious ownership"), where
+        # the invariant is real but cannot be read from here. Quoting git's own
+        # words is what makes the skip diagnosable instead of mysterious.
+        detail = listed.stderr.strip().splitlines()
         pytest.skip(
-            "not a git checkout, so there is no index to read. The invariant is "
-            "about the mode a checkout reproduces, which is why it is read from "
-            "the index rather than from the filesystem."
+            "`git ls-files` failed, so the index cannot be read and the "
+            f"invariant cannot be checked here: {detail[-1] if detail else '?'}"
         )
 
     offenders: list[str] = []
