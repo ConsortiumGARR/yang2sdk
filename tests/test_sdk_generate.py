@@ -1,7 +1,7 @@
 """Generate + exercise both SDKs against live notconf images (integration).
 
 Per image: download YANG via get-schema (RFC 6241 Sec 7 + ietf-netconf-
-monitoring, same path as cli/downloader.py) -> yang2restconf + yang2netconf
+monitoring, same path as cli/downloader.py) -> both protocols
 compile (same path as cli/compiler.py Compiler) -> import sample -> Pydantic
 validate live payloads -> full CRUD round-trips (create/retrieve/update/
 replace/delete) through both generated SDKs -> idempotent same-data merges

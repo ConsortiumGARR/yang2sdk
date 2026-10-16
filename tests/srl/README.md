@@ -18,7 +18,7 @@ against real SR Linux instead of the `notconf` simulator.
   `SRL_DEVICE_USER` / `SRL_DEVICE_PASS` (see `../../.env.srl-lab.example`) to
   point the same code at a remote node.
 - YANG source: **the node's own library**, pulled over `get-schema` by
-  `yang-downloader`, then compiled with `yang2netconf` over the augment
+  `yang-downloader`, then compiled with `yang2sdk --protocol netconf` over the augment
   closure from `srl_nokia-system` + `srl_nokia-interfaces`. Offline
   `nokia/srlinux-yang-models` (tag matching the image) is the manual fallback
   when there is no node to ask; CI does not use it.
@@ -35,7 +35,7 @@ uv run yang-downloader                           # -> temp/yang_modules/srl (cre
 mkdir -p temp/yang_tree
 mapfile -t F < <(uv run python -m yang2sdk.cli.closure \
   srl_nokia-system srl_nokia-interfaces --yang-dir temp/yang_modules/srl --format files)
-uv run yang2netconf "${F[@]}" --device srl \
+uv run yang2sdk --protocol netconf --roots srl_nokia-system,srl_nokia-interfaces --device srl \
   --yang-dir temp/yang_modules/srl --output-dir temp/netconf_clients/srl
 NOTCONF_RUN_INTEGRATION=1 uv run pytest tests/test_srl_netconf.py -v
 sudo -E containerlab destroy -t srl.clab.yml --cleanup

@@ -4435,6 +4435,264 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
     )
     assert again.returncode == 0, again.stderr[-2000:]
     assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
+
+
+# --- yang2sdk CLI: root picking ---------------------------------------------
+#
+# Picking root modules was the last hand-fed step in the pipeline, and it is
+# load-bearing: pyang expands an `augment` only when the augmenting module is
+# also named (RFC 7950 Sec 7.17), so a wrong root set emits a model that
+# imports cleanly and then rejects the device's own replies under
+# `extra="forbid"`. These tests pin WHAT gets suggested, measured against the
+# real vendor trees.
+
+_PICKER_YANG = {
+    "pbase.yang": """module pbase {
+  prefix pb;
+  namespace "urn:test:pbase";
+  revision 2026-01-01;
+  container system { leaf hostname { type string; } }
+  rpc reboot { input { leaf delay { type uint32; } } }
+}
+""",
+    # Imports base -> not a root. Augments base -> reached via the closure.
+    # Statement order is load-bearing: a module body is namespace, prefix,
+    # import/include, revision, then data definitions. `import` after `revision`
+    # is a parse error, and pyang reports it as 'unexpected keyword "import"'
+    # rather than as an ordering complaint. Filenames match module names so
+    # pyang does not warn.
+    "pimports.yang": """module pimports {
+  prefix pi;
+  namespace "urn:test:pimports";
+  import pbase {
+    prefix pb;
+  }
+  revision 2026-01-01;
+  container extra {
+    leaf x {
+      type string;
+    }
+  }
+}
+""",
+    "paug.yang": """module paug {
+  prefix pa;
+  namespace "urn:test:paug";
+  import pbase {
+    prefix pb;
+  }
+  revision 2026-01-01;
+  augment "/pb:system" {
+    leaf patched {
+      type string;
+    }
+  }
+}
+""",
+    # Operations only: no top-level data node at all.
+    "pops.yang": """module pops {
+  prefix po;
+  namespace "urn:test:pops";
+  revision 2026-01-01;
+  rpc install { input { leaf pkg { type string; } } output { leaf ok { type boolean; } } }
+  rpc remove { }
+}
+""",
+    # The transport itself: rpcs that are the client's own operations. Named
+    # `ietf-netconf` because the exclusion is name-based on the real IETF
+    # module names -- a fixture called "pproto" would never exercise the rule.
+    "ietf-netconf.yang": """module ietf-netconf {
+  prefix pp;
+  namespace "urn:test:pproto";
+  revision 2026-01-01;
+  rpc get-config { }
+  rpc edit-config { }
+}
+""",
+    # Real data, so a real suggestion even though the name looks like plumbing.
+    "pmonitor.yang": """module pmonitor {
+  prefix pm;
+  namespace "urn:test:pmonitor";
+  revision 2026-01-01;
+  container state { leaf uptime { type uint32; } }
+  rpc get-schema { }
+}
+""",
+}
+
+
+def _picker_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "picker_yang"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in _PICKER_YANG.items():
+        (d / name).write_text(text)
+    return d
+
+
+def _suggested(d: Path) -> list[str]:
+    from yang2sdk.cli import rootpicker
+
+    return [
+        c.module
+        for c in rootpicker.suggested_roots(
+            rootpicker.with_top_level(rootpicker.scan(d), d)
+        )
+    ]
+
+
+def test_picker_suggests_data_and_operation_modules(tmp_path):
+    """A suggested root carries top-level data OR operations.
+
+    Regression from the G30 tree: the rule counted data nodes only, so
+    `coriant-rpc` (41 operations) and `coriant-cli` (37) were dropped -- a
+    module whose entire surface is operations declares no data nodes. Measured
+    there, vendor RPC modules are the device's API and belong in the model.
+    """
+    suggested = _suggested(_picker_dir(tmp_path))
+
+    assert "pbase" in suggested, "a data-bearing module must be suggested"
+    assert "pops" in suggested, (
+        "an operations-only module must be suggested: it declares no top-level "
+        "data node, and dropping it loses the device's whole API"
+    )
+
+
+def test_picker_excludes_transport_rpcs(tmp_path):
+    """`get-config`/`edit-config` are the client's own operations, not roots.
+
+    Compiling them is how the G30 tree ended up with 18 of 19 top-level
+    navigators being protocol plumbing.
+    """
+    assert "pproto" not in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_keeps_a_module_that_has_real_data_despite_its_name(tmp_path):
+    """ietf-netconf-monitoring stays a root because netconf-state is a read.
+
+    The transport exclusion is name-based, so it has to stop at the first
+    `ietf-netconf*` that carries real data of its own -- otherwise the rule
+    would silently drop a legitimate device read.
+    """
+    assert "pmonitor" in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_offers_a_module_that_imports_another(tmp_path):
+    """Being imported does not disqualify a module as a root.
+
+    Measured on SR Linux: `srl_nokia-system` is imported by 88 modules and is
+    still one of the two roots ci-srl compiles. A rule that excluded modules
+    with importers disqualified the single most useful root on the device.
+    """
+    assert "pimports" in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_does_not_offer_an_augment_only_module(tmp_path):
+    """Augment-only modules are the closure's job, not the operator's.
+
+    pyang expands an `augment` only when the augmenting module is also named
+    (RFC 7950 Sec 7.17), and `expand_augment_closure` already resolves that
+    transitively -- measured on SR Linux, naming 2 roots pulls in 93 more.
+    Offering them as roots would ask the operator to do by hand what the
+    compiler does automatically.
+    """
+    assert "paug" not in _suggested(_picker_dir(tmp_path))
+
+
+def _run_cli(argv: list[str], **popen_kwargs) -> subprocess.CompletedProcess:
+    """Invoke the `yang2sdk` entry point as a subprocess, like a user does."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from yang2sdk.cli.main import main; raise SystemExit(main())",
+            *argv,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+        **popen_kwargs,
+    )
+
+
+def test_yang2sdk_without_protocol_teaches_and_does_not_compile():
+    """Bare `yang2sdk` prints the pipeline and exits non-zero.
+
+    Exit 0 would let a script that forgot --protocol read "success" from a run
+    that compiled nothing.
+    """
+    proc = _run_cli([])
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    assert "yang-downloader" in proc.stdout + proc.stderr, "help must teach the flow"
+    assert "--protocol" in proc.stdout + proc.stderr
+
+
+def test_yang2sdk_help_teaches_the_four_step_pipeline():
+    proc = _run_cli(["--help"])
+
+    assert proc.returncode == 0, proc.stderr[-500:]
+    text = proc.stdout
+    for expected in ("yang-downloader", "--protocol", "uv add", "sdk-verify"):
+        assert expected in text, f"--help must mention {expected!r}"
+
+
+def test_yang2sdk_refuses_to_prompt_when_stdin_is_not_a_tty(tmp_path):
+    """CI has no TTY, so an absent --roots must fail fast, not block on a read.
+
+    This is the property that keeps the blocking ci-srl job safe: a prompt that
+    waits for input that will never arrive is a hung pipeline.
+    """
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        ["--protocol", "netconf", "--yang-dir", str(d), "--device", "x"],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    combined = proc.stdout + proc.stderr
+    assert "not a terminal" in combined, combined[-500:]
+    assert "--roots" in combined, "the error must say how to proceed"
+
+
+def test_yang2sdk_roots_resolves_names_to_files(tmp_path):
+    """`--roots a,b` becomes real paths, and an unknown name fails loudly."""
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        [
+            "--protocol",
+            "netconf",
+            "--yang-dir",
+            str(d),
+            "--device",
+            "pickerok",
+            "--device-version",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--roots",
+            "pbase",
+        ],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert (tmp_path / "out" / "__init__.py").is_file()
+    assert (tmp_path / "out" / "data_models").is_dir()
+
+
+def test_yang2sdk_rejects_an_unknown_root_name(tmp_path):
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        ["--protocol", "netconf", "--yang-dir", str(d), "--roots", "nosuchmodule"],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    assert "nosuchmodule" in proc.stderr, proc.stderr[-500:]
+
+
 BROKEN_YANG = """module tbroken {
   prefix tb;
   namespace "urn:test:tbroken";

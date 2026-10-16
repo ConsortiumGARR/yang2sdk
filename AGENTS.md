@@ -25,8 +25,8 @@ Concretely, production-grade means:
 
 ```
 yang-downloader (NETCONF get-schema)
-  → pyang -f tree inspection (human picks root modules)
-  → yang2restconf / yang2netconf (pyang plugin: AST → IR → Jinja)
+  → yang2sdk root picker (proposes roots; human confirms)
+  → yang2sdk --protocol netconf|restconf (pyang plugin: AST → IR → Jinja)
   → sdk-verify (full-tree read + RPC round-trip + gated CRUD, LAB ONLY)
   → publish generated client as versioned package
 ```
@@ -34,8 +34,8 @@ yang-downloader (NETCONF get-schema)
 | Stage | Entry point | Notes |
 |---|---|---|
 | Download YANG | `src/yang2sdk/cli/downloader.py` (`yang-downloader`) | `ietf-netconf-monitoring/get-schema` via `ncclient`. Output: `temp/yang_modules/<device>/`. |
-| Inspect tree | `uv run pyang -p temp/yang_modules/<device>/ -f tree …` | Human identifies *root* modules. No automation here yet. |
-| Compile | `src/yang2sdk/cli/compiler.py` (`yang2restconf`, `yang2netconf`) | In-process pyang invocation. Defaults: `--yang-dir temp/yang_modules/<device>`, `--output-dir temp/{restconf,netconf}_clients/<device>`. Flags: `--device`, `--yang-dir`, `--output-dir`, `--config-only`, `--device-version`, `--package-version`, `--deviation-module`, `--feature`, `--features-file`, `--no-device-features`, `--ignore-error`, `--check-model-gaps` (NETCONF only). |
+| Pick roots | `src/yang2sdk/cli/rootpicker.py` (`yang2sdk` with no `--roots`) | Proposes modules that declare top-level data **or** operations; human confirms with Enter, or filters. Excludes `ietf-netconf*` transport RPCs (`get-config`/`edit-config`); ranks `ietf-yang-library`/monitoring/deviations last. Measured: 31 of 357 modules on SR Linux (both ci-srl roots among them), 8 of 130 on G30 including `coriant-rpc`/`coriant-cli`, whose entire surface is operations. `pyang -f tree` over the same tree costs the same (~16s) but yields 18k lines to read by hand. |
+| Compile | `src/yang2sdk/cli/main.py` (`yang2sdk --protocol netconf\|restconf`) | In-process pyang invocation. Defaults: `--yang-dir temp/yang_modules/<device>`, `--output-dir temp/{restconf,netconf}_clients/<device>`. Flags: `--device`, `--yang-dir`, `--output-dir`, `--config-only`, `--device-version`, `--package-version`, `--deviation-module`, `--feature`, `--features-file`, `--no-device-features`, `--ignore-error`, `--check-model-gaps` (NETCONF only). |
 | IR | `src/yang2sdk/plugin/src/ir.py` (`IRBuilder`) | AST → `IRModule/IRModel/IREnum/IRNavNode/IRField` dataclasses. Load-bearing logic, see §5. |
 | Emit | `src/yang2sdk/plugin/src/core.py` (`Yang2Restconf`, `Yang2Netconf`) | IR → Jinja templates in `src/yang2sdk/plugin/src/templates/{restconf,netconf}/`. |
 | Validate | `src/yang2sdk/cli/sdk_verify.py` (`sdk-verify`) | Walks the generated navigator tree and calls its own methods: `read` (full tree, bounded depth), `rpc` (serialise every Input, no send), `crud` (idempotent merge + proven restore). Both protocols. LAB ONLY. |
@@ -169,8 +169,8 @@ cp .env.example .env            # never commit .env
 uv run yang-downloader
 mkdir -p temp/yang_tree
 uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
-uv run yang2restconf <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
-uv run yang2netconf  <root1.yang> [<root2.yang> ...] [--device <device>] [--config-only]
+uv run yang2sdk --protocol netconf   [--device <device>]   # picks roots interactively
+uv run yang2sdk --protocol restconf --device <device> --roots <mod1>,<mod2>
 uv run sdk-verify --device <d>  # LAB ONLY, see §11
 ```
 

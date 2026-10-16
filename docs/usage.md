@@ -9,8 +9,9 @@ Generating clients, authenticating, writing safely, calling RPCs, and packaging 
 Both targets share the same navigator intent and differ only in transport; the per-class surface is asymmetrical by protocol (RESTCONF plural lists expose `create`, not `update`; NETCONF plural lists expose `update`, not `delete` — see `AGENTS.md` parity table).
 
 ```bash
-uv run yang2restconf temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
-uv run yang2netconf  temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
+uv run yang2sdk --protocol netconf   --device <device>   # interactive: pick the roots
+uv run yang2sdk --protocol restconf --device <device>
+uv run yang2sdk --protocol netconf --device <device> --roots ietf-interfaces,ietf-system
 ```
 
 | Flag | Effect |
