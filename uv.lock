@@ -861,7 +861,7 @@ wheels = [
 
 [[package]]
 name = "yang2sdk"
-version = "0.1.0"
+version = "2026.10.16"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
