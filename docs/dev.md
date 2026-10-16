@@ -84,13 +84,32 @@ Golden snapshots under `tests/fixtures/golden/` are run-local and gitignored.
 
 ## Releasing
 
-There was no release process before `v0.1.0` (2026-10-15): no publish workflow,
-no tag convention, and 57KB of changelog sitting under `[Unreleased]`. This is it.
+There was no release process before the first release (`v2026.10.16`): no publish
+workflow, no version convention, and 57KB of changelog sitting under
+`[Unreleased]`. This is it.
 
-**Tag convention:** `v<MAJOR>.<MINOR>.<PATCH>`, matching `pyproject.toml`'s
-`version` exactly — `v0.1.0`, never `0.1.0` and never a bare `0.1.0-dev`. The
-`release.yaml` build job asserts `tag == pyproject version` and fails the run on
-mismatch, so a drifted tag cannot publish.
+**Versioning: CalVer, the release date.** `version` is `YYYY.M.D` — the day the
+release was cut — and the tag is that value with a `v` prefix:
+`v2026.10.16`. Adopted 2026-10-16, replacing a SemVer `0.1.0` that was never
+published: the first tag was pushed as `v2026.10.16` while `pyproject.toml`
+still said `0.1.0`, and the guard caught it.
+
+The `release.yaml` build job asserts `tag == pyproject version` exactly and
+fails the run on mismatch, so a drifted tag cannot publish. Four consequences
+worth knowing before you tag:
+
+- **The tag must point at the commit carrying the version.** `git tag -f` onto
+  an unchanged commit does *not* re-run the workflow — GitHub keys `on.push` on
+  the ref value — and "Re-run failed jobs" on the old run re-executes the old
+  commit and fails identically.
+- **Never push a SemVer tag** (`v0.1.0`, `v1.2.3`): same guard, same failure.
+- **No zero padding needed.** PEP 440 orders `YYYY.M.D` numerically, so
+  `2026.10.2 < 2026.10.16 < 2026.11.1`. Padding only helps a human sorting
+  filenames.
+- **A version bump must carry `uv.lock`.** `uv.lock` records the editable root's
+  version, and `ci-pr` runs `uv sync --locked`, which fails without it. A
+  version change forces a re-resolve, so `uv lock` needs network — it cannot be
+  done offline from cache.
 
 Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
 conference tags, not releases. They do not match a version and nothing
@@ -110,7 +129,12 @@ runs `twine check --strict`, and publishes to PyPI.
 **What the workflow does not do:** it cannot create the PyPI-side configuration.
 Either enable Trusted Publishing for the repo (recommended; no secret needed) or
 add a project-scoped API token as the `PYPI_TOKEN` repository secret, and create
-the `pypi` environment so publishing needs an approver.
+the `pypi` environment so publishing needs an approver. This must be in place
+**before** the tag is pushed: `yang2sdk` does not yet exist on PyPI, so the first
+upload creates the project, and PyPI rejects the OIDC exchange with a 403 unless
+the trusted publisher is already registered against the exact name `yang2sdk`. A
+`pypi` environment created implicitly by the first run has no protection rules,
+which is the opposite of the approver gate the workflow assumes.
 
 **Verify a release locally before tagging:**
 

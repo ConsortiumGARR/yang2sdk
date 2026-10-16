@@ -1,16 +1,17 @@
 # Changelog
 
 All notable changes to `yang2sdk` are documented here. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
-`0.x` pre-1.0 (breaking changes allowed, documented).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is CalVer
+on the release date (`YYYY.M.D`), and breaking changes are allowed and
+documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-15
+## [2026.10.16] - 2026-10-16
 
 First release. Everything below accumulated since inception and was previously
-recorded only under `[Unreleased]`. This is a `0.x` pre-1.0 release: breaking
-changes are allowed and will be documented.
+recorded only under `[Unreleased]`. Breaking changes are allowed and will be
+documented.
 
 Known limitations, recorded honestly rather than deferred (see `AGENTS.md` for
 the full statements):
