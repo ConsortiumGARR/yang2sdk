@@ -7,7 +7,7 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
-### Removed (breaking)
+## [2026.10.16.1] - 2026-10-16
 
 - **`yang2netconf` and `yang2restconf` are gone; `yang2sdk --protocol` replaces
   both.** They were the same program with a hardcoded transport, so a third
@@ -18,7 +18,6 @@ documented — a date-versioned scheme carries no compatibility promise.
   `ci-srl.yaml` was updated in the same change, so the blocking lab job
   compiles through the new entry point.
 
-### Added
 
 - **Interactive root-module picker.** `run_compiler` needs *root* modules — the
   ones pyang is told about directly, because pyang expands an `augment` only
@@ -71,7 +70,6 @@ documented — a date-versioned scheme carries no compatibility promise.
   the same changelog section, so the page and the repository cannot drift.
 - **Dependabot**, weekly and grouped, for `uv` and `github-actions`.
 
-### Changed
 
 - **A compile that pyang rejects now refuses to generate.** pyang prints
   errors, calls the emitter anyway, and only exits non-zero afterwards, so the
@@ -111,7 +109,6 @@ documented — a date-versioned scheme carries no compatibility promise.
 - `AGENTS.md` and `docs/dev.md` state the release contract — when it is enforced,
   by what, and which failures motivated each guard.
 
-### Fixed
 
 - **The generated sdist shipped the package twice.** The emitter writes the
   client flat (so the lab harness can import it) and namespaced (so pip installs
@@ -142,7 +139,6 @@ documented — a date-versioned scheme carries no compatibility promise.
 - The offline suite wrote to the repository: the `no_writes` fixture stubbed
   `run()` but not `bump()`, which edits `pyproject.toml`, re-locks and commits.
 
-### Verified
 
 - 136 offline tests, `ruff` / `ruff format` / `ty` / `pyrefly` clean.
 - `content="nonconfig"` proven **live** on SR Linux 25.10.1 — the only device in
@@ -171,7 +167,6 @@ documented — a date-versioned scheme carries no compatibility promise.
   `compileall` — because the published `2026.10.16` predates the CLI merge and
   has no `yang2sdk` binary to check.
 
-### Known limitations
 
 - NMDA (RFC 8526) paths still have no live coverage; the `has_nmda` branch is
   covered offline only.
