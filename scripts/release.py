@@ -28,11 +28,19 @@ way this can go wrong is checked BEFORE anything is pushed:
     not free the name. This is the check that would have caught the original
     "republish 2026.10.16" request.
 
-Usage::
+Usage — two phases, because the version bump is a code change and this repo's
+ruleset requires a pull request for `main`::
 
-    uv run python scripts/release.py --bump 2026.10.16.1   # bump, commit, tag, push
-    uv run python scripts/release.py                       # tag what is already declared
-    uv run python scripts/release.py --dry-run             # check only, change nothing
+    uv run python scripts/release.py --bump 2026.11.1   # on a branch: notes, bump, commit
+    #   ... open the PR, merge it ...
+    uv run python scripts/release.py                   # on main: derive the tag, push it
+    uv run python scripts/release.py --dry-run         # check only, change nothing
+
+That is one command and a review for the tag, which is the whole point: the
+failure this script exists to prevent was a tag typed one commit ahead of the
+version it named. The bump goes through review because the bump is what the tag
+will name; the tag itself needs none, since it is derived and every check on it
+has already run.
 
 Not shipped in the wheel (it lives outside `src/`), so it costs a consumer
 nothing.
@@ -239,78 +247,117 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         check_clean_tree()
-        check_on_main()
-        check_up_to_date()
 
-        # Resolve the target BEFORE touching anything, so every refusal below
-        # happens with the tree still clean. A half-applied bump committed to
-        # main is worse than no attempt at all.
-        target = args.bump or declared_version()
-
-        if published(target):
-            raise Failure(
-                f"{target} is already published on PyPI. PyPI filenames are "
-                "permanent -- a re-upload fails with 400 File already exists, and "
-                "yanking does not free the name. Pick a new version "
-                "(e.g. the next date under CalVer) and pass --bump."
-            )
-
-        tag = f"v{target}"
-        if not check_tag_absent(tag):
-            raise Failure(
-                f"{tag} already exists on origin. It may have failed to publish; "
-                "moving a public tag rewrites it, so do that deliberately:\n"
-                f"    git tag -f -a {tag} -m '{target}' && git push -f origin {tag}"
-            )
-
+        # `--bump` is a *code change* and belongs on a branch, because this repo's
+        # ruleset requires a pull request for `main` (it is not ceremony: the
+        # bump is what the release tag names, so it is exactly the commit that
+        # deserves review). The tag is the only step taken from a clean main.
+        # Doing both in one run -- as the first version of this script did --
+        # could therefore never succeed here, and the two-phase shape is what
+        # makes "push a tag" one command instead of five.
         if args.bump:
-            prepare_notes(target, may_promote=True, write=not args.dry_run)
-            if args.dry_run:
-                # The bump has not run, so `uv.lock` cannot yet carry the new
-                # version -- `bump()` is what re-locks it. Checking the lock
-                # against `target` here would refuse every `--bump --dry-run`,
-                # which makes the dry run useless precisely when it is wanted
-                # most: before committing a release. Instead check what the
-                # *current* commit must satisfy -- `ci-pr` runs
-                # `uv sync --locked` on it -- and report the re-lock as pending.
-                check_lock_matches(declared_version())
-            else:
-                bump(target)
-                if declared_version() != target:
-                    raise Failure(
-                        f"bump did not take: pyproject.toml says {declared_version()!r}"
-                    )
-                check_lock_matches(target)
-        else:
-            check_lock_matches(target)
+            return _bump_phase(args)
+        return _tag_phase(dry_run=bool(args.dry_run))
 
-        print(f"version    {target}")
-        print(f"tag        {tag}")
-        if args.bump and args.dry_run:
-            print(f"lock       matches pyproject (will re-lock for {target})")
-        else:
-            print("lock       matches pyproject")
-        print("changelog  documents this version")
-        print(f"pypi       {target} not published")
-        print("tag        not on origin yet")
-        if args.dry_run:
-            print("\ndry run: nothing changed")
-            return 0
-
-        annotated = run("git", "tag", "-a", tag, "-m", target)
-        if annotated.returncode != 0:
-            raise Failure(f"git tag failed:\n{annotated.stderr[-400:]}")
-        pushed = run("git", "push", "origin", tag)
-        if pushed.returncode != 0:
-            raise Failure(
-                f"git push failed:\n{pushed.stderr[-400:]}\n"
-                f"The local tag {tag} exists but was not pushed."
-            )
-        print(f"\npushed {tag} -> release.yaml will run")
-        return 0
     except Failure as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+
+def _bump_phase(args: argparse.Namespace) -> int:
+    """Write the version and the notes, commit, and stop before the tag."""
+    target = str(args.bump)
+    if published(target):
+        raise Failure(
+            f"{target} is already published on PyPI. PyPI filenames are "
+            "permanent -- a re-upload fails with 400 File already exists, and "
+            "yanking does not free the name. Pick a new version "
+            "(e.g. the next date under CalVer) and pass --bump."
+        )
+
+    if args.dry_run:
+        prepare_notes(target, may_promote=True, write=False)
+        # The bump has not run, so `uv.lock` cannot yet carry the new version --
+        # `bump()` is what re-locks it. Checking the lock against `target` here
+        # would refuse every `--bump --dry-run`, which makes the rehearsal
+        # useless precisely when it is wanted most: before committing a
+        # release. Check what the *current* commit must satisfy instead --
+        # `ci-pr` runs `uv sync --locked` on it.
+        check_lock_matches(declared_version())
+        print(f"version    {target} (would bump from {declared_version()})")
+        print(f"tag        v{target} (after the merge, not now)")
+        print(f"lock       matches pyproject (will re-lock for {target})")
+        print("changelog  documents this version")
+        print(f"pypi       {target} not published")
+        print("\ndry run: nothing changed")
+        return 0
+
+    prepare_notes(target, may_promote=True, write=True)
+    bump(target)
+    if declared_version() != target:
+        raise Failure(f"bump did not take: pyproject.toml says {declared_version()!r}")
+    check_lock_matches(target)
+
+    print(f"version    {target}")
+    print("lock       matches pyproject")
+    print("changelog  documents this version")
+    print(
+        "\nNow open a PR for this branch and merge it, then on main:\n"
+        "    uv run python scripts/release.py"
+    )
+    return 0
+
+
+def _tag_phase(*, dry_run: bool) -> int:
+    """Verify main, derive the tag from the version, and push it. Writes nothing."""
+    check_on_main()
+    check_up_to_date()
+
+    target = declared_version()
+    if published(target):
+        raise Failure(
+            f"{target} is already published on PyPI. PyPI filenames are "
+            "permanent -- a re-upload fails with 400 File already exists, and "
+            "yanking does not free the name. Pick a new version "
+            "(e.g. the next date under CalVer) and pass --bump."
+        )
+
+    tag = f"v{target}"
+    if not check_tag_absent(tag):
+        raise Failure(
+            f"{tag} already exists on origin. It may have failed to publish; "
+            "moving a public tag rewrites it, so do that deliberately:\n"
+            f"    git tag -f -a {tag} -m '{target}' && git push -f origin {tag}"
+        )
+
+    check_lock_matches(target)
+    prepare_notes(target, may_promote=False, write=False)
+
+    print(f"version    {target}")
+    print(f"tag        {tag}")
+    print("lock       matches pyproject")
+    print("changelog  documents this version")
+    print(f"pypi       {target} not published")
+    print("tag        not on origin yet")
+    if dry_run:
+        # Reached by `scripts/release.py --dry-run`, which is how an operator
+        # rehearses the tag before committing to it. The phase split introduced
+        # this path and initially dropped the flag on the floor, so a dry run
+        # pushed the tag it was supposed to be previewing.
+        print("\ndry run: nothing changed")
+        return 0
+
+    annotated = run("git", "tag", "-a", tag, "-m", target)
+    if annotated.returncode != 0:
+        raise Failure(f"git tag failed:\n{annotated.stderr[-400:]}")
+    pushed = run("git", "push", "origin", tag)
+    if pushed.returncode != 0:
+        raise Failure(
+            f"git push failed:\n{pushed.stderr[-400:]}\n"
+            f"The local tag {tag} exists but was not pushed."
+        )
+    print(f"\npushed {tag} -> release.yaml will run")
+    return 0
 
 
 if __name__ == "__main__":

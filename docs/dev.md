@@ -123,18 +123,28 @@ Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
 conference tags, not releases. They do not match a version and nothing
 publishes from them (`release.yaml` triggers only on `v*`).
 
-**A release is one command.** Write the notes, then:
+**A release is two commands and a review.** Write the notes, then:
 
 ```bash
-uv run python scripts/release.py --bump 2026.11.1
+git switch -c release/2026.11.1
+uv run python scripts/release.py --bump 2026.11.1   # notes, version, lock, commit
+#   ... open the PR, merge it ...
+git switch main && git pull
+uv run python scripts/release.py                   # derive the tag, push it
 ```
 
-It promotes `## [Unreleased]` into `## [2026.11.1] - <today>`, bumps
-`pyproject.toml` + `uv.lock`, commits, derives the tag from the version, and
-pushes it. `--dry-run` runs every check and changes nothing. Do not hand-type a
-tag: the guard exists and it will refuse you, which is the correct outcome
-learned the expensive way on 2026-10-16, when `v2026.10.16.1` was pushed one
-commit before the bump landed and the build died on
+`--dry-run` on either phase runs every check and changes nothing.
+
+The split is not ceremony. The bump is a *code change* — it is the commit the
+tag will name, so it is exactly the one that deserves review — and the ruleset
+requires a pull request for `main`. The tag is the only step taken from a clean
+`main`, and every check on it has already run by then. The first version of the
+script did both in one command, which could therefore never succeed on a
+protected branch; that is the shape that turned "push a tag" into five steps.
+
+Do not hand-type a tag. The guard exists and it will refuse you, which is the
+correct outcome learned the expensive way on 2026-10-16, when `v2026.10.16.1` was
+pushed one commit before the bump landed and the build died on
 `tag v2026.10.16.1 implies 2026.10.16.1 but pyproject.toml says 2026.10.16`.
 
 **The changelog is part of the contract, not documentation.** `scripts/changelog.py`

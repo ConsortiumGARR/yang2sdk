@@ -108,9 +108,16 @@ def on_a_clean_main(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def no_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
-    """Record every `run()` argv instead of executing it."""
+    """Record every `run()` argv instead of executing it.
+
+    Also stubs `bump()`, which is a real writer: it edits `pyproject.toml`, runs
+    `uv lock`, and commits. A test that reaches it dirties the working tree of
+    whoever is running the suite — which is exactly what happened the first time
+    this fixture existed, leaving the repo's own version bumped by a test run.
+    """
     seen: list[tuple[str, ...]] = []
     monkeypatch.setattr(release, "run", lambda *a, **k: seen.append(a) or _done())
+    monkeypatch.setattr(release, "bump", lambda version: None)
     return seen
 
 
@@ -292,6 +299,20 @@ def test_the_real_changelog_is_releasable_for_the_declared_version() -> None:
 # --- the whole thing, dry ---------------------------------------------------
 
 
+def test_the_suite_never_writes_to_the_repository() -> None:
+    """A test that bumps the version is a test that breaks the next run.
+
+    Found the hard way: an early version of `no_writes` stubbed `run()` but not
+    `bump()`, which is itself a writer, so a suite run left `pyproject.toml` and
+    `uv.lock` modified and the *next* run failed on the dirt it had caused.
+    """
+    source = Path(__file__).read_text()
+    assert 'monkeypatch.setattr(release, "bump"' in source, (
+        "the no_writes fixture must stub bump(); it edits pyproject.toml, "
+        "runs `uv lock`, and commits"
+    )
+
+
 def test_a_dry_run_reports_the_tag_and_writes_nothing(
     published_off: list[str],
     on_a_clean_main: None,
@@ -339,6 +360,93 @@ def test_the_dry_run_of_a_bump_is_not_blocked_by_the_bump_it_previews(
     """
     assert release.main(["--bump", "2026.10.16.1", "--dry-run"]) == 0
     assert published_off == ["2026.10.16.1"]
+
+
+# --- the two phases ----------------------------------------------------------
+
+
+def test_a_bump_does_not_tag(
+    published_off: list[str],
+    on_a_clean_main: None,
+    no_writes: list[tuple[str, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bump is a code change; the ruleset requires it to be reviewed.
+
+    Tagging from the same run could never work here — the bump lands on a branch,
+    the ruleset refuses a direct push to `main`, and the tag must name a commit
+    CI has gated. Splitting the phases is what turns "push a tag" into one
+    command instead of five.
+    """
+    # `bump()` is stubbed by no_writes, so both the declared version and the
+    # post-bump lock check have to be told the bump took; otherwise the script
+    # correctly reports that it did not.
+    monkeypatch.setattr(release, "declared_version", lambda: "2026.10.16.1")
+    monkeypatch.setattr(release, "check_lock_matches", lambda version: None)
+    assert release.main(["--bump", "2026.10.16.1"]) == 0
+    assert not [a for a in no_writes if a[:2] == ("git", "tag")]
+    assert not [a for a in no_writes if a[:2] == ("git", "push")]
+
+
+def test_a_dry_run_of_the_tag_phase_never_pushes(
+    published_off: list[str],
+    on_a_clean_main: None,
+    no_writes: list[tuple[str, ...]],
+) -> None:
+    """Regression: the phase split dropped `--dry-run` and the tag got pushed.
+
+    `--dry-run` existed only in the bump phase, so the *rehearsal* of the one
+    irreversible step silently performed it. `no_writes` recorded the argv instead
+    of running it, which is the only reason the repo survived to have the bug
+    found; before that fixture, this would have published a tag from a "dry run".
+    """
+    assert release.main(["--dry-run"]) == 0
+    assert not [a for a in no_writes if a[:2] == ("git", "tag")]
+    assert not [a for a in no_writes if a[:2] == ("git", "push")]
+
+
+def test_a_bump_is_allowed_off_main(
+    monkeypatch: pytest.MonkeyPatch, on_a_clean_main: None
+) -> None:
+    """`--bump` runs on a feature branch, so it must not demand `main`.
+
+    Pins the phase split: `check_on_main()` belongs to the tag phase only, and
+    demanding it during a bump would make the documented flow impossible to
+    start.
+    """
+    monkeypatch.setattr(release, "published", lambda v: False)
+    monkeypatch.setattr(release, "prepare_notes", lambda *a, **k: None)
+    monkeypatch.setattr(release, "bump", lambda v: None)
+    monkeypatch.setattr(release, "declared_version", lambda: "2026.10.16.1")
+    monkeypatch.setattr(release, "check_lock_matches", lambda v: None)
+    monkeypatch.setattr(release, "check_on_main", _forbid("check_on_main"))
+    monkeypatch.setattr(release, "check_up_to_date", _forbid("check_up_to_date"))
+    assert release.main(["--bump", "2026.10.16.1"]) == 0
+
+
+def test_the_tag_phase_requires_main(
+    monkeypatch: pytest.MonkeyPatch, on_a_clean_main: None
+) -> None:
+    """The tag must name a commit `main` holds and CI has gated."""
+    monkeypatch.setattr(release, "published", lambda v: False)
+    monkeypatch.setattr(release, "check_on_main", _refuse("not on main"))
+    assert release.main([]) == 1
+
+
+def _refuse(message: str) -> Any:
+    def go(*args: object, **kwargs: object) -> None:
+        raise release.Failure(message)
+
+    return go
+
+
+def _forbid(name: str) -> Any:
+    """Fail loudly if a guard runs in a phase that must not need it."""
+
+    def go(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"{name} must not run in this phase")
+
+    return go
 
 
 def test_the_script_is_never_shipped_in_the_wheel() -> None:
