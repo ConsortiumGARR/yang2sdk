@@ -4435,3 +4435,98 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
     )
     assert again.returncode == 0, again.stderr[-2000:]
     assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
+BROKEN_YANG = """module tbroken {
+  prefix tb;
+  namespace "urn:test:tbroken";
+  revision 2026-01-01;
+  container top { leaf ok { type string; } }
+  rpc broken {
+    // `confirmation` belongs to ietf-yang-metadata, not the core grammar.
+    // YANG comments are // or /* */ -- a # is itself an illegal keyword.
+    confirmation "not a core statement";
+  }
+}
+"""
+
+
+def test_a_yang_error_writes_no_client(tmp_path):
+    """A model pyang rejects must leave nothing behind.
+
+    pyang prints errors and calls the emitter anyway, exiting non-zero only
+    afterwards, so the run both wrote a complete client AND reported failure.
+    Measured 2026-10-16: the emitted models were byte-identical to a clean
+    compile of the same YANG while the exit was 1. That misleads twice -- CI
+    reddens on a good artifact, and a human who trusts the "Generated SDK in:
+    <dir>" line publishes a model built from rejected YANG.
+    """
+    (tmp_path / "tbroken.yang").write_text(BROKEN_YANG)
+    out = tmp_path / "broken_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(tmp_path / "tbroken.yang"),
+            "--device",
+            "tbroken",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert "unexpected keyword" in proc.stderr, (
+        f"the model must actually fail to parse, or this test is vacuous: {proc.stderr[-500:]}"
+    )
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "Generated" not in proc.stdout, "a refused compile must not announce output"
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+def test_ignore_error_re_enables_generation(tmp_path):
+    """`--ignore-error` stays the working escape hatch.
+
+    pyang keeps a downgraded tag in `ctx.errors` and only skips printing it, so
+    the generator's own guard has to re-apply the same filter. Without that the
+    documented opt-out for a vendor model's illegal XPath would be dead.
+    """
+    yang = tmp_path / "tbroken.yang"
+    yang.write_text(BROKEN_YANG)
+    out = tmp_path / "downgraded_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tbroken",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+            "--ignore-error",
+            "UNEXPECTED_KEYWORD",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert (out / "__init__.py").is_file()
+    assert (out / "data_models").is_dir()
