@@ -491,18 +491,34 @@ def test_the_real_changelog_becomes_releasable_once_the_version_is_promoted(
     releasable" is not the invariant and never was -- asserting it here is what
     made the previous version of this test fail the moment a change was written
     down. The invariant is: *main plus the promotion the bump performs* is
-    releasable, which is the state the tag is pushed from. Checks the real
-    `CHANGELOG.md`, at the real version the tool would derive.
+    releasable, which is the state the tag is pushed from.
+
+    That promotion only exists when something is pending, and immediately after
+    a release nothing is -- `[Unreleased]` is empty and `main` is *already*
+    releasable for the version it declares. The test says so and skips rather
+    than passing vacuously: the state it cannot rehearse is the state where the
+    release already happened, and `test_the_real_changelog_is_well_formed`
+    covers that one.
     """
+    text = (REPO_ROOT / "CHANGELOG.md").read_text()
+    pending = changelog.unreleased(text)
+    if pending is None or not pending.notes(text):
+        pytest.skip(
+            "nothing is pending under '## [Unreleased]', so there is no "
+            "promotion to rehearse: the tree already declares a version and "
+            "documents it, which is the state "
+            "test_the_real_changelog_is_well_formed covers"
+        )
+
     _stub_taken(monkeypatch, pypi={"2026.10.16"}, tags={"v2026.10.16.1"})
     version, _ = release.next_version()
 
-    text = (REPO_ROOT / "CHANGELOG.md").read_text()
     promoted = changelog.promote(text, version)
     assert changelog.require_release_notes(promoted, version).notes(promoted)
-    pending = changelog.unreleased(promoted)
-    assert pending is not None, "promotion must leave a fresh [Unreleased] behind"
-    assert not pending.notes(promoted), (
+
+    left_behind = changelog.unreleased(promoted)
+    assert left_behind is not None, "promotion must leave a fresh [Unreleased]"
+    assert not left_behind.notes(promoted), (
         "promotion must leave [Unreleased] empty, or the next release ships "
         "this one's notes again"
     )

@@ -112,6 +112,69 @@ def _run_release_guard(
     )
 
 
+def test_every_tracked_file_with_a_shebang_is_executable() -> None:
+    """Ruff's `EXE001`, asserted where the answer is a fact and not a view.
+
+    A shebang in a file that is not executable is a violation of an enabled
+    rule, and this one took down every `ci-pr` run: `scripts/changelog.py`
+    carried `#!/usr/bin/env python3` at mode 644 from the commit that added it,
+    so `uv run ruff check .` failed on `main` — and therefore on every branch
+    and every dependabot PR, since they all inherit `main`. The boundary is
+    exact: `575f798` passes, `bdd3978` fails, and that is the commit that added
+    the file.
+
+    It was invisible locally, which is the reason this test exists rather than a
+    note to run ruff. Ruff's answer to "is this file executable" depends on the
+    environment and not only on the file: the *same binary*, on the same
+    directory, at the same mode, reports `EXE001` inside a container and reports
+    nothing on the developer host — with `os.access(path, X_OK)` false and
+    `stat` reporting 644 in both. A rule whose verdict depends on the runner
+    cannot be the only thing enforcing it, so the invariant is read from the git
+    index, which is exactly what a checkout reproduces.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-s", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listed.returncode != 0:
+        # Git refusing is not the same as there being no index, and the
+        # difference matters to whoever reads this: the common cause is running
+        # as a user that does not own the checkout ("dubious ownership"), where
+        # the invariant is real but cannot be read from here. Quoting git's own
+        # words is what makes the skip diagnosable instead of mysterious.
+        detail = listed.stderr.strip().splitlines()
+        pytest.skip(
+            "`git ls-files` failed, so the index cannot be read and the "
+            f"invariant cannot be checked here: {detail[-1] if detail else '?'}"
+        )
+
+    offenders: list[str] = []
+    for entry in listed.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        mode = meta.split()[0]
+        if mode != "100644":  # already executable, or a symlink: nothing to check
+            continue
+        target = REPO_ROOT / path
+        if not target.is_file():
+            continue
+        with target.open("rb") as handle:
+            if handle.read(2) != b"#!":
+                continue
+        offenders.append(path)
+
+    assert not offenders, (
+        "these tracked files start with a shebang but are not executable, which "
+        f"`ruff check .` rejects as EXE001: {offenders}. "
+        "Fix with `chmod +x <path>` and commit the mode change — the mode is "
+        "tracked by git, so the fix is a commit and not a local chmod."
+    )
+
+
 def test_release_tag_guard_passes_on_a_matching_tag(tmp_path: Path) -> None:
     """A tag equal to `pyproject.toml`'s version must let the release build.
 

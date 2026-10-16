@@ -180,6 +180,39 @@ def test_promotion_refuses_rather_than_duplicate_a_section() -> None:
         changelog.promote(GOOD, "2026.1.2")
 
 
+def test_promotion_keeps_the_subsection_headings() -> None:
+    """The categories are part of the notes, not decoration around them.
+
+    Regression, and a shipped one: `promote()` wrote out `Section.notes()`,
+    which strips every line starting with `#` *by design* -- it answers "does
+    this section document anything", and a heading does not document anything.
+    That makes it right for the emptiness check and wrong for the output, and
+    the result is on `main`: `## [2026.10.16.1]` is 170 flat bullets with no
+    `### Added` / `### Fixed` / `### Verified` anywhere, so the reader cannot
+    tell a breaking removal from a documentation fix. The structure was never
+    recovered, which is the cost of a write path that runs once.
+
+    Asserted on the *released* section's text, not on the pending one, because
+    the pending one is discarded by the promotion and the released one is what
+    ships.
+    """
+    original = GOOD.replace(
+        "## [Unreleased]\n",
+        "## [Unreleased]\n\n### Added\n\n- new work\n\n### Fixed\n\n- a bug\n",
+    )
+    promoted = changelog.promote(original, "2026.3.4", on=date(2026, 3, 4))
+
+    released = promoted[
+        promoted.index("## [2026.3.4]") : promoted.index("## [2026.1.2]")
+    ]
+    assert "### Added" in released, released
+    assert "### Fixed" in released, released
+    # ...and the entries under them survive too, in order.
+    assert released.index("- new work") < released.index("- a bug")
+    # The gate is about entries, so the promoted section must still pass it.
+    changelog.require_release_notes(promoted, "2026.3.4")
+
+
 # --- the CLI the workflow calls ---------------------------------------------
 
 

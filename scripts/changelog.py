@@ -222,10 +222,18 @@ def promote(text: str, version: str, on: date | None = None) -> str:
     stamp = (on or datetime.now(tz=UTC).date()).isoformat()
     lines = text.splitlines()
     head = lines[: section.heading_line]
+    # The text written out is the raw body, not `body`: `notes()` strips every
+    # `### Added` / `### Fixed` heading on purpose, because "does this section
+    # document anything" is a question about entries and a heading is not one.
+    # That makes it right for the check above and wrong for the output -- using
+    # it here shipped `2026.10.16.1` as 170 flat lines with no categories at all,
+    # and the structure was never recovered. The check keeps `notes()`; the
+    # output takes the body verbatim.
+    verbatim = "\n".join(lines[section.heading_line + 1 : section.body_end]).strip("\n")
     # `body_end` is the *next* `## [` heading, so the tail starts there. Taking
     # `heading_line + 1 : body_end` as well would re-emit the body a second time
-    # underneath itself -- it is already written from `body`. Demonstrated, not
-    # deduced: the first version printed every promoted entry twice.
+    # underneath itself -- it is already written from `verbatim`. Demonstrated,
+    # not deduced: the first version printed every promoted entry twice.
     tail = lines[section.body_end :]
     rebuilt = "\n".join(
         [
@@ -234,7 +242,7 @@ def promote(text: str, version: str, on: date | None = None) -> str:
             "",
             f"## [{version}] - {stamp}",
             "",
-            *body.splitlines(),
+            *verbatim.splitlines(),
             "",
             *tail,
         ]
