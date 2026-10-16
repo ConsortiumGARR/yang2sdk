@@ -92,7 +92,8 @@ workflow, no version convention, and 57KB of changelog sitting under
 release was cut — and the tag is that value with a `v` prefix:
 `v2026.10.16`. Adopted 2026-10-16, replacing a SemVer `0.1.0` that was never
 published: the first tag was pushed as `v2026.10.16` while `pyproject.toml`
-still said `0.1.0`, and the guard caught it.
+still said `0.1.0`, and the guard caught it. `YYYY.M.D.N` is the same-day
+re-release form, and `scripts/release.py` picks the right `N` by itself.
 
 The `release.yaml` build job asserts `tag == pyproject version` exactly and
 fails the run on mismatch, so a drifted tag cannot publish. It is shell, not a
@@ -122,16 +123,86 @@ Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
 conference tags, not releases. They do not match a version and nothing
 publishes from them (`release.yaml` triggers only on `v*`).
 
-**Procedure:**
+**A release is two commands and a review.** Write the notes, then:
 
-1. Land the code, gates green, on `main`.
-2. Promote `## [Unreleased]` in `CHANGELOG.md` to `## [<version>] - <YYYY-MM-DD>`
-   and leave a fresh empty `## [Unreleased]` above it.
-3. Bump `version` in `pyproject.toml` if it does not already match.
-4. `git tag -a v<version> -m "<version>"` and `git push origin main --tags`.
+```bash
+uv run python scripts/release.py --bump --dry-run   # prints the version it would use
+git switch -c release/2026.11.1                     # ...name the branch that version
+uv run python scripts/release.py --bump             # notes, version, lock, commit
+#   ... open the PR, merge it ...
+git switch main && git pull
+uv run python scripts/release.py                    # derive the tag, push it
+```
 
-Pushing the tag triggers `.github/workflows/release.yaml`, which builds,
-runs `twine check --strict`, and publishes to PyPI.
+`--dry-run` on either phase runs every check and changes nothing.
+
+**Neither the version nor the tag is typed, and for the same reason.** Under
+CalVer the version *is* the date, so the only thing left to decide is the
+same-day sequence number — and PyPI already records which ones are used. The
+script derives `2026.11.1`, or `2026.11.1.2` if that day already produced two
+releases, and prints the candidates it skipped with the reason for each. The
+reason matters when the blocker is a *tag* rather than a PyPI filename: a tag can
+be moved, so you may prefer to fix the stale tag and re-run rather than burn the
+number, and only you can make that call. `--bump 2026.11.1` still works for a
+deliberate jump, but the default derives.
+
+The split is not ceremony. The bump is a *code change* — it is the commit the
+tag will name, so it is exactly the one that deserves review — and the ruleset
+requires a pull request for `main`. The tag is the only step taken from a clean
+`main`, and every check on it has already run by then. The first version of the
+script did both in one command, which could therefore never succeed on a
+protected branch; that is the shape that turned "push a tag" into five steps.
+
+Do not hand-type a tag. The guard exists and it will refuse you, which is the
+correct outcome learned the expensive way on 2026-10-16, when `v2026.10.16.1` was
+pushed one commit before the bump landed and the build died on
+`tag v2026.10.16.1 implies 2026.10.16.1 but pyproject.toml says 2026.10.16`. A
+version typed by hand is the same failure one step earlier, which is why it is
+derived too.
+
+**The changelog is part of the contract, not documentation.** `scripts/changelog.py`
+refuses a release whose version has no section, whose section is empty, whose
+`## [Unreleased]` still holds content (it would ship with the *next* release,
+silently), or whose heading date contradicts the CalVer version. `release.yaml`
+re-checks the same rules in the build job, so a tag pushed around the script is
+still refused. Pinned by `tests/test_changelog.py`, which runs the workflow's own
+`run` text with GitHub's substitution semantics plus a negative control.
+
+The reason is this repo's own record: eight commits landed on `main` after
+`v2026.10.16` — two of them breaking, `yang2netconf`/`yang2restconf` removed
+outright — while `## [Unreleased]` sat empty. The `--check` rule counts real
+entries, not subheadings: `### Added` alone is a promise, not a release note.
+That distinction was found by running the check, not by reading it — the first
+version accepted a section of bare headings, which is the same vacuous pass
+`AGENTS.md` records three times.
+
+**What CI adds, and why each is there:**
+
+| stage | catches |
+| --- | --- |
+| `tag == pyproject version` | a tag typed ahead of the bump (it has happened) |
+| `changelog.py --check` | a version whose change nobody wrote down |
+| `uv build` + `twine check --strict` | metadata PyPI would reject, before the tag is public |
+| publish, Trusted Publishing | no long-lived secret; attestations on (PEP 740, already present on `v2026.10.16`) |
+| `verify-published` | installs the published wheel **from PyPI**, checks `yang2sdk --version`, generates a client and imports it |
+| `github-release` | a release page with notes taken from the changelog section |
+
+`verify-published` exists because "we published" and "the published thing works"
+are different claims and only the first was ever tested: the generated sdist
+shipped the package twice (`3b22730`) with every gate green, because every gate
+ran against the source tree. It deliberately runs no `checkout` step, so an
+editable install from the workspace cannot make it vacuous.
+
+Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
+conference tags, not releases. They do not match a version and nothing
+publishes from them (`release.yaml` triggers only on `v*`).
+
+**A version cannot be reused, on PyPI or here.** Filenames on PyPI are
+permanent — a re-upload fails `400 File already exists`, and yanking does not
+free the name — so `release.py` checks PyPI before tagging and fails closed if
+it cannot reach it. For a same-day re-release use `YYYY.M.D.N`, which the
+derivation selects automatically; its date still has to match the changelog
+heading.
 
 **What the workflow does not do:** it cannot create the PyPI-side configuration.
 Either enable Trusted Publishing for the repo (recommended; no secret needed) or

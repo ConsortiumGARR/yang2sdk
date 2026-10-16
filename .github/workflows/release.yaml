@@ -62,6 +62,17 @@ jobs:
             exit 1
           fi
 
+      # A version number is a claim about what changed. This repo shipped that
+      # claim unbacked once already: eight commits landed on `main` after
+      # v2026.10.16 -- two of them breaking, `yang2netconf`/`yang2restconf`
+      # removed -- while `## [Unreleased]` sat empty. `scripts/release.py`
+      # refuses before tagging, but a tag can be pushed by hand around it, so
+      # the same rule is enforced here too. The rules live in
+      # scripts/changelog.py (stdlib only, hence `python3` and not `uv run`),
+      # and are pinned offline by `tests/test_matrix.py::test_changelog_*`.
+      - name: Fail if CHANGELOG.md does not document this version
+        run: python3 scripts/changelog.py --check "${{ steps.version.outputs.value }}"
+
       - run: uv build --out-dir dist
 
       # --strict: fail on anything PyPI would reject, so a rejected upload is
@@ -89,6 +100,103 @@ jobs:
       # PYPI_TOKEN set in the environment it falls back to that token. The
       # value is passed via `env`, never interpolated into the `with:` block,
       # so it cannot be echoed into a log.
+      #
+      # `attestations: true` is the default since release/v1.8, so v2026.10.16
+      # already carries PEP 740 provenance (verified: both files in the PyPI
+      # simple index carry a data-provenance link). It is set explicitly anyway
+      # so that dropping it is a visible diff rather than a silent downgrade of
+      # the supply chain -- `pip install --require-hashes`-style verification of
+      # a build depends on this being present.
       - uses: pypa/gh-action-pypi-publish@release/v1
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        with:
+          attestations: true
+
+  # "We published" and "the published thing works" are different claims, and
+  # only the first one was ever tested. The generated package shipped the
+  # package twice inside its sdist (fixed in 3b22730) with every gate green,
+  # because every gate ran against the source tree or against a wheel built from
+  # it -- never against what a user gets from `pip install yang2sdk`.
+  #
+  # This job installs the published version from PyPI into a throwaway venv,
+  # outside the checkout, and proves three things that a local build cannot:
+  # the artifact is installable at all, the CLI reports the version it claims,
+  # and it generates a client that imports. Deliberately NOT in ci-pr's
+  # `ci-gate` needs: it can only run after a tag exists.
+  verify-published:
+    needs: publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: astral-sh/setup-uv@v5
+
+      # No checkout: everything below must come from PyPI, and a stray
+      # `uv sync` or an editable install from the workspace would make the whole
+      # job vacuous. `uv pip install` is the pip-compatible interface and does not
+      # discover the project in $GITHUB_WORKSPACE (there is no `--no-project`
+      # flag; that was written here, failed on uv 0.11.7, and was removed).
+      - name: Install the published release from PyPI
+        run: |
+          set -euo pipefail
+          uv venv /tmp/published
+          uv pip install --python /tmp/published/bin/python \
+            "yang2sdk==${{ needs.build.outputs.version }}"
+
+      - name: The installed CLI reports the published version
+        run: |
+          set -euo pipefail
+          got="$(/tmp/published/bin/yang2sdk --version)"
+          echo "$got"
+          case "$got" in
+            *"{{ needs.build.outputs.version }}"*) ;;
+            *) echo "expected version {{ needs.build.outputs.version }}, got: $got" >&2; exit 1 ;;
+          esac
+
+      # Generate from a module small enough to read in full, then import what
+      # came out. `import` is the part that matters: a client that generates but
+      # will not import is the failure mode `_validate_generated` exists to
+      # catch, and it is caught here against the published wheel rather than
+      # against the source tree.
+      - name: The published CLI generates an importable client
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gen && cat > /tmp/gen/tmod.yang <<'YANG'
+          module tmod {
+            prefix tm;
+            namespace "urn:tmod";
+            container top { leaf name { type string; } }
+          }
+          YANG
+          /tmp/published/bin/yang2sdk --protocol restconf \
+            --device verify --device-version 1.0.0 \
+            --yang-dir /tmp/gen \
+            --output-dir /tmp/gen/out /tmp/gen/tmod.yang
+          PYTHONPATH=/tmp/gen/out /tmp/published/bin/python -c \
+            "from verify_1_0_0 import RestconfClient; print('imported', RestconfClient.__name__)"
+          find /tmp/gen/out -name '*.py' -print0 | xargs -0 \
+            /tmp/published/bin/python -m compileall -q
+
+  # A tag with no Release object is invisible on the releases page: no notes, no
+  # changelog link, nothing to point a user at. The body is the release's own
+  # CHANGELOG section, so the notes on GitHub and the notes in the repository
+  # cannot drift -- there is one text, read twice.
+  github-release:
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Publish the release notes from the changelog section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/changelog.py --notes "${{ needs.build.outputs.version }}" \
+            > /tmp/notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "${{ needs.build.outputs.version }}" \
+            --notes-file /tmp/notes.md \
+            --verify-tag

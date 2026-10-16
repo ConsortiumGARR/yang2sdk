@@ -15,6 +15,12 @@ way this can go wrong is checked BEFORE anything is pushed:
     origin -- refuse;
   * `uv.lock` disagrees with `pyproject.toml` -- refuse, because `ci-pr` runs
     `uv sync --locked` and would go red on the commit we just tagged;
+  * `CHANGELOG.md` does not document this version -- refuse. This is the gap
+    that actually bit: eight commits landed on `main` after `v2026.10.16`, two
+    of them breaking, while `## [Unreleased]` sat empty. A version number is a
+    claim about what changed, and an undocumented one cannot be checked. The
+    rules live in `scripts/changelog.py` and are enforced again in CI, so a tag
+    pushed around this script is still refused;
   * the tag already exists -- refuse, so a re-run cannot silently rewrite a
     public ref;
   * the version is already on PyPI -- refuse, because PyPI filenames are
@@ -22,11 +28,24 @@ way this can go wrong is checked BEFORE anything is pushed:
     not free the name. This is the check that would have caught the original
     "republish 2026.10.16" request.
 
-Usage::
+Usage — two phases, because the version bump is a code change and this repo's
+ruleset requires a pull request for `main`::
 
-    uv run python scripts/release.py --bump 2026.10.16.1   # bump, commit, tag, push
-    uv run python scripts/release.py                       # tag what is already declared
-    uv run python scripts/release.py --dry-run             # check only, change nothing
+    uv run python scripts/release.py --bump       # on a branch: notes, derive the
+                                                  # version, bump, commit
+    #   ... open the PR, merge it ...
+    uv run python scripts/release.py              # on main: derive the tag, push it
+    uv run python scripts/release.py --dry-run    # check only, change nothing
+
+Neither the version nor the tag is typed, and for the same reason. Under CalVer
+the version *is* the date, so the only thing to decide is the same-day sequence
+number — and PyPI already records which ones are used. `--bump 2026.11.1` still
+works, for the rare deliberate jump, but the default derives.
+
+The tag needs no review once the bump has had one: it is computed from the
+version, and every check on it has already run by then. The failure this script
+exists to prevent was a tag typed one commit ahead of the version it named; a
+version typed by hand is the same failure one step earlier.
 
 Not shipped in the wheel (it lives outside `src/`), so it costs a consumer
 nothing.
@@ -40,10 +59,24 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+from datetime import UTC, date, datetime
 from pathlib import Path
+
+# Importable as a sibling script. `python scripts/release.py` already puts
+# `scripts/` on sys.path[0], but leaning on that makes the module untestable from
+# anywhere else, so it is stated rather than assumed.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import changelog
 
 REPO = Path(__file__).resolve().parent.parent
 PYPI_URL = "https://pypi.org/pypi/yang2sdk/{version}/json"
+
+# What `taken()` reports for the unresolvable collision. A named constant so
+# callers can branch on it without matching against prose: the tag collision is
+# recoverable and the PyPI one is not, and confusing the two would either refuse
+# a release that could proceed or proceed with one that cannot.
+PUBLISHED = "already on PyPI"
 
 
 class Failure(Exception):
@@ -131,16 +164,89 @@ def check_lock_matches(version: str) -> None:
         raise Failure(f"`uv lock --check` failed:\n{result.stderr[-500:]}")
 
 
-def check_tag_absent(tag: str) -> bool:
-    exists = (
+def tag_exists(tag: str) -> bool:
+    """Is `tag` on origin? Asked once per candidate, so it is named, not inlined."""
+    return (
         run("git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}").stdout.strip()
         != ""
     )
-    return not exists
+
+
+def check_tag_absent(tag: str) -> bool:
+    return not tag_exists(tag)
+
+
+def taken(version: str) -> list[str]:
+    """Every reason `version` cannot be released; empty means it is free.
+
+    PyPI is listed first because it is the one that cannot be undone: filenames
+    there are permanent, so a collision is final. A tag collision is merely in
+    the way -- a human may move it -- but it still cannot be released over.
+    """
+    reasons = []
+    if published(version):
+        reasons.append(PUBLISHED)
+    if tag_exists(f"v{version}"):
+        reasons.append(f"tag v{version} exists on origin")
+    return reasons
+
+
+def next_version(on: date | None = None) -> tuple[str, list[str]]:
+    """Today's version, derived. Returns it and the candidates skipped.
+
+    Under CalVer the version *is* the date, so there is nothing here for a human
+    to decide: the only free variable is the same-day sequence number, and what
+    is already taken answers it. Asking to be told `2026.10.16.1` is asking the
+    operator to do arithmetic the script already holds the inputs for — the same
+    defect as the hand-typed tag this file exists to remove, one step earlier.
+
+    The skips are returned rather than printed so the caller decides when the
+    operator sees them, and so this stays testable without capturing stdout.
+    """
+    # UTC for the same reason `changelog.promote` uses it: a release cut at
+    # 23:30 must not be named differently for whoever is in another zone.
+    day = on or datetime.now(tz=UTC).date()
+    base = f"{day.year}.{day.month}.{day.day}"
+    skipped: list[str] = []
+    for sequence in range(1000):
+        candidate = base if sequence == 0 else f"{base}.{sequence}"
+        reasons = taken(candidate)
+        if not reasons:
+            return candidate, skipped
+        skipped.append(f"{candidate} ({', '.join(reasons)})")
+    raise Failure(
+        f"every version from {base} to {base}.999 is taken. Something is wrong "
+        "that another version number will not fix -- check PyPI and the tags."
+    )
+
+
+def _refuse_published(version: str) -> Failure:
+    return Failure(
+        f"{version} is already published on PyPI. PyPI filenames are "
+        "permanent -- a re-upload fails with 400 File already exists, and "
+        "yanking does not free the name. Pick a new version "
+        "(e.g. the next date under CalVer) and pass --bump."
+    )
+
+
+def _report_skipped(skipped: list[str]) -> None:
+    """Show the arithmetic behind a derived version; silent if there was none.
+
+    Reported rather than silent because the operator's expectation and the
+    derivation can disagree -- most sharply when a *tag* is what blocked a
+    candidate, since that is a decision they may already have made.
+    """
+    if skipped:
+        print(f"skipped    {'; '.join(skipped)}")
 
 
 def bump(version: str) -> None:
-    """Write the version into pyproject.toml, re-lock, commit."""
+    """Write the version into pyproject.toml, re-lock, commit.
+
+    `CHANGELOG.md` is committed in the same commit when it was promoted here, so
+    the tree is clean again by the time anything is tagged. Splitting them would
+    put a half-finished release on main.
+    """
     path = REPO / "pyproject.toml"
     text = path.read_text()
     old = declared_version()
@@ -169,6 +275,38 @@ def bump(version: str) -> None:
     print(f"committed version {old} -> {version}")
 
 
+def prepare_notes(version: str, may_promote: bool, write: bool) -> None:
+    """Make `CHANGELOG.md` releasable for `version`, or explain why it is not.
+
+    With `--bump`, an unwritten `[Unreleased]` is promoted into the version's
+    section -- the heading is mechanical, the prose is the author's. Without
+    `--bump` nothing is promoted: a bare tag run only checks, so it can never
+    rewrite the changelog of a release someone else wrote by hand.
+
+    `write=False` is the dry run. It reports the promotion it *would* make and
+    validates the result in memory, because a dry run that refuses for something
+    the real run would fix is lying about the release.
+    """
+    text = changelog.CHANGELOG.read_text()
+    if changelog.find(text, version) is None and may_promote:
+        try:
+            promoted = changelog.promote(text, version)
+        except changelog.ChangelogError as exc:
+            raise Failure(str(exc)) from exc
+        text = promoted
+        if write:
+            changelog.CHANGELOG.write_text(promoted)
+            run("git", "add", "CHANGELOG.md")
+        print(
+            f"promote    [Unreleased] -> ## [{version}]"
+            f"{'' if write else ' (dry run: not written)'}"
+        )
+    try:
+        changelog.require_release_notes(text, version)
+    except changelog.ChangelogError as exc:
+        raise Failure(str(exc)) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Tag a release from pyproject.toml's version.",
@@ -177,8 +315,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--bump",
+        nargs="?",
+        const="",
+        default=None,
         metavar="VERSION",
-        help="Write VERSION into pyproject.toml, re-lock, commit, then tag.",
+        help=(
+            "Write VERSION into pyproject.toml, re-lock, commit, then stop. "
+            "With no VERSION, derive today's version (CalVer) from what is "
+            "already taken on PyPI and in the tags."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -189,61 +334,120 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         check_clean_tree()
-        check_on_main()
-        check_up_to_date()
 
-        # Resolve the target BEFORE touching anything, so every refusal below
-        # happens with the tree still clean. A half-applied bump committed to
-        # main is worse than no attempt at all.
-        target = args.bump or declared_version()
+        # `--bump` is a *code change* and belongs on a branch, because this repo's
+        # ruleset requires a pull request for `main` (it is not ceremony: the
+        # bump is what the release tag names, so it is exactly the commit that
+        # deserves review). The tag is the only step taken from a clean main.
+        # Doing both in one run -- as the first version of this script did --
+        # could therefore never succeed here, and the two-phase shape is what
+        # makes "push a tag" one command instead of five.
+        if args.bump is not None:
+            return _bump_phase(args)
+        return _tag_phase(dry_run=bool(args.dry_run))
 
-        if published(target):
-            raise Failure(
-                f"{target} is already published on PyPI. PyPI filenames are "
-                "permanent -- a re-upload fails with 400 File already exists, and "
-                "yanking does not free the name. Pick a new version "
-                "(e.g. the next date under CalVer) and pass --bump."
-            )
-
-        tag = f"v{target}"
-        if not check_tag_absent(tag):
-            raise Failure(
-                f"{tag} already exists on origin. It may have failed to publish; "
-                "moving a public tag rewrites it, so do that deliberately:\n"
-                f"    git tag -f -a {tag} -m '{target}' && git push -f origin {tag}"
-            )
-
-        if args.bump:
-            bump(target)
-
-        version = declared_version()
-        if version != target:
-            raise Failure(f"bump did not take: pyproject.toml says {version!r}")
-        check_lock_matches(version)
-
-        print(f"version    {version}")
-        print(f"tag        {tag}")
-        print("lock       matches pyproject")
-        print(f"pypi       {version} not published")
-        print("tag        not on origin yet")
-        if args.dry_run:
-            print("\ndry run: nothing changed")
-            return 0
-
-        annotated = run("git", "tag", "-a", tag, "-m", version)
-        if annotated.returncode != 0:
-            raise Failure(f"git tag failed:\n{annotated.stderr[-400:]}")
-        pushed = run("git", "push", "origin", tag)
-        if pushed.returncode != 0:
-            raise Failure(
-                f"git push failed:\n{pushed.stderr[-400:]}\n"
-                f"The local tag {tag} exists but was not pushed."
-            )
-        print(f"\npushed {tag} -> release.yaml will run")
-        return 0
     except Failure as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+
+def _bump_phase(args: argparse.Namespace) -> int:
+    """Write the version and the notes, commit, and stop before the tag."""
+    skipped: list[str] = []
+    if args.bump:
+        # An explicit version is the operator overriding the derivation, so a
+        # stale tag is *reported* rather than refused: the tag is not pushed
+        # until another phase, and they may intend to move it. The derivation
+        # never arrives here with one -- it skips such candidates -- so this
+        # note only ever appears when the version was named by hand.
+        target = str(args.bump)
+        for reason in taken(target):
+            if reason == PUBLISHED:
+                raise _refuse_published(target)
+            skipped.append(f"{target} ({reason})")
+    else:
+        target, skipped = next_version()
+
+    if args.dry_run:
+        prepare_notes(target, may_promote=True, write=False)
+        # The bump has not run, so `uv.lock` cannot yet carry the new version --
+        # `bump()` is what re-locks it. Checking the lock against `target` here
+        # would refuse every `--bump --dry-run`, which makes the rehearsal
+        # useless precisely when it is wanted most: before committing a
+        # release. Check what the *current* commit must satisfy instead --
+        # `ci-pr` runs `uv sync --locked` on it.
+        check_lock_matches(declared_version())
+        print(f"version    {target} (would bump from {declared_version()})")
+        print(f"tag        v{target} (after the merge, not now)")
+        _report_skipped(skipped)
+        print(f"lock       matches pyproject (will re-lock for {target})")
+        print("changelog  documents this version")
+        print(f"pypi       {target} not published")
+        print("\ndry run: nothing changed")
+        return 0
+
+    prepare_notes(target, may_promote=True, write=True)
+    bump(target)
+    if declared_version() != target:
+        raise Failure(f"bump did not take: pyproject.toml says {declared_version()!r}")
+    check_lock_matches(target)
+
+    print(f"version    {target}")
+    _report_skipped(skipped)
+    print("lock       matches pyproject")
+    print("changelog  documents this version")
+    print(
+        "\nNow open a PR for this branch and merge it, then on main:\n"
+        "    uv run python scripts/release.py"
+    )
+    return 0
+
+
+def _tag_phase(*, dry_run: bool) -> int:
+    """Verify main, derive the tag from the version, and push it. Writes nothing."""
+    check_on_main()
+    check_up_to_date()
+
+    target = declared_version()
+    if published(target):
+        raise _refuse_published(target)
+
+    tag = f"v{target}"
+    if not check_tag_absent(tag):
+        raise Failure(
+            f"{tag} already exists on origin. It may have failed to publish; "
+            "moving a public tag rewrites it, so do that deliberately:\n"
+            f"    git tag -f -a {tag} -m '{target}' && git push -f origin {tag}"
+        )
+
+    check_lock_matches(target)
+    prepare_notes(target, may_promote=False, write=False)
+
+    print(f"version    {target}")
+    print(f"tag        {tag}")
+    print("lock       matches pyproject")
+    print("changelog  documents this version")
+    print(f"pypi       {target} not published")
+    print("tag        not on origin yet")
+    if dry_run:
+        # Reached by `scripts/release.py --dry-run`, which is how an operator
+        # rehearses the tag before committing to it. The phase split introduced
+        # this path and initially dropped the flag on the floor, so a dry run
+        # pushed the tag it was supposed to be previewing.
+        print("\ndry run: nothing changed")
+        return 0
+
+    annotated = run("git", "tag", "-a", tag, "-m", target)
+    if annotated.returncode != 0:
+        raise Failure(f"git tag failed:\n{annotated.stderr[-400:]}")
+    pushed = run("git", "push", "origin", tag)
+    if pushed.returncode != 0:
+        raise Failure(
+            f"git push failed:\n{pushed.stderr[-400:]}\n"
+            f"The local tag {tag} exists but was not pushed."
+        )
+    print(f"\npushed {tag} -> release.yaml will run")
+    return 0
 
 
 if __name__ == "__main__":

@@ -7,6 +7,181 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Removed (breaking)
+
+- **`yang2netconf` and `yang2restconf` are gone; `yang2sdk --protocol` replaces
+  both.** They were the same program with a hardcoded transport, so a third
+  transport would have meant a third copy of twelve flags. Every flag except
+  `--protocol` forwards verbatim to `cli.compiler.run_compiler`, which is how the
+  two surfaces are kept from drifting. `--protocol netconf` is the literal
+  replacement for `yang2netconf`; `--protocol restconf` for `yang2restconf`.
+  `ci-srl.yaml` was updated in the same change, so the blocking lab job
+  compiles through the new entry point.
+
+### Added
+
+- **Interactive root-module picker.** `run_compiler` needs *root* modules — the
+  ones pyang is told about directly, because pyang expands an `augment` only
+  when the augmenting module is also named (RFC 7950 §7.17) — and picking them
+  was the last hand-fed step in the pipeline. Omit `--roots` and the modules
+  that actually declare top-level data **or** operations are proposed (38 of 357
+  on an SR Linux tree, including both roots `ci-srl` compiles). `ietf-netconf*`
+  transport RPCs are excluded, since compiling them is how a G30 tree ended up
+  with 18 of 19 top-level navigators being protocol plumbing; an
+  `ietf-netconf*` module that also carries data stays a candidate, because that
+  data is the device's. `--list-roots` prints and exits. With no TTY (CI) and no
+  `--roots`, it exits 2 with the candidates on stderr rather than blocking on a
+  read that will never come. Cost is the same as the step it replaces: 16.7s for
+  38 numbered rows, against 15.3s for `pyang -f tree`'s 18,604 lines to read by
+  hand. **No `--yes`** — it meant "compile everything suggested", which on SRL
+  compiles three competing interface models with nothing in the output saying
+  which one the device populates.
+- **`yang2sdk --version`.** Reads `importlib.metadata`, so it cannot report a
+  version the installed package does not carry. This is what the release
+  workflow asserts after installing the published wheel from PyPI.
+- **`## Trust protocol` in `AGENTS.md`.** Agents operate at Trust 0: every
+  assertion is a claim requiring proof from source or demonstration. Stated as a
+  principle rather than a procedure, because procedures get satisfied on paper.
+
+- **`yang2sdk --version`.** Reads the installed distribution's metadata via
+  `importlib.metadata`, so it reports what is actually installed rather than a
+  string compiled into the source. Every release after `2026.10.16` is checked
+  with it against the artifact pulled from PyPI, which is what makes a console
+  script missing from the wheel a release-time failure instead of a user's.
+- **`scripts/changelog.py` and `scripts/release.py`.** The release procedure was
+  five hand-run steps with a hand-typed tag and a hand-typed version, and it
+  failed on its first use: `v2026.10.16.1` was pushed one commit before the bump
+  landed and the build died on `tag ... implies 2026.10.16.1 but pyproject.toml
+  says 2026.10.16`. Both numbers are now derived from a single source of truth —
+  the version from the date plus what PyPI already holds, the tag from the
+  version — and every way the release can go wrong is checked before anything is
+  pushed. The version derivation reports each candidate it skipped and *why*, so
+  a collision with a movable tag is distinguishable from one with a permanent
+  PyPI filename.
+- **A changelog gate, enforced twice.** `CHANGELOG.md` must carry a non-empty
+  `## [<version>]` section whose date matches the CalVer version, and
+  `## [Unreleased]` must be empty. `release.py` applies it before tagging and
+  `release.yaml` re-applies it in the build job, so a tag pushed around the
+  script is still refused. Subheadings do not count as entries: `### Added` alone
+  is a promise, not a release note.
+- **`verify-published` and `github-release` jobs.** The first installs the
+  published wheel *from PyPI* — no `checkout` step, so it cannot be satisfied by
+  the source tree — checks `yang2sdk --version`, generates a client from a
+  one-container module and imports it. The second creates the GitHub Release from
+  the same changelog section, so the page and the repository cannot drift.
+- **Dependabot**, weekly and grouped, for `uv` and `github-actions`.
+
+### Changed
+
+- **A compile that pyang rejects now refuses to generate.** pyang prints
+  errors, calls the emitter anyway, and only exits non-zero afterwards, so the
+  same run wrote a complete client *and* reported failure — misleading in both
+  directions. Measured: a `confirmation` statement produced models byte-identical
+  to a clean compile with exit 1. Both emitters now check before writing, so a
+  refused compile leaves no directory behind and announces nothing. The check
+  mirrors pyang's own filtering (`--ignore-errors`, per-tag `--ignore-error`, and
+  `implicit_errors=False`, which keeps errors from imported-but-unnamed modules
+  out of the failure set) and distinguishes warnings from errors by `err_level` —
+  without that, SR Linux's 43 warnings looked like 43 failures.
+  `--ignore-error` remains the documented escape hatch.
+- **NETCONF honours `content=` client-side.** `content="nonconfig"` is not
+  expressible over legacy NETCONF: RFC 6241 §7.7 defines `<get>` as state *and*
+  running configuration, with no state-only read, so a legacy nonconfig read
+  arrives with config mixed in. `prune_xml_to_content` now applies the rule
+  RESTCONF already used, so the two transports agree;
+  `test_netconf_and_restconf_content_pruning_agree` compiles one module for both
+  and compares which paths survive, so they cannot drift. Two corrections found
+  by demonstration: testing `is_config` on complex nodes deleted a state-only
+  container whole (YANG inherits `config true` onto containers per RFC 7950
+  §7.21.6, even when every child is `config false`), and treating a *missing*
+  `is_config` as state deleted every RPC input, so every RPC reached the device
+  with an empty payload.
+
+- **Releasing is two commands and a review.** `--bump` writes the notes, derives
+  the version, re-locks and commits on a branch; after the merge, the bare
+  invocation derives the tag and pushes it. The split is forced: the ruleset
+  requires a pull request for `main`, and the bump is the commit the tag will
+  name, so it is the step that deserves the review. `release.py` previously did
+  both in one run, which could never succeed on this repository.
+- **`scripts/` is a source root for `ty` and `pyrefly`** (`[tool.ty.environment]`,
+  `[tool.pyrefly] search-path`, and `sys.path` in `tests/conftest.py`). `ty` used
+  to need no section because it respected `.gitignore`, which covered `temp/`;
+  that stopped being true once release tooling imported a sibling module. The
+  wheel still ships `src/yang2sdk` only.
+- `AGENTS.md` and `docs/dev.md` state the release contract — when it is enforced,
+  by what, and which failures motivated each guard.
+
+### Fixed
+
+- **The generated sdist shipped the package twice.** The emitter writes the
+  client flat (so the lab harness can import it) and namespaced (so pip installs
+  it). The wheel carried only the namespaced copy, but hatchling puts the whole
+  project tree in an sdist — measured 25 entries with two `data_models/`, two
+  `data_navigators/`, two `__init__.py`. Two identical-looking trees in one
+  artifact is also a trap for anyone hand-editing before publishing.
+- **A RESTCONF model comment claiming an emptied container is "harmless in
+  PATCH/PUT bodies" was false.** A presence container with a defaulted leaf
+  validates to `{"feat": {"enabled": false}}`, which a PUT sends as a real value
+  while an omitted container means deletion (RFC 8040 §4.5).
+
+- **`--dry-run` on the tag phase pushed the tag.** The flag was honoured only in
+  the bump phase, so the rehearsal of the one irreversible step performed it. It
+  survived discovery only because the test fixture records `run()` argv instead
+  of executing it.
+- **`--bump --dry-run` could never pass.** It checked `uv.lock` against a version
+  that only `bump()` creates, so every rehearsal refused — precisely when a
+  rehearsal is wanted. It now checks what the current commit must satisfy.
+- **`--notes` flattened every release** and `--promote` emitted each entry twice.
+- **`uv pip install --no-project` is not a real flag.** It was written into
+  `release.yaml`'s `verify-published` job and rejects on uv 0.11.7, so the job
+  would have failed on its first step of every release. Deleted rather than
+  worked around; uv's `pip` interface does not discover a project anyway.
+- **Both post-publish jobs read `steps.version`, which does not exist outside
+  `build`.** They would have installed `yang2sdk==` with no constraint and
+  asserted the CLI reports an empty string.
+- The offline suite wrote to the repository: the `no_writes` fixture stubbed
+  `run()` but not `bump()`, which edits `pyproject.toml`, re-locks and commits.
+
+### Verified
+
+- 136 offline tests, `ruff` / `ruff format` / `ty` / `pyrefly` clean.
+- `content="nonconfig"` proven **live** on SR Linux 25.10.1 — the only device in
+  reach that can run it. notconf answers 404 for `?content=nonconfig` on `/data`
+  and 500 on `/ds`, while `?content=config` returns 200, so it is specifically
+  that value; and NETCONF's `<get>` works but the image holds no entries carrying
+  both a config and a state leaf. On the live node raw `<get>` for
+  `/system/acl` returns `acl-filter`, `policers` and `egress-mac-filtering`
+  (config) together with `datapath-programming` (state), and the prune separates
+  them. Passed in 4.85s. `tests/test_srl_netconf.py`, non-blocking in `ci-srl`.
+- The new `yang2sdk` CLI compiles the SR Linux client to a **byte-identical**
+  output — 210 files, zero differing hashes — versus `yang2netconf` on the same
+  modules.
+- The wheel built from the extracted sdist is unaffected by the exclusion:
+  extract, build, contents correct, then `uv add <sdist>` in a clean project
+  imports it.
+
+- 46 new tests for the two gates (`tests/test_changelog.py`,
+  `tests/test_release_script.py`), several with negative controls that sabotage
+  the gate and assert it goes red. The whole flow was rehearsed against a scratch
+  bare remote with this repository untouched: dry run, bump on a branch, the tag
+  phase refusing off `main`, merge, and a pushed tag confirmed by
+  `git ls-remote --tags origin 'v…^{}'` to name exactly `main`'s HEAD.
+- `verify-published`'s logic was exercised against a locally built wheel —
+  `yang2sdk --version`, generate, `from verify_1_0_0 import RestconfClient`,
+  `compileall` — because the published `2026.10.16` predates the CLI merge and
+  has no `yang2sdk` binary to check.
+
+### Known limitations
+
+- NMDA (RFC 8526) paths still have no live coverage; the `has_nmda` branch is
+  covered offline only.
+- Golden snapshots remain run-local and gitignored, and there is still no
+  tracked YANG corpus (`git ls-files '*.yang'` returns 0).
+
+- **No release has yet run through the new workflow.** `verify-published` and
+  `github-release` are unexecuted until the next tag; their logic is proven
+  locally, their execution is not.
+
 ## [2026.10.16] - 2026-10-16
 
 First release. Everything below accumulated since inception and was previously

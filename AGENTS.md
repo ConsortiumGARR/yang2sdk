@@ -198,7 +198,8 @@ uv run pyrefly check
   overload. Bump with `uv lock --upgrade-package <tool>` (procedure in
   `docs/dev.md`).
 - Both must pass on `src/`. Astral `ty` and Meta `pyrefly` are complementary; a pass in one does not excuse a failure in the other.
-- Tool scoping lives in `pyproject.toml`: `[tool.ruff]` pins `target-version = "py312"` and excludes ephemeral `temp/` output; `[tool.pyrefly]` excludes `temp/`; `ty` needs no section (it respects `.gitignore`, which already covers `temp/`). There is no `[tool.pyright]` — pyright is gone, do not reintroduce it.
+- Tool scoping lives in `pyproject.toml`: `[tool.ruff]` pins `target-version = "py312"` and excludes ephemeral `temp/` output; `[tool.pyrefly]` excludes `temp/` and adds `scripts` to `search-path`; `[tool.ty.environment]` adds the same `scripts` root via `extra-paths`. `ty` used to need no section because it respected `.gitignore`, which covered `temp/` — that stopped being true once `scripts/release.py` imported `scripts/changelog.py`, and the fix was a section rather than a suppression. There is no `[tool.pyright]` — pyright is gone, do not reintroduce it.
+- `scripts/` is a source root for both checkers and for pytest (via `tests/conftest.py`), but it is **not** in `[tool.hatch.build.targets.wheel]`, which stays `["src/yang2sdk"]`. Release tooling must never become downstream install weight.
 - Generated code under `temp/` is excluded from blocking type-checks (it is ephemeral output), but templates that *produce* it are not — template edits must still type-check at the template level and via a generated sample.
 
 ## Testing and CI
@@ -296,6 +297,27 @@ is not advertised (RFC 6241 §8.6.4.1 makes it optional).
   deletes the rest. Do not remove this guard without an equivalent loud failure.
 - The emitter compiles every generated `.py` before reporting success (`core._validate_generated`).
   Never bypass it: a client that cannot be imported is not a deliverable.
+
+## Releasing (normative)
+
+Two commands and a review. Never hand-type a tag.
+
+```bash
+uv run python scripts/release.py --bump --dry-run   # prints the version it would use
+git switch -c release/2026.11.1
+uv run python scripts/release.py --bump             # notes, version, lock, commit
+#   ... PR, merge ...
+git switch main && git pull
+uv run python scripts/release.py                   # derive the tag, push it
+```
+
+- **Neither the version nor the tag is typed.** CalVer makes the version the date, so the only free variable is the same-day sequence number, and PyPI already records which ones are used: `next_version()` returns `2026.11.1`, or `2026.11.1.2` after two releases that day, and reports every candidate it skipped with the reason. A *tag* collision is reported distinctly from a PyPI one because it is recoverable — the operator may prefer to move the stale tag instead of burning the number, and that is their call, not the script's. `--bump <version>` remains for a deliberate jump.
+- **The tag is derived, never typed.** `release.yaml` asserts `tag == pyproject version`; `scripts/release.py` computes the tag from the same single source of truth. It fired on 2026-10-16 precisely because a human typed `v2026.10.16.1` one commit before the bump landed. A guard that can only say no has moved the failure to a human, not removed it.
+- **The bump is a code change and goes through review.** The ruleset requires a PR for `main`; the bump is the commit the tag will name, so it is the one that deserves the review. The tag is the only step taken from a clean `main`.
+- **A version cannot ship undocumented.** `scripts/changelog.py` refuses unless `CHANGELOG.md` has a non-empty `## [<version>]` section, `## [Unreleased]` is empty, and the heading date agrees with the CalVer version. Enforced again in `release.yaml`'s build job, so a tag pushed around the script is still refused. Humans write the prose; the tool never invents it and never publishes without it.
+- **A version cannot be reused.** PyPI filenames are permanent (a re-upload is `400 File already exists`; yanking does not free the name), so the script checks PyPI before tagging and **fails closed** if it cannot reach it. Same-day re-releases use `YYYY.M.D.N`.
+- **Never move a published tag.** `release.py` refuses if the tag exists on origin and prints the commands to move it, because rewriting a public ref is a human decision.
+- `release.yaml` also runs `twine check --strict`, publishes via Trusted Publishing with PEP 740 attestations, installs the published wheel **from PyPI** to verify it (`verify-published`), and creates the GitHub Release from the changelog section. The full stage table is in `docs/dev.md`; the gates are pinned by `tests/test_changelog.py` and `tests/test_release_script.py`, both of which include a negative control.
 
 ## Contribution guardrails
 
