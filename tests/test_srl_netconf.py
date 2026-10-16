@@ -537,3 +537,103 @@ def test_throwaway_interface_crud(srl_client):
         target(TEST_INTERFACE).retrieve(source=target_ds, content="config", depth=3)
         is None
     ), "throwaway interface survived deletion in the candidate datastore"
+
+
+def _config_state_fields(model_cls) -> tuple[set[str], set[str]]:
+    """(config field names, state field names) from the generated metadata."""
+    config, state = set(), set()
+    for name, info in model_cls.model_fields.items():
+        extra = info.json_schema_extra or {}
+        if "tag" not in extra:
+            continue  # injected attribute (nc_operation), never a wire node
+        (state if extra.get("is_config") is False else config).add(name)
+    return config, state
+
+
+def _payload_fields(model) -> set[str]:
+    """Fields the payload actually carried.
+
+    `getattr(model, f, None) is not None` is wrong here: pydantic materialises a
+    leaf's YANG default during validation, so it is never None and a node the
+    content filter removed still looks present. Measured on this node:
+    `egress-mac-filtering` (default "false") read as config-present after a
+    `content="nonconfig"` read, while the undefaulted `acl_filter` and
+    `policers` lists were correctly dropped -- one defaulted leaf, one false
+    alarm. `exclude_unset` is the honest test.
+    """
+    if model is None:
+        return set()
+    return set(model.model_dump(exclude_unset=True).keys())
+
+
+def test_content_filter_splits_config_from_state(srl_client):
+    """`content=` must mean the same thing as on any other transport, live.
+
+    SR Linux is the device that can prove this. It advertises no `:nmda:1.0`
+    (see test_capability_discovery), so every read takes the legacy RFC 6241
+    path where `content="nonconfig"` maps to `<get>` -- and RFC 6241 Sec 7.7
+    defines `<get>` as state AND running configuration, with no state-only
+    read. The device therefore replies with config and state MIXED, and
+    `prune_xml_to_content` in the generated navigator is what makes
+    `content="nonconfig"` return state alone.
+
+    Measured on this node, raw `<get>` for `/system/acl` returns
+    `acl-filter`, `policers` and `egress-mac-filtering` (config) together
+    with `datapath-programming` (state) in one reply.
+
+    Before this test, `content="nonconfig"` had no live coverage anywhere:
+    the offline tests in test_matrix.py stub the transport, and the notconf
+    simulators cannot run it at all (RESTCONF answers 404/500 for that query,
+    NETCONF has no data to split -- both measured 2026-10-16).
+
+    Any navigator carrying both kinds of leaf is accepted, so the test does
+    not break when the vendor renames a container.
+    """
+    chosen = None
+    for name in _property_names(srl_client.data):
+        nav = getattr(srl_client.data, name)
+        try:
+            model = nav.retrieve(content="all", depth=2)
+        except Exception:  # noqa: BLE001, S112 - probing nodes for one with both
+            continue
+        if model is None:
+            continue
+        config, state = _config_state_fields(type(model))
+        if (
+            config
+            and state
+            and (_payload_fields(model) & config)
+            and (_payload_fields(model) & state)
+        ):
+            chosen = (name, nav, config, state)
+            break
+    if chosen is None:
+        pytest.skip("no top-level navigator carries both config and state leaves")
+
+    name, nav, config, state = chosen
+
+    def got(content):
+        return _payload_fields(nav.retrieve(content=content, depth=2))
+
+    as_all, as_config, as_nonconfig = got("all"), got("config"), got("nonconfig")
+
+    leaked = as_nonconfig & config
+    assert not leaked, (
+        f"content='nonconfig' leaked config fields {sorted(leaked)}: this node "
+        f"replies to <get> with config and state mixed, so the client must strip it"
+    )
+    assert as_nonconfig & state, (
+        f"content='nonconfig' returned no state leaf: {_sorted(as_nonconfig)}"
+    )
+    assert as_config & config, (
+        f"content='config' dropped every config leaf although content='all' "
+        f"returned {sorted(as_all & config)}"
+    )
+    leaked_state = as_config & state
+    assert not leaked_state, (
+        f"content='config' leaked state fields {sorted(leaked_state)}"
+    )
+
+
+def _sorted(names) -> list[str]:
+    return sorted(names)
