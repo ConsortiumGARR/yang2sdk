@@ -54,6 +54,84 @@ def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max
             elif is_complex:
                 prune_xml_tree_to_depth(child_node, child_cls, max_depth, current_depth + 1)
 
+def prune_xml_to_content(element: etree._Element, model_cls: type | None, content: str):
+    """Keep only the nodes matching `content` (RFC 7950 Sec 7.21).
+
+    This mirrors the RESTCONF `YangBaseModel._prune_content` rule exactly, so
+    `content=` means the same thing on both transports. RESTCONF's rule
+    (restconf/data_models/_base.py.jinja:91-110) is bottom-up:
+
+      * recurse into a container/list first;
+      * a node MISMATCHING `content` is dropped, UNLESS it is a container or
+        list still holding a matchable descendant -- then the ancestor shell
+        survives, so RFC 8040 hierarchy is preserved;
+      * a node MATCHING `content` is always kept, even once emptied.
+
+    Why NETCONF needs it: `content=` reaches the wire three ways and RFC 6241
+    cannot express one of them. NMDA sends `<config-filter>` (RFC 8526);
+    RESTCONF sends `?content=` (RFC 8040 Sec 4.5.2); legacy NETCONF maps
+    `config` to `<get-config>` but `nonconfig` to `<get>`, which RFC 6241
+    Sec 7.7 defines as state AND running configuration, with no state-only
+    read. Pruning here is what makes the caller's view match the others.
+
+    Idempotent where the server already filtered, so it is safe to apply
+    unconditionally rather than branching on capability a second time.
+    """
+    if content not in ("config", "nonconfig"):
+        return
+    if model_cls is None:
+        return
+    if hasattr(model_cls, "model_rebuild"):
+        from ..data_models._base import rebuild_model_and_dependencies
+        rebuild_model_and_dependencies(model_cls)
+    if not hasattr(model_cls, "model_fields"):
+        return
+
+    from typing import get_args, get_origin, Union, Annotated
+    import types
+    from pydantic import BaseModel
+
+    def extract_base_model(annot):
+        if annot is None: return None
+        origin = get_origin(annot)
+        if origin in (Union, types.UnionType):
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif origin is list or origin is Annotated:
+            for arg in get_args(annot):
+                if res := extract_base_model(arg): return res
+        elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
+        return None
+
+    keep_config = content == "config"
+
+    for field_name, field_info in list(model_cls.model_fields.items()):
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag", field_name)
+        ns = extra.get("ns")
+        # A missing is_config means config-ness is not defined for this node
+        # (rpc/action/notification subtrees). RESTCONF treats that as config,
+        # because treating it as state pruned real parameters out of a
+        # content="config" read. Match that, so the transports agree.
+        is_config = extra.get("is_config") is not False
+        match = keep_config == is_config
+
+        sub = extract_base_model(field_info.annotation)
+
+        child_nodes = []
+        for child in list(element):
+            localname = etree.QName(child).localname
+            namespace = etree.QName(child).namespace
+            if localname == tag and (not ns or namespace == ns):
+                child_nodes.append(child)
+
+        for child_node in child_nodes:
+            if sub is not None:
+                prune_xml_to_content(child_node, sub, content)
+            keep_shell = sub is not None and len(list(child_node)) > 0
+            if not match and not keep_shell:
+                element.remove(child_node)
+
 def _require_complete_for_replace(data, allow_partial: bool, model_cls=None) -> None:
     """Refuse an `nc:operation="replace"` that would delete unset fields.
 

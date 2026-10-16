@@ -4,8 +4,8 @@ Generate a Pydantic v2, IDE-friendly SDK for your network device directly from t
 
 ```mermaid
 flowchart LR
-    A[yang-downloader<br/>get-schema off the box] --> B[pyang -f tree<br/>you pick root modules]
-    B --> C[yang2restconf / yang2netconf<br/>AST → IR → Jinja]
+    A[yang-downloader<br/>get-schema off the box] --> B[yang2sdk<br/>you confirm the roots]
+    B --> C[yang2sdk --protocol<br/>AST → IR → Jinja]
     C --> D[versioned Python package]
     D --> E[HAL + adapters<br/>multi-vendor automation]
     D -. lab-only .-> F[sdk-verify<br/>read + RPC + gated CRUD]
@@ -60,8 +60,8 @@ cp .env.example .env   # never commit .env; DEVICE_USER / DEVICE_PASS live here
 uv run yang-downloader
 mkdir -p temp/yang_tree
 uv run pyang -p temp/yang_modules/<device>/ -f tree temp/yang_modules/<device>/*.yang > temp/yang_tree/<device>.txt
-uv run yang2restconf temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
-uv run yang2netconf  temp/yang_modules/<device>/file1.yang [file2.yang ...] --device <device>
+uv run yang2sdk --protocol netconf   --device <device>   # picks the roots for you
+uv run yang2sdk --protocol restconf --device <device>
 ```
 
 `temp/` is an untracked workspace — every command creates its own output dir on demand, so a fresh clone has no `temp/` until the first run (and `rm -rf temp/` only loses re-downloadable/recompilable output).

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -3993,3 +3993,798 @@ def test_importing_downloader_creates_no_files(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert not (tmp_path / "temp").exists(), "import must not create temp/"
     assert list(tmp_path.glob("*.log")) == []
+
+
+# --- content= parity across NETCONF branches
+
+
+def _import_fresh(pkg_dir, dotted):
+    """Import from a freshly compiled package, ignoring an earlier one.
+
+    Several tests here compile a module whose generated package has the same
+    name, and Python caches `tcontent_netconf.data_models.tcontent` from the
+    first of them. Without this purge a later test silently asserts against an
+    earlier test's model -- which showed up as tests that pass alone and fail
+    in a full run.
+    """
+    prefix = f"{pkg_dir.name}."
+    stale = [n for n in sys.modules if n == pkg_dir.name or n.startswith(prefix)]
+    for name in stale:
+        del sys.modules[name]
+    return _import(pkg_dir, dotted)
+
+
+# --- content= parity across NETCONF branches -------------------------------
+#
+#
+# `content=` reaches the wire three different ways, and one of them cannot be
+# expressed in RFC 6241. Measured on generated clients by stubbing the
+# dispatch (below) rather than inferred:
+#
+#   content      NMDA (RFC 8526)             legacy (RFC 6241)
+#   config       <config-filter>true</>      <get-config>
+#   all          no config-filter            <get>
+#   nonconfig    <config-filter>false</>     <get>   <- state AND running config
+#
+# RFC 6241 Sec 7.7 defines <get> as returning both, and there is no state-only
+# read, so a legacy `content="nonconfig"` arrives unfiltered. The generated
+# navigator prunes to `is_config` metadata (prune_xml_to_content) so the caller
+# sees the same thing on every transport.
+#
+# RESTCONF needs no such handling: the server filters on `?content=`
+# (RFC 8040 Sec 4.5.2), pinned by test_content_filter_prunes_nested_state.
+
+_NMDA_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
+_NC_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+# What a legacy <get> returns: every node populated, config and state mixed.
+_UNFILTERED_REPLY = (
+    f'<data xmlns="{_NC_NS}">'
+    '<top xmlns="urn:test:tcontent">'
+    "<name>cfg-leaf</name>"
+    "<counter>42</counter>"
+    "<only_state><reads>7</reads></only_state>"
+    "<mixed><cfg>C</cfg><obs>O</obs></mixed>"
+    "<only_config><a>A</a><b>B</b></only_config>"
+    "</top>"
+    "</data>"
+).encode()
+
+CONTENT_STATE_YANG = """module tcontent {
+  prefix tc;
+  namespace "urn:test:tcontent";
+  revision 2026-01-01;
+  container top {
+    leaf name { type string; }
+    leaf counter { type string; config false; }
+
+    // A container holding only state. YANG inherits `config true` onto it from
+    // its parent (RFC 7950 Sec 7.21.6), so pruning on the container's own
+    // is_config would drop it whole and lose the counter inside.
+    container only_state {
+      leaf reads { type string; config false; }
+    }
+
+    // One child of each kind: the state child must survive a nonconfig filter.
+    container mixed {
+      leaf cfg { type string; }
+      leaf obs { type string; config false; }
+    }
+
+    // Emptied entirely by a nonconfig filter: must read as None, not as an
+    // empty model instance a consumer would treat as present.
+    container only_config {
+      leaf a { type string; }
+      leaf b { type string; }
+    }
+  }
+}
+"""
+
+
+class _Reply:
+    """Stands in for an ncclient reply, exposing both accessor styles.
+
+    `retrieve` reads `.data_ele` on the legacy path and `_reply_root` reads
+    `.ele`/`.xml` on the NMDA path, so the stub must carry all three.
+    """
+
+    def __init__(self, xml: bytes):
+        from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+        self.xml = xml
+        self.data_ele = etree.fromstring(xml).find(f"{{{_NC_NS}}}data")
+
+
+class _ManagerSpy:
+    """Records which transport verb the client chose."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _reply(self, name: str, kwargs: dict[str, Any]) -> _Reply:
+        self.calls.append((name, kwargs))
+        return _Reply(_UNFILTERED_REPLY)
+
+    def get(self, **kwargs):
+        return self._reply("<get>", kwargs)
+
+    def get_config(self, **kwargs):
+        return self._reply("<get-config>", kwargs)
+
+    def dispatch(self, rpc):
+        return self._reply("<get-data>", {"rpc": rpc})
+
+
+def _stub_netconf_session(sm, has_nmda: bool):
+    """A NetconfClient wired to spies, with no socket and no credentials."""
+    client = sm.NetconfClient.__new__(sm.NetconfClient)
+    client.has_nmda = has_nmda
+    client._manager = _ManagerSpy()
+    client.module_namespaces = {}
+    client._handle_rpc = lambda func, *a, **kw: func(*a, **kw)
+    return client
+
+
+@pytest.mark.parametrize(
+    ("content", "want_verb", "want_config_filter"),
+    [
+        ("config", "<get-data>", "true"),
+        ("all", "<get-data>", None),
+        ("nonconfig", "<get-data>", "false"),
+    ],
+)
+def test_netconf_nmda_sends_config_filter(
+    tmp_path, content, want_verb, want_config_filter
+):
+    """NMDA expresses all three content values as <config-filter>."""
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    client = _stub_netconf_session(sm, has_nmda=True)
+    client.retrieve(source="running", content=content)
+
+    verb, kwargs = client._manager.calls[0]
+    assert verb == want_verb, kwargs
+    node = kwargs["rpc"].find(f"{{{_NMDA_NS}}}config-filter")
+    got = None if node is None else node.text
+    assert got == want_config_filter, f"{content}: config-filter={got!r}"
+
+
+@pytest.mark.parametrize(
+    ("content", "want_verb"),
+    [("config", "<get-config>"), ("all", "<get>"), ("nonconfig", "<get>")],
+)
+def test_netconf_legacy_maps_content_onto_get_or_get_config(
+    tmp_path, content, want_verb
+):
+    """Legacy maps config to <get-config>; all and nonconfig both become <get>.
+
+    The last row is the whole problem: RFC 6241 has no state-only read, so
+    nonconfig and all are indistinguishable on the wire here.
+    """
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    client = _stub_netconf_session(sm, has_nmda=False)
+    client.retrieve(content=content)
+
+    verb, _kwargs = client._manager.calls[0]
+    assert verb == want_verb, f"content={content!r} used {verb}"
+
+
+@pytest.mark.parametrize(
+    ("content", "want_config", "want_state"),
+    [
+        ("config", True, False),
+        ("all", True, True),
+        ("nonconfig", False, True),
+    ],
+)
+def test_netconf_content_parity_when_the_device_does_not_filter(
+    tmp_path, content, want_config, want_state
+):
+    """The caller sees the same thing on both branches, whatever the device did.
+
+    The session is stubbed to return the unfiltered reply a legacy <get>
+    produces, so this exercises exactly the case RFC 6241 cannot express. If
+    the prune is removed from the navigator, the state/config columns flip and
+    this fails.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    navs = _import_fresh(out, "data_navigators.tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    class _Client:
+        module_namespaces: ClassVar[dict[str, str]] = {}
+
+        def retrieve(self, source=None, filter_xml=None, content=None, **kw):
+            # Always the unfiltered reply: the legacy <get> case.
+            return _et.fromstring(_UNFILTERED_REPLY)
+
+    node_cls = getattr(navs, f"{models.Top.__name__}Node")
+    model = node_cls(_Client(), [("urn:test:tcontent", "top", {})]).retrieve(
+        content=content, depth="unbounded"
+    )
+
+    assert model is not None, "no <top> returned"
+    got_config = model.name is not None
+    got_state = model.counter is not None
+    assert (got_config, got_state) == (want_config, want_state), (
+        f"content={content!r}: got config={got_config} state={got_state}, "
+        f"want config={want_config} state={want_state}"
+    )
+
+
+def _top_from_unfiltered_reply(tmp_path):
+    """The Top model as a caller sees it when the device did NOT filter."""
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    navs = _import_fresh(out, "data_navigators.tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    class _Client:
+        module_namespaces: ClassVar[dict[str, str]] = {}
+
+        def retrieve(self, source=None, filter_xml=None, content=None, **kw):
+            return _et.fromstring(_UNFILTERED_REPLY)
+
+    node_cls = getattr(navs, f"{models.Top.__name__}Node")
+    return node_cls(_Client(), [("urn:test:tcontent", "top", {})]).retrieve(
+        content="nonconfig", depth="unbounded"
+    )
+
+
+def test_netconf_nonconfig_keeps_state_inside_a_config_container(tmp_path):
+    """A container whose children are ALL `config false` must survive.
+
+    Regression, caught by demonstration rather than by a test: YANG inherits
+    `config true` onto a container that does not state it (RFC 7950 Sec 7.21.6),
+    so `only_state` is is_config=True in the generated model even though its
+    only leaf is state. Filtering on the container's own flag deleted it whole
+    and the caller lost the data inside:
+
+        top.only_state = None      instead of OnlyState(reads='7')
+
+    Containers and lists are groupings, so the prune recurses and decides on
+    the leaves.
+    """
+    model = _top_from_unfiltered_reply(tmp_path)
+
+    assert model.only_state is not None, (
+        "state-only container dropped whole: YANG inherits config true onto it, "
+        "so is_config on the container must not drive the filter"
+    )
+    assert model.only_state.reads == "7", model.only_state
+
+
+def test_netconf_nonconfig_keeps_the_state_child_of_a_mixed_container(tmp_path):
+    """`mixed` holds one config and one state child; only the state one survives."""
+    model = _top_from_unfiltered_reply(tmp_path)
+
+    assert model.mixed is not None, "mixed container dropped instead of pruned"
+    assert model.mixed.obs == "O", model.mixed
+    assert model.mixed.cfg is None, (
+        f"config leaf survived a nonconfig read: {model.mixed}"
+    )
+
+
+def test_netconf_nonconfig_renders_an_emptied_container_as_none(tmp_path):
+    """A container emptied by the filter reads as absent, not as an empty model.
+
+    Kept-empty deserializes to `OnlyConfig(a=None, b=None)`, and
+    `if model.only_config:` is then True -- a consumer would read a device that
+    has no such container as having one. None is the honest answer.
+    """
+    model = _top_from_unfiltered_reply(tmp_path)
+
+    assert model.only_config is None, (
+        f"emptied container should be None, got {model.only_config!r}"
+    )
+    assert not model.only_config, "None must stay falsy for `if node:` checks"
+
+
+def _surviving_paths_netconf(tmp_path, content):
+    """Field paths a NETCONF caller can see after `content=` filtering."""
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    base = _import_fresh(out, "data_navigators._base")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    top = _et.fromstring(_UNFILTERED_REPLY).find("{urn:test:tcontent}top")
+    base.prune_xml_to_content(top, models.Top, content)
+    return {_et.QName(c).localname for c in top}
+
+
+def _surviving_paths_restconf(tmp_path, content):
+    """Field paths a RESTCONF caller can see after `content=` filtering."""
+    out, _ = _gen(tmp_path, "restconf", CONTENT_STATE_YANG, "tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    # The payload the navigator hands to model_validate: the unwrapped top
+    # container, exactly as restconf/data_navigators/_base.py.jinja:251-258
+    # produces it.
+    model = models.Top.model_validate(
+        {
+            "name": "cfg-leaf",
+            "counter": "42",
+            "only_state": {"reads": "7"},
+            "mixed": {"cfg": "C", "obs": "O"},
+            "only_config": {"a": "A", "b": "B"},
+        }
+    )
+    return set(model.model_dump(content=content))
+
+
+@pytest.mark.parametrize("content", ["config", "nonconfig"])
+def test_netconf_and_restconf_content_pruning_agree(tmp_path, content):
+    """The two transports must prune identically for the same input.
+
+    NETCONF has to prune client-side (RFC 6241 cannot express a state-only
+    read) while RESTCONF lets the server filter and prunes in the model layer.
+    Two implementations of one rule is only acceptable if they cannot drift,
+    so this compares their OUTPUT on the same module and the same data rather
+    than asserting each in isolation.
+
+    `mixed` is the discriminating case: it keeps its ancestor shell because a
+    matchable descendant remains, while `only_config` is dropped outright.
+    """
+    netconf = _surviving_paths_netconf(tmp_path / "nc", content)
+    restconf = _surviving_paths_restconf(tmp_path / "rc", content)
+
+    assert netconf == restconf, (
+        f"content={content!r}: NETCONF kept {sorted(netconf)}, "
+        f"RESTCONF kept {sorted(restconf)}"
+    )
+
+
+def test_restconf_keeps_an_emptied_matching_container(tmp_path):
+    """The rule both transports now share, asserted on RESTCONF directly.
+
+    A config container whose children are all state is emptied by a
+    content="config" filter, and it is RETAINED -- not dropped -- because the
+    IR tracks no presence flag, so a dropped container is indistinguishable
+    from one the device never had, and an omitted node is a deletion in a PUT
+    body (RFC 8040 Sec 4.5).
+    """
+    out, _ = _gen(tmp_path, "restconf", CONTENT_STATE_YANG, "tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    model = models.Top.model_validate(
+        {"name": "n", "counter": "42", "mixed": {"cfg": "C", "obs": "O"}}
+    )
+    kept = model.model_dump(content="config")
+
+    assert "mixed" in kept, f"emptied matching container dropped: {kept}"
+    assert "obs" not in kept["mixed"], f"state leaf leaked into a config dump: {kept}"
+
+
+def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
+    """A published sdist must not ship the package twice.
+
+    The emitter writes the client twice on purpose: flat at the output dir so
+    the lab harness can `import temp.<proto>_clients.<device>`, and namespaced
+    so pip installs `import <package_name>`. The wheel already carried only the
+    namespaced copy, but hatchling puts the whole project tree in an sdist, so
+    the tarball shipped both -- measured on a 25-entry tarball with two
+    data_models/, two data_navigators/, two __init__.py, two
+    session_manager.py and two py.typed. Two identical-looking trees in one
+    artifact is also a trap for anyone hand-editing before publishing.
+
+    Asserted on the artifact rather than on the generator's intent, and the
+    wheel-from-sdist path is exercised too, because that is what `pip install
+    <sdist>` does and it is what an excluded path could silently break.
+    """
+    import tarfile
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tsdist")
+    dist = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--out-dir", str(dist), str(out)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert build.returncode == 0, build.stderr[-2000:]
+
+    sdists = list(dist.glob("*.tar.gz"))
+    assert len(sdists) == 1, [p.name for p in sdists]
+    with tarfile.open(sdists[0]) as tar:
+        names = ["/".join(n.split("/")[1:]) for n in tar.getnames()]
+
+    # The flat lab copy must be gone...
+    for flat in ("__init__.py", "data_models", "data_navigators", "session_manager.py"):
+        assert flat not in names, f"sdist still ships the flat {flat}: {sorted(names)}"
+
+    # ...and exactly one namespaced package must remain, holding one copy of
+    # each module. The directory is named after the device, so derive it from the
+    # artifact rather than assuming.
+    roots = {n.split("/")[0] for n in names if "/" in n}
+    assert len(roots) == 1, f"expected one package dir, got {sorted(roots)}"
+    root = roots.pop()
+    for member in ("data_models", "data_navigators"):
+        tops = [
+            n for n in names if n.startswith(f"{root}/{member}/") and n.count("/") == 2
+        ]
+        assert tops, f"{root}/{member} missing from sdist: {sorted(names)}"
+    assert not any(n.startswith(f"{root}/{root}/") for n in names), (
+        "the package is nested inside itself: the flat copy was not excluded"
+    )
+
+    # `pip install <sdist>` builds a wheel from the extracted tree: prove the
+    # exclusion did not remove anything the wheel target needs.
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(sdists[0]) as tar:
+        tar.extractall(extracted)  # our own build output, into tmp_path
+    src = next(extracted.iterdir())
+    wheel_dir = tmp_path / "dist2"
+    again = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), str(src)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert again.returncode == 0, again.stderr[-2000:]
+    assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
+
+
+# --- yang2sdk CLI: root picking ---------------------------------------------
+#
+# Picking root modules was the last hand-fed step in the pipeline, and it is
+# load-bearing: pyang expands an `augment` only when the augmenting module is
+# also named (RFC 7950 Sec 7.17), so a wrong root set emits a model that
+# imports cleanly and then rejects the device's own replies under
+# `extra="forbid"`. These tests pin WHAT gets suggested, measured against the
+# real vendor trees.
+
+_PICKER_YANG = {
+    "pbase.yang": """module pbase {
+  prefix pb;
+  namespace "urn:test:pbase";
+  revision 2026-01-01;
+  container system { leaf hostname { type string; } }
+  rpc reboot { input { leaf delay { type uint32; } } }
+}
+""",
+    # Imports base -> not a root. Augments base -> reached via the closure.
+    # Statement order is load-bearing: a module body is namespace, prefix,
+    # import/include, revision, then data definitions. `import` after `revision`
+    # is a parse error, and pyang reports it as 'unexpected keyword "import"'
+    # rather than as an ordering complaint. Filenames match module names so
+    # pyang does not warn.
+    "pimports.yang": """module pimports {
+  prefix pi;
+  namespace "urn:test:pimports";
+  import pbase {
+    prefix pb;
+  }
+  revision 2026-01-01;
+  container extra {
+    leaf x {
+      type string;
+    }
+  }
+}
+""",
+    "paug.yang": """module paug {
+  prefix pa;
+  namespace "urn:test:paug";
+  import pbase {
+    prefix pb;
+  }
+  revision 2026-01-01;
+  augment "/pb:system" {
+    leaf patched {
+      type string;
+    }
+  }
+}
+""",
+    # Operations only: no top-level data node at all.
+    "pops.yang": """module pops {
+  prefix po;
+  namespace "urn:test:pops";
+  revision 2026-01-01;
+  rpc install { input { leaf pkg { type string; } } output { leaf ok { type boolean; } } }
+  rpc remove { }
+}
+""",
+    # The transport itself: rpcs that are the client's own operations. Named
+    # `ietf-netconf` because the exclusion is name-based on the real IETF
+    # module names -- a fixture called "pproto" would never exercise the rule.
+    "ietf-netconf.yang": """module ietf-netconf {
+  prefix pp;
+  namespace "urn:test:pproto";
+  revision 2026-01-01;
+  rpc get-config { }
+  rpc edit-config { }
+}
+""",
+    # Real data, so a real suggestion even though the name looks like plumbing.
+    "pmonitor.yang": """module pmonitor {
+  prefix pm;
+  namespace "urn:test:pmonitor";
+  revision 2026-01-01;
+  container state { leaf uptime { type uint32; } }
+  rpc get-schema { }
+}
+""",
+}
+
+
+def _picker_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "picker_yang"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in _PICKER_YANG.items():
+        (d / name).write_text(text)
+    return d
+
+
+def _suggested(d: Path) -> list[str]:
+    from yang2sdk.cli import rootpicker
+
+    return [
+        c.module
+        for c in rootpicker.suggested_roots(
+            rootpicker.with_top_level(rootpicker.scan(d), d)
+        )
+    ]
+
+
+def test_picker_suggests_data_and_operation_modules(tmp_path):
+    """A suggested root carries top-level data OR operations.
+
+    Regression from the G30 tree: the rule counted data nodes only, so
+    `coriant-rpc` (41 operations) and `coriant-cli` (37) were dropped -- a
+    module whose entire surface is operations declares no data nodes. Measured
+    there, vendor RPC modules are the device's API and belong in the model.
+    """
+    suggested = _suggested(_picker_dir(tmp_path))
+
+    assert "pbase" in suggested, "a data-bearing module must be suggested"
+    assert "pops" in suggested, (
+        "an operations-only module must be suggested: it declares no top-level "
+        "data node, and dropping it loses the device's whole API"
+    )
+
+
+def test_picker_excludes_transport_rpcs(tmp_path):
+    """`get-config`/`edit-config` are the client's own operations, not roots.
+
+    Compiling them is how the G30 tree ended up with 18 of 19 top-level
+    navigators being protocol plumbing.
+    """
+    assert "pproto" not in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_keeps_a_module_that_has_real_data_despite_its_name(tmp_path):
+    """ietf-netconf-monitoring stays a root because netconf-state is a read.
+
+    The transport exclusion is name-based, so it has to stop at the first
+    `ietf-netconf*` that carries real data of its own -- otherwise the rule
+    would silently drop a legitimate device read.
+    """
+    assert "pmonitor" in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_offers_a_module_that_imports_another(tmp_path):
+    """Being imported does not disqualify a module as a root.
+
+    Measured on SR Linux: `srl_nokia-system` is imported by 88 modules and is
+    still one of the two roots ci-srl compiles. A rule that excluded modules
+    with importers disqualified the single most useful root on the device.
+    """
+    assert "pimports" in _suggested(_picker_dir(tmp_path))
+
+
+def test_picker_does_not_offer_an_augment_only_module(tmp_path):
+    """Augment-only modules are the closure's job, not the operator's.
+
+    pyang expands an `augment` only when the augmenting module is also named
+    (RFC 7950 Sec 7.17), and `expand_augment_closure` already resolves that
+    transitively -- measured on SR Linux, naming 2 roots pulls in 93 more.
+    Offering them as roots would ask the operator to do by hand what the
+    compiler does automatically.
+    """
+    assert "paug" not in _suggested(_picker_dir(tmp_path))
+
+
+def _run_cli(argv: list[str], **popen_kwargs) -> subprocess.CompletedProcess:
+    """Invoke the `yang2sdk` entry point as a subprocess, like a user does."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from yang2sdk.cli.main import main; raise SystemExit(main())",
+            *argv,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+        **popen_kwargs,
+    )
+
+
+def test_yang2sdk_without_protocol_teaches_and_does_not_compile():
+    """Bare `yang2sdk` prints the pipeline and exits non-zero.
+
+    Exit 0 would let a script that forgot --protocol read "success" from a run
+    that compiled nothing.
+    """
+    proc = _run_cli([])
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    assert "yang-downloader" in proc.stdout + proc.stderr, "help must teach the flow"
+    assert "--protocol" in proc.stdout + proc.stderr
+
+
+def test_yang2sdk_help_teaches_the_four_step_pipeline():
+    proc = _run_cli(["--help"])
+
+    assert proc.returncode == 0, proc.stderr[-500:]
+    text = proc.stdout
+    for expected in ("yang-downloader", "--protocol", "uv add", "sdk-verify"):
+        assert expected in text, f"--help must mention {expected!r}"
+
+
+def test_yang2sdk_refuses_to_prompt_when_stdin_is_not_a_tty(tmp_path):
+    """CI has no TTY, so an absent --roots must fail fast, not block on a read.
+
+    This is the property that keeps the blocking ci-srl job safe: a prompt that
+    waits for input that will never arrive is a hung pipeline.
+    """
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        ["--protocol", "netconf", "--yang-dir", str(d), "--device", "x"],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    combined = proc.stdout + proc.stderr
+    assert "not a terminal" in combined, combined[-500:]
+    assert "--roots" in combined, "the error must say how to proceed"
+
+
+def test_yang2sdk_roots_resolves_names_to_files(tmp_path):
+    """`--roots a,b` becomes real paths, and an unknown name fails loudly."""
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        [
+            "--protocol",
+            "netconf",
+            "--yang-dir",
+            str(d),
+            "--device",
+            "pickerok",
+            "--device-version",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--roots",
+            "pbase",
+        ],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert (tmp_path / "out" / "__init__.py").is_file()
+    assert (tmp_path / "out" / "data_models").is_dir()
+
+
+def test_yang2sdk_rejects_an_unknown_root_name(tmp_path):
+    d = _picker_dir(tmp_path)
+    proc = _run_cli(
+        ["--protocol", "netconf", "--yang-dir", str(d), "--roots", "nosuchmodule"],
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert proc.returncode == 2, proc.stdout[-500:]
+    assert "nosuchmodule" in proc.stderr, proc.stderr[-500:]
+
+
+BROKEN_YANG = """module tbroken {
+  prefix tb;
+  namespace "urn:test:tbroken";
+  revision 2026-01-01;
+  container top { leaf ok { type string; } }
+  rpc broken {
+    // `confirmation` belongs to ietf-yang-metadata, not the core grammar.
+    // YANG comments are // or /* */ -- a # is itself an illegal keyword.
+    confirmation "not a core statement";
+  }
+}
+"""
+
+
+def test_a_yang_error_writes_no_client(tmp_path):
+    """A model pyang rejects must leave nothing behind.
+
+    pyang prints errors and calls the emitter anyway, exiting non-zero only
+    afterwards, so the run both wrote a complete client AND reported failure.
+    Measured 2026-10-16: the emitted models were byte-identical to a clean
+    compile of the same YANG while the exit was 1. That misleads twice -- CI
+    reddens on a good artifact, and a human who trusts the "Generated SDK in:
+    <dir>" line publishes a model built from rejected YANG.
+    """
+    (tmp_path / "tbroken.yang").write_text(BROKEN_YANG)
+    out = tmp_path / "broken_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(tmp_path / "tbroken.yang"),
+            "--device",
+            "tbroken",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert "unexpected keyword" in proc.stderr, (
+        f"the model must actually fail to parse, or this test is vacuous: {proc.stderr[-500:]}"
+    )
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "Generated" not in proc.stdout, "a refused compile must not announce output"
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+def test_ignore_error_re_enables_generation(tmp_path):
+    """`--ignore-error` stays the working escape hatch.
+
+    pyang keeps a downgraded tag in `ctx.errors` and only skips printing it, so
+    the generator's own guard has to re-apply the same filter. Without that the
+    documented opt-out for a vendor model's illegal XPath would be dead.
+    """
+    yang = tmp_path / "tbroken.yang"
+    yang.write_text(BROKEN_YANG)
+    out = tmp_path / "downgraded_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tbroken",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+            "--ignore-error",
+            "UNEXPECTED_KEYWORD",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert (out / "__init__.py").is_file()
+    assert (out / "data_models").is_dir()

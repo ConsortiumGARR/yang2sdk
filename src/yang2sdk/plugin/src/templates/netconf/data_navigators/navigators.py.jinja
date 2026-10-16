@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from lxml import etree
-from ._base import Node, ListNode, ItemNode, _require_complete_for_replace, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth
+from ._base import Node, ListNode, ItemNode, _require_complete_for_replace, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth, prune_xml_to_content
 
 if TYPE_CHECKING:
     from ..data_models import {{ module.py_name }}
@@ -20,6 +20,7 @@ class {{ node.class_name }}Node(ItemNode):
         if matched is not None:
             if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
                 prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
+            prune_xml_to_content(matched, {{ node.class_name }}, content)
             return {{ node.class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
         return None
 
@@ -87,6 +88,7 @@ class {{ node.item_class_name }}Node(ItemNode):
         if matched is not None:
             if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
                 prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
+            prune_xml_to_content(matched, {{ node.class_name }}, content)
             return {{ node.item_class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
         return None
 
@@ -157,6 +159,7 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
         if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()):
             for m in matched: 
                 prune_xml_tree_to_depth(m, {{ node.item_class_name }}, int(depth))
+                prune_xml_to_content(m, {{ node.item_class_name }}, content)
         return [{{ node.item_class_name }}.from_xml(etree.tostring(m), module_namespaces=self._client.module_namespaces) for m in matched]
 
     def update(self, data: list[{{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str], *, target: str | None = None) -> bool:

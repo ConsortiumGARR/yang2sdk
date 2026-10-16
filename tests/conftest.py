@@ -331,7 +331,7 @@ def _compile_all(yang_files, roots, image):
 
     In-process pyang runs cannot compile twice (global optparse registry
     raises OptionConflictError on the second run), so each format gets its
-    own process. This also covers the real yang2restconf/yang2netconf CLIs.
+    own process. This also covers the real `yang2sdk --protocol` CLI.
 
     `image` is the matrix entry, and the three names are deliberately derived
     from it rather than passed separately: `slug` names the on-disk directory

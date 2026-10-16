@@ -14,6 +14,7 @@ import optparse
 import os
 import re
 import shutil
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -117,6 +118,89 @@ def _pep440_version(raw: str) -> str:
     return v or "0.0.0"
 
 
+def _refuse_on_error(ctx, modules) -> bool:
+    """Exit before writing anything if YANG errors survived --ignore-error.
+
+    pyang prints errors and then calls the emitter anyway, exiting non-zero
+    only afterwards, so without this both happen: a complete client on disk
+    AND a failure for the same run. Measured 2026-10-16 with a `confirmation`
+    statement (which belongs to ietf-yang-metadata, not the core grammar): the
+    models were byte-identical to a clean compile and the exit was still 1.
+    Two ways that misleads -- a CI job reddens on a good artifact, and a human
+    trusting "Generated SDK in: <dir>" publishes a model built from rejected
+    YANG.
+    """
+    unsuppressed = _unsuppressed_errors(ctx, modules)
+    if not unsuppressed:
+        return False
+    tags = sorted({tag for _, tag, _ in unsuppressed})
+    print(
+        f"Error: refusing to generate: {len(unsuppressed)} YANG error(s) "
+        f"({', '.join(tags)}). No client written. Fix the model, or pass "
+        "--ignore-error <TAG> for the errors you accept.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _unsuppressed_errors(ctx, modules) -> list[tuple]:
+    """Errors pyang would actually REPORT, minus anything downgraded.
+
+    pyang filters three times before printing, and this guard has to apply the
+    same filters or it becomes stricter than the tool it wraps:
+
+    * the blanket ``--ignore-errors`` empties ``ctx.errors`` outright;
+    * a per-tag ``--ignore-error`` skips printing but leaves the entry there;
+    * and, crucially, ``setup_fmt`` sets ``ctx.implicit_errors = False``, which
+      makes pyang skip errors belonging to modules pulled in by ``import`` rather
+      than named on the command line (pyang_tool.py:502-509). Those entries stay
+      in ``ctx.errors``.
+
+    Without that third filter the guard refused to generate on the SR Linux
+    tree: 58 errors, all UNUSED_IMPORT / XPATH_NODE_NOT_FOUND1 from implicitly
+    imported modules, none of which pyang prints. The guard must be exactly as
+    strict as the reporting, or a green blocking job turns red.
+    """
+    from pyang import error as pyang_error
+
+    opts = ctx.opts
+    if getattr(opts, "ignore_errors", False):
+        return []
+    ignored = set(getattr(opts, "ignore_error_tags", None) or [])
+    # pyang's own rule (pyang_tool.py:512-522): a warning-level tag is only a
+    # failure when the operator promoted it with `--errors`. Without this the
+    # guard refused the SR Linux tree on 43 UNUSED_IMPORT / XPATH_NODE_NOT_FOUND1
+    # entries that pyang prints as `warning:` and does not fail on.
+    promoted = set(getattr(opts, "errors", None) or [])
+    modulenames = {m.arg for m in modules}
+    # pyang's `filenames` is a local in run() (pyang_tool.py:230), not an
+    # option, so it cannot be read off ctx.opts. The command-line files become
+    # modules carrying that same path as `.ref`, which is where it comes from.
+    filenames = {getattr(m, "ref", None) for m in modules}
+
+    out: list[tuple] = []
+    for entry in getattr(ctx, "errors", []):
+        epos, etag, _eargs = entry
+        if etag in ignored:
+            continue
+        level = pyang_error.err_level(etag)
+        if pyang_error.is_warning(level) and etag not in promoted:
+            continue
+        top = getattr(epos, "top", None)
+        if (
+            getattr(ctx, "implicit_errors", True) is False
+            and top is not None
+            and top.arg not in modulenames
+            and (
+                not hasattr(top, "i_modulename") or top.i_modulename not in modulenames
+            )
+            and epos.ref not in filenames
+        ):
+            continue
+        out.append(entry)
+    return out
+
+
 def _package_context(ctx, modules, ir_modules, protocol: str) -> dict:
     device = getattr(ctx.opts, "sdk_device", "") or "device"
     device_version = getattr(ctx.opts, "sdk_device_version", "") or "0.0.0"
@@ -204,6 +288,23 @@ class Yang2Restconf(plugin.PyangPlugin):
         output_dir = ctx.opts.sdk_output_dir
         config_only = ctx.opts.sdk_config_only
 
+        # A YANG error means the model is not trustworthy, so nothing is
+        # written and nothing is announced. pyang prints errors and then calls
+        # this emitter anyway, exiting non-zero only afterwards -- which had us
+        # writing a complete, working client AND reporting failure for the same
+        # run. Two ways that misleads: a CI job goes red on a good artifact, and
+        # a human who trusts "Generated SDK in: <dir>" publishes a model built
+        # from YANG pyang rejected.
+        #
+        # `--ignore-error <TAG>` is the escape hatch and stays authoritative:
+        # pyang keeps a downgraded tag in ctx.errors, so the operator's
+        # downgrades are re-checked here rather than assumed (and the blanket
+        # --ignore-errors clears ctx.errors outright, so nothing survives).
+        # Measured 2026-10-16: a `confirmation` statement (which belongs to
+        # ietf-yang-metadata, not to the core grammar) produced byte-identical
+        # models and exit 1 at the same time.
+        if _refuse_on_error(ctx, modules):
+            return
         # `temp/` is untracked and created on demand: ensure the output root
         # exists before any write (makedirs below would also create it, but
         # the package/static writers must not depend on that ordering).
@@ -308,6 +409,9 @@ class Yang2Netconf(plugin.PyangPlugin):
     def emit(self, ctx, modules, fd):
         output_dir = ctx.opts.sdk_output_dir
         config_only = ctx.opts.sdk_config_only
+
+        if _refuse_on_error(ctx, modules):
+            return
 
         # `temp/` is untracked and created on demand: ensure the output root
         # exists before any write (see the restconf emit above).
@@ -460,7 +564,20 @@ def _write_package_files(
         'requires-python = ">=3.12"\n'
         f"dependencies = [\n    {deps_str},\n]\n\n"
         "[tool.hatch.build.targets.wheel]\n"
-        f'packages = ["{pkg_name}"]\n',
+        f'packages = ["{pkg_name}"]\n\n'
+        # The package is emitted twice on purpose: flat at out_dir so the lab
+        # harness can `import temp.<proto>_clients.<device>`, and namespaced at
+        # out_dir/<package_name>/ so pip installs `import <package_name>`. Only
+        # the namespaced copy belongs in a published artifact. The wheel already
+        # carried just it; an sdist includes the whole project tree and shipped
+        # both (measured: a 25-entry tarball with two data_models/, two
+        # data_navigators/, two __init__.py, two session_manager.py, two
+        # py.typed). Excluding the flat copy is safe because the wheel target
+        # references the namespaced path, so a wheel built from the extracted
+        # sdist is unaffected.
+        "[tool.hatch.build.targets.sdist]\n"
+        'exclude = ["/__init__.py", "/data_models", "/data_navigators",'
+        ' "/session_manager.py", "/py.typed"]\n',
         encoding="utf-8",
     )
     mod_rows = "\n".join(

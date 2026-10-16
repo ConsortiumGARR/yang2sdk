@@ -94,7 +94,7 @@ jobs:
         # Same path the notconf suite uses: the shipped yang-downloader, so the
         # integration suite exercises the code users actually run. It also
         # writes features.json from the <hello> capability set, which
-        # yang2netconf picks up automatically as --features-file.
+        # the compiler picks it up automatically as --features-file.
         #
         # Single source of truth for host/port/credentials: the committed
         # tests/srl/.env.srl.example (published containerlab defaults, not
@@ -127,14 +127,18 @@ jobs:
         # Roots are the two the tests navigate to: <system> (system/name/host-name,
         # management, logging) and the interfaces list.
         #
-        # yang2netconf now resolves the augment closure itself (88c2681), so the
-        # explicit closure.py step that used to live here is redundant — passing
-        # the two root files is enough. Kept as a single command so this job
+        # yang2sdk resolves the augment closure itself (88c2681), so the
+        # explicit closure.py step that used to live here is redundant —
+        # naming the two roots is enough. Kept as a single command so this job
         # exercises the documented user path rather than a special one.
+        #
+        # --roots, not positional paths: that is the form a script or CI job
+        # should use, and it is what proves `yang2sdk` resolves module names to
+        # files. A TTY-less run must never prompt, which
+        # test_yang2sdk_refuses_to_prompt_when_stdin_is_not_a_tty pins.
         run: |
-          uv run yang2netconf \
-            temp/yang_modules/srl/srl_nokia-system@*.yang \
-            temp/yang_modules/srl/srl_nokia-interfaces@*.yang \
+          uv run yang2sdk --protocol netconf \
+            --roots srl_nokia-system,srl_nokia-interfaces \
             --device srl \
             --yang-dir temp/yang_modules/srl \
             --output-dir temp/netconf_clients/srl

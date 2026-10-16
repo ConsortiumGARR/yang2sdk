@@ -51,8 +51,10 @@ lab = [
 ]
 
 [project.scripts]
-yang2restconf = "yang2sdk.cli.compiler:restconf"
-yang2netconf = "yang2sdk.cli.compiler:netconf"
+# One entry point, `--protocol netconf|restconf`. Replaces the
+# yang2netconf/yang2restconf pair, which were the same program with a hardcoded
+# transport. Everything except --protocol is forwarded to cli.compiler.
+yang2sdk = "yang2sdk.cli.main:main"
 # Lab-only (require `yang2sdk[lab]`); kept as scripts for the documented dev workflow.
 yang-downloader = "yang2sdk.cli.downloader:main"
 # Full-SDK validation against a lab device. Supersedes `tester`, which only read

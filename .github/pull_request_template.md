@@ -23,7 +23,7 @@ Per `AGENTS.md`'s evidence rule — this is the part reviewers rely on most.
 
 **Commands run:**
 
-<!-- e.g. the five gate commands; `uv run yang2netconf temp/yang_modules/srl/*.yang --device srl` -->
+<!-- e.g. the five gate commands; `uv run yang2sdk --protocol netconf --device srl --list-roots` -->
 
 **Verified:**
 

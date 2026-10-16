@@ -1,7 +1,7 @@
 """Augment-closure resolver. LAB/DEV helper — no new runtime deps (stdlib only).
 
 Given requested root modules, find every module that augments them
-(transitively: augmenters of augmenters), so ``yang2netconf`` compiles the
+(transitively: augmenters of augmenters), so ``yang2sdk`` compiles the
 full closure and pyang expands augments into parents. Without this, the
 device returns fully-augmented subtrees while generated models only carry
 base children, and strict ``extra="forbid"`` validation rejects replies.
