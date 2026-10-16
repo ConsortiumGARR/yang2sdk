@@ -8,8 +8,8 @@ jobs:
   lint-typecheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked --group dev --extra lab
       # `uv run`, not `uvx`: the four gates are pinned exactly in the dev group
       # so CI installs what uv.lock says. `uvx` would resolve the newest release
@@ -23,8 +23,8 @@ jobs:
     needs: lint-typecheck
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked --group dev --extra lab
       # The whole offline suite, not one file. It ran `pytest tests/test_matrix.py`
       # alone, so every test added outside it was never executed by CI — 46 of
@@ -48,8 +48,8 @@ jobs:
           - { package: notconf-cisco-xr, tag: "2411" }
           - { package: notconf-cisco-nx, tag: 10.4-4 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked --group dev --extra lab
       # test_sdk_verify_ci.py drives `sdk-verify` (every reachable node + every RPC
       # Input serialised) against the same container the other two reuse, so it

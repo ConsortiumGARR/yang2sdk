@@ -50,9 +50,9 @@ jobs:
     # would buy nothing anyway.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install containerlab (pinned)
         # CLAB_VERSION is pinned for the same reason tests/srl/srl.clab.yml pins
