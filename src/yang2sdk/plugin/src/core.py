@@ -460,7 +460,20 @@ def _write_package_files(
         'requires-python = ">=3.12"\n'
         f"dependencies = [\n    {deps_str},\n]\n\n"
         "[tool.hatch.build.targets.wheel]\n"
-        f'packages = ["{pkg_name}"]\n',
+        f'packages = ["{pkg_name}"]\n\n'
+        # The package is emitted twice on purpose: flat at out_dir so the lab
+        # harness can `import temp.<proto>_clients.<device>`, and namespaced at
+        # out_dir/<package_name>/ so pip installs `import <package_name>`. Only
+        # the namespaced copy belongs in a published artifact. The wheel already
+        # carried just it; an sdist includes the whole project tree and shipped
+        # both (measured: a 25-entry tarball with two data_models/, two
+        # data_navigators/, two __init__.py, two session_manager.py, two
+        # py.typed). Excluding the flat copy is safe because the wheel target
+        # references the namespaced path, so a wheel built from the extracted
+        # sdist is unaffected.
+        "[tool.hatch.build.targets.sdist]\n"
+        'exclude = ["/__init__.py", "/data_models", "/data_navigators",'
+        ' "/session_manager.py", "/py.typed"]\n',
         encoding="utf-8",
     )
     mod_rows = "\n".join(

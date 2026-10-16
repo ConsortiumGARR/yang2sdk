@@ -4361,3 +4361,77 @@ def test_restconf_keeps_an_emptied_matching_container(tmp_path):
 
     assert "mixed" in kept, f"emptied matching container dropped: {kept}"
     assert "obs" not in kept["mixed"], f"state leaf leaked into a config dump: {kept}"
+
+
+def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
+    """A published sdist must not ship the package twice.
+
+    The emitter writes the client twice on purpose: flat at the output dir so
+    the lab harness can `import temp.<proto>_clients.<device>`, and namespaced
+    so pip installs `import <package_name>`. The wheel already carried only the
+    namespaced copy, but hatchling puts the whole project tree in an sdist, so
+    the tarball shipped both -- measured on a 25-entry tarball with two
+    data_models/, two data_navigators/, two __init__.py, two
+    session_manager.py and two py.typed. Two identical-looking trees in one
+    artifact is also a trap for anyone hand-editing before publishing.
+
+    Asserted on the artifact rather than on the generator's intent, and the
+    wheel-from-sdist path is exercised too, because that is what `pip install
+    <sdist>` does and it is what an excluded path could silently break.
+    """
+    import tarfile
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tsdist")
+    dist = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--out-dir", str(dist), str(out)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert build.returncode == 0, build.stderr[-2000:]
+
+    sdists = list(dist.glob("*.tar.gz"))
+    assert len(sdists) == 1, [p.name for p in sdists]
+    with tarfile.open(sdists[0]) as tar:
+        names = ["/".join(n.split("/")[1:]) for n in tar.getnames()]
+
+    # The flat lab copy must be gone...
+    for flat in ("__init__.py", "data_models", "data_navigators", "session_manager.py"):
+        assert flat not in names, f"sdist still ships the flat {flat}: {sorted(names)}"
+
+    # ...and exactly one namespaced package must remain, holding one copy of
+    # each module. The directory is named after the device, so derive it from the
+    # artifact rather than assuming.
+    roots = {n.split("/")[0] for n in names if "/" in n}
+    assert len(roots) == 1, f"expected one package dir, got {sorted(roots)}"
+    root = roots.pop()
+    for member in ("data_models", "data_navigators"):
+        tops = [
+            n for n in names if n.startswith(f"{root}/{member}/") and n.count("/") == 2
+        ]
+        assert tops, f"{root}/{member} missing from sdist: {sorted(names)}"
+    assert not any(n.startswith(f"{root}/{root}/") for n in names), (
+        "the package is nested inside itself: the flat copy was not excluded"
+    )
+
+    # `pip install <sdist>` builds a wheel from the extracted tree: prove the
+    # exclusion did not remove anything the wheel target needs.
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(sdists[0]) as tar:
+        tar.extractall(extracted)  # our own build output, into tmp_path
+    src = next(extracted.iterdir())
+    wheel_dir = tmp_path / "dist2"
+    again = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), str(src)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert again.returncode == 0, again.stderr[-2000:]
+    assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
