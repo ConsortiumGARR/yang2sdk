@@ -97,8 +97,9 @@ packages = ["src/yang2sdk"]
 target-version = "py312"
 exclude = ["temp", ".venv", ".ruff_cache"]
 
-# ty needs no section: it respects .gitignore by default, so ephemeral
-# temp/ output is excluded; Python version comes from .python-version/.venv.
+# ty respected .gitignore by default, so ephemeral temp/ output needed no
+# section -- that stopped being the whole story once a module outside src/ was
+# imported by something under test, hence the section below.
 
 [tool.ty.environment]
 # `src` and `.` are inferred from the project layout; `scripts` is not, because
