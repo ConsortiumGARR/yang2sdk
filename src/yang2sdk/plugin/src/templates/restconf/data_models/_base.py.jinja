@@ -70,8 +70,17 @@ class YangBaseModel(BaseModel):
         ancestor shells (e.g. a config container above a state leaf in a
         ``nonconfig`` dump) while never leaking mismatched leaves. Emptied
         *matching* containers are retained: the IR does not track presence
-        containers, so dropping them could corrupt round-trips, and an empty
-        shell is harmless in PATCH/PUT bodies.
+        containers, so dropping them could corrupt round-trips.
+
+        Retained is not the same as harmless. A presence container emptied here
+        is not empty in the model, because its leaves carry their YANG defaults
+        -- measured: `container feat { presence ""; leaf enabled { default
+        false; } }` validates to `{"feat": {"enabled": false}}`. A PUT sends
+        that as a real value, while an omitted container means deletion
+        (RFC 8040 Sec 4.5). `_update` strips empty dicts from the body, so the
+        placeholder itself never reaches the wire, and `replace()` refuses a
+        model with unset config fields. Preserving the node is the conservative
+        choice, not a free one.
         """
         if not isinstance(data, dict):
             return
