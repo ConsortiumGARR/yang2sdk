@@ -458,6 +458,92 @@ def test_the_script_is_never_shipped_in_the_wheel() -> None:
     assert "scripts" not in str(targets)
 
 
+# --- the post-publish jobs, parsed from the workflow ------------------------
+
+
+def _workflow() -> Any:
+    import yaml
+
+    path = REPO_ROOT / ".github" / "workflows" / "release.yaml"
+    return yaml.safe_load(path.read_text())
+
+
+def _job_shell(name: str) -> str:
+    return "\n".join(
+        str(s["run"]) for s in _workflow()["jobs"][name]["steps"] if "run" in s
+    )
+
+
+def test_verify_published_never_checks_out_the_workspace() -> None:
+    """It must install from PyPI, or the check is theatre.
+
+    A `checkout` step plus an editable install from the tree would make every
+    assertion below pass while testing the source tree — the claim this job
+    exists to stop making, since the sdist shipped the package twice (3b22730)
+    with every source-tree gate green.
+    """
+    steps = _workflow()["jobs"]["verify-published"]["steps"]
+    assert not [
+        s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")
+    ]
+
+
+def test_the_post_publish_jobs_read_the_build_job_output() -> None:
+    """`steps.version` exists only inside `build`.
+
+    Regression: both jobs were written with `${{ steps.version.outputs.value }}`,
+    which is empty outside the job that defines it — so they would have installed
+    `yang2sdk==` (no constraint at all) and asserted the CLI reports an empty
+    string. Found by parsing the workflow instead of trusting it.
+    """
+    for job in ("verify-published", "github-release"):
+        shell = _job_shell(job)
+        assert "steps.version.outputs.value" not in shell, job
+        assert "needs.build.outputs.version" in shell, job
+
+
+def test_verify_published_installs_the_exact_published_version() -> None:
+    """Not `yang2sdk` unpinned: that would install whatever is newest."""
+    assert "yang2sdk==${{ needs.build.outputs.version }}" in _job_shell(
+        "verify-published"
+    )
+
+
+def test_the_generate_step_actually_generates_and_imports() -> None:
+    """Each part is the claim it is meant to prove."""
+    shell = _job_shell("verify-published")
+    assert "yang2sdk --protocol restconf" in shell
+    assert "from verify_1_0_0 import RestconfClient" in shell, (
+        "the job must import the generated client; generating without importing "
+        "is the failure `_validate_generated` exists to catch"
+    )
+    assert "compileall" in shell
+
+
+def test_the_release_notes_come_from_the_changelog_section() -> None:
+    """One text read twice, so the page and the repository cannot drift."""
+    shell = _job_shell("github-release")
+    assert "scripts/changelog.py --notes" in shell
+    assert "--notes-file" in shell
+    assert "--verify-tag" in shell
+
+
+def test_no_job_uses_a_uv_flag_that_does_not_exist() -> None:
+    """`uv pip install --no-project` was written here and is not a real flag.
+
+    Found by running the step on uv 0.11.7, which rejected it outright. Checking
+    the few flags these jobs use is cheaper than finding it during a release,
+    and the fix was to delete the flag rather than to pin uv.
+    """
+    allowed = {("uv", "venv"), ("uv", "pip", "install"), ("uv", "pip", "--python")}
+    for line in _job_shell("verify-published").splitlines():
+        tokens = line.strip().split()
+        if tokens[:1] == ["uv"]:
+            assert any(tuple(tokens[: len(k)]) == k for k in allowed), (
+                f"unrecognised uv invocation: {line.strip()}"
+            )
+
+
 def test_every_refusal_reaches_the_operator_not_a_traceback(
     published_off: list[str],
     on_a_clean_main: None,

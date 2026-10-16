@@ -130,15 +130,16 @@ jobs:
     steps:
       - uses: astral-sh/setup-uv@v5
 
-      # No checkout: everything below must come from PyPI. A stray
-      # `uv sync` or an editable install from the workspace would make the
-      # whole job vacuous, so the venv is built in the runner's temp dir and
-      # `--no-project` keeps uv from discovering a pyproject in $GITHUB_WORKSPACE.
+      # No checkout: everything below must come from PyPI, and a stray
+      # `uv sync` or an editable install from the workspace would make the whole
+      # job vacuous. `uv pip install` is the pip-compatible interface and does not
+      # discover the project in $GITHUB_WORKSPACE (there is no `--no-project`
+      # flag; that was written here, failed on uv 0.11.7, and was removed).
       - name: Install the published release from PyPI
         run: |
           set -euo pipefail
           uv venv /tmp/published
-          uv pip install --python /tmp/published/bin/python --no-project \
+          uv pip install --python /tmp/published/bin/python \
             "yang2sdk==${{ needs.build.outputs.version }}"
 
       - name: The installed CLI reports the published version
