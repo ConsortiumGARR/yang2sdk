@@ -125,7 +125,12 @@ jobs:
   # and it generates a client that imports. Deliberately NOT in ci-pr's
   # `ci-gate` needs: it can only run after a tag exists.
   verify-published:
-    needs: publish
+    # `build` is listed for the version, not for ordering: `needs` holds direct
+    # dependencies only, so with `needs: publish` alone `needs.build.outputs.version`
+    # is "" and this job ran `uv pip install "yang2sdk=="` (tag run 38960272123).
+    # `github-release` read the same expression correctly in that run because it
+    # lists `build`. `build` always succeeds if `publish` did, so naming it is free.
+    needs: [build, publish]
     runs-on: ubuntu-24.04
     steps:
       - uses: astral-sh/setup-uv@v7

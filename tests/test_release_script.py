@@ -164,6 +164,52 @@ def no_writes(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[tuple[str, ...]]
     )
 
 
+# A fixed day, deliberately *not* `date.today()`: a fixture that tracks the wall
+# clock is the defect this exists to remove.
+FROZEN_DAY = date(2026, 10, 16)
+
+
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch, module: Any, day: date) -> None:
+    """Pin `module.datetime.now()` to `day`; every other call stays real.
+
+    Subclassed, not replaced, so `fromisoformat`/`combine` keep working.
+    """
+    real = module.datetime
+
+    class Frozen(real):  # type: ignore[misc, valid-type]
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            # Noon, so a caller in a DST zone cannot hit a non-existent wall time.
+            return real(day.year, day.month, day.day, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", Frozen)
+
+
+@pytest.fixture
+def on_a_frozen_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `--bump` rehearsal independent of the calendar and of the repository.
+
+    Three uncontrolled inputs on that path:
+      * `next_version()` reads `datetime.now(UTC)` — that is how `main()` calls it;
+      * `changelog.promote()` stamps the heading date, which the notes gate then
+        checks against the version, so `changelog`'s clock must move too;
+      * `prepare_notes()` promotes `## [Unreleased]`, empty on main between
+        releases.
+
+    Uncontrolled, the derivation test derived *today's* version against the real
+    CHANGELOG.md, so it passed only on 2026-10-16 and thereafter failed every run
+    with "nothing to promote", reddening `offline-tests` on all open PRs.
+    """
+    _freeze_clock(monkeypatch, release, FROZEN_DAY)
+    _freeze_clock(monkeypatch, changelog, FROZEN_DAY)
+
+    target = tmp_path / "CHANGELOG.md"
+    target.write_text(
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- something worth releasing.\n"
+    )
+    monkeypatch.setattr(changelog, "CHANGELOG", target)
+
+
 # --- the git-state guards ----------------------------------------------------
 
 
@@ -607,16 +653,17 @@ def test_the_dry_run_of_a_bump_is_not_blocked_by_the_bump_it_previews(
 
 def test_bump_with_no_argument_derives_the_version(
     on_a_clean_main: None,
+    on_a_frozen_day: None,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The change in one test: `--bump` takes no version, and still gets one.
 
-    `2026.10.16` is genuinely on PyPI, so the derivation has to reach
-    `2026.10.16.1` — and the changelog documents that version, which is what
-    lets the dry run get past the notes gate. Both halves have to be true for
-    this to exit 0, so a derivation that returned the base version, or one that
-    was computed and then ignored, fails here.
+    `2026.10.16` is on PyPI, so the derivation must reach `2026.10.16.1`. Both
+    halves must hold to exit 0: a derivation returning the base version, or one
+    computed then ignored, fails here.
+
+    `on_a_frozen_day` is load-bearing — without it this passed only on 2026-10-16.
     """
     _stub_taken(monkeypatch, pypi={"2026.10.16"})
     assert release.main(["--bump", "--dry-run"]) == 0
@@ -649,10 +696,17 @@ def test_a_stale_tag_on_an_explicit_version_is_reported_not_refused(
 
 def test_a_dry_run_of_the_derived_version_writes_nothing_either(
     on_a_clean_main: None,
+    on_a_frozen_day: None,
     no_writes: list[tuple[str, ...]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dry run that reaches the network does not get to write on the way back."""
+    """A dry run that reaches the network does not get to write on the way back.
+
+    `on_a_frozen_day` keeps the wall clock out. This test passes without it *by
+    accident*: `no_writes` stubs `prepare_notes`, so the derived version never
+    reaches the notes gate — which is how the sibling test's date dependency went
+    unnoticed.
+    """
     _stub_taken(monkeypatch, pypi={"2026.10.16"})
     assert release.main(["--bump", "--dry-run"]) == 0
     assert not [a for a in no_writes if a[:2] in {("git", "tag"), ("git", "push")}]
@@ -782,17 +836,38 @@ def test_verify_published_never_checks_out_the_workspace() -> None:
 
 
 def test_the_post_publish_jobs_read_the_build_job_output() -> None:
-    """`steps.version` exists only inside `build`.
+    """Both halves of reading a job output, neither visible to a grep for it.
 
-    Regression: both jobs were written with `${{ steps.version.outputs.value }}`,
-    which is empty outside the job that defines it — so they would have installed
-    `yang2sdk==` (no constraint at all) and asserted the CLI reports an empty
-    string. Found by parsing the workflow instead of trusting it.
+    `steps.version` is job-local, so `${{ steps.version.outputs.value }}` outside
+    `build` is "". And `needs.build` needs `build` in `needs:` — the context holds
+    direct dependencies only, so `verify-published` with `needs: publish` again
+    got "" and ran `uv pip install "yang2sdk=="` (run 38960272123). Assert the
+    wiring, not the text.
     """
     for job in ("verify-published", "github-release"):
         shell = _job_shell(job)
         assert "steps.version.outputs.value" not in shell, job
         assert "needs.build.outputs.version" in shell, job
+        assert "build" in _needs(job), (
+            f"{job} reads `needs.build.outputs.version` but does not list "
+            f"`build` in `needs:` (it has {_needs(job)}), so the expression "
+            "resolves to the empty string at runtime"
+        )
+
+
+def _needs(name: str) -> list[str]:
+    """A job's `needs:` as a list; YAML allows a scalar or a list."""
+    raw = _workflow()["jobs"][name].get("needs", [])
+    return [raw] if isinstance(raw, str) else list(raw)
+
+
+def test_needs_is_normalised_for_both_yaml_spellings() -> None:
+    """Pin both branches, or half the assertions silently inspect nothing.
+
+    `publish` writes `needs: build` (scalar), the post-publish jobs write lists.
+    """
+    assert _needs("publish") == ["build"]
+    assert _needs("github-release") == ["build", "publish"]
 
 
 def test_verify_published_installs_the_exact_published_version() -> None:
