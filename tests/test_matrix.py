@@ -6,11 +6,12 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -3881,6 +3882,8 @@ def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
     for var in (
         "DEVICE_USER",
         "DEVICE_PASS",
+        "DEVICE_SSH_KEY",
+        "DEVICE_SSH_KEY_PASSPHRASE",
         "DEVICE_USERNAME",
         "DEVICE_PASSWORD",
     ):
@@ -3932,7 +3935,14 @@ def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
     """
     from unittest import mock
 
-    for var in ("DEVICE_USER", "DEVICE_PASS", "DEVICE_USERNAME", "DEVICE_PASSWORD"):
+    for var in (
+        "DEVICE_USER",
+        "DEVICE_PASS",
+        "DEVICE_SSH_KEY",
+        "DEVICE_SSH_KEY_PASSPHRASE",
+        "DEVICE_USERNAME",
+        "DEVICE_PASSWORD",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("DEVICE_USERNAME", "retired")
     monkeypatch.setenv("DEVICE_PASSWORD", "retiredpass")
@@ -3957,6 +3967,912 @@ def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
     ):
         nclient = netc.NetconfClient(management_ip="127.0.0.1")
     assert (nclient.username, nclient.password) == ("current", "currentpass")
+
+
+def _key_auth_env(monkeypatch):
+    """Clear every credential name so key-auth tests cannot read a local .env."""
+    for var in (
+        "DEVICE_USER",
+        "DEVICE_PASS",
+        "DEVICE_SSH_KEY",
+        "DEVICE_SSH_KEY_PASSPHRASE",
+        "DEVICE_USERNAME",
+        "DEVICE_PASSWORD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_netconf_ssh_key_authenticates_without_a_password(tmp_path, monkeypatch):
+    """A key is a credential: no password is required when one is named.
+
+    This is the half of the credential contract SSH key auth relaxes. The
+    username stays mandatory, and the key path reaches ncclient as
+    `key_filename` with no password value. Agent and ~/.ssh discovery are
+    disabled with an explicit key, so only that key can authenticate.
+    """
+    from unittest import mock
+
+    _key_auth_env(monkeypatch)
+    monkeypatch.setenv("DEVICE_USER", "keyuser")
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material; not parsed by the client")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkey")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(management_ip="127.0.0.1", key_filename=str(key))
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["key_filename"] == [str(key)]
+    assert kwargs["password"] is None
+    assert kwargs["allow_agent"] is False, (
+        "an explicit key must not fall through to the SSH agent"
+    )
+    assert kwargs["look_for_keys"] is False, (
+        "an explicit key must not fall through to ~/.ssh/id_*"
+    )
+    assert client.key_filenames == [str(key)]
+    assert client.username == "keyuser"
+
+
+def test_password_auth_keeps_ncclient_agent_and_default_key_discovery(
+    tmp_path, monkeypatch
+):
+    """The fallback gate is scoped to an explicit key, not applied globally.
+
+    ncclient's agent/~/.ssh discovery is the documented behaviour when no key
+    path is supplied; disabling it for password auth would break callers who
+    rely on it. Callers may still opt out explicitly.
+    """
+    from unittest import mock
+
+    _key_auth_env(monkeypatch)
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeydefaults")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        sm.NetconfClient(
+            management_ip="127.0.0.1", username="u", password="p", verify=False
+        )
+    kwargs = connect.call_args.kwargs
+    assert kwargs["allow_agent"] is True
+    assert kwargs["look_for_keys"] is True
+
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            password="p",
+            verify=False,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+    kwargs = connect.call_args.kwargs
+    assert kwargs["allow_agent"] is False
+    assert kwargs["look_for_keys"] is False
+
+
+def test_netconf_username_must_match_the_xml_char_production(tmp_path, monkeypatch):
+    """RFC 6242 Sec 3 + RFC 6241 Sec 2.2: the NETCONF username is XML text.
+
+    The SSH layer forwards the name unchanged, so a name containing a code
+    point outside XML's ``Char`` production cannot be represented. Reject it
+    before the transport instead of relying on the server to drop the session.
+    """
+    from unittest import mock
+
+    _key_auth_env(monkeypatch)
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tusername")
+    sm = _import_fresh(out, "session_manager")
+
+    for bad in ("bad\x00user", "bad\x01user"):
+        with pytest.raises(ValueError, match="XML Char"):
+            sm.NetconfClient(management_ip="127.0.0.1", username=bad, password="p")
+
+    # Valid XML characters, including non-ASCII, must not be over-rejected.
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ):
+        sm.NetconfClient(management_ip="127.0.0.1", username="utente-è", password="p")
+
+
+def test_explicit_password_wins_over_environment_key(tmp_path, monkeypatch):
+    """An explicit password must not be overridden by DEVICE_SSH_KEY.
+
+    Resolving fields independently made ``password=...`` silently become
+    key-only auth whenever the host exported DEVICE_SSH_KEY. The source rule is
+    the contract: an explicit password suppresses both environment key names.
+    """
+    import argparse
+    from unittest import mock
+
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    monkeypatch.setenv("DEVICE_USER", "envuser")
+    monkeypatch.setenv("DEVICE_SSH_KEY", str(key))
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeyexplicitpw")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(
+            management_ip="127.0.0.1", password="explicit-password"
+        )
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["password"] == "explicit-password"
+    assert kwargs["key_filename"] is None
+    assert kwargs["allow_agent"] is True
+    assert kwargs["look_for_keys"] is True
+    assert client.password == "explicit-password"
+    assert client.key_filenames is None
+    assert client.passphrase is None
+
+    args = argparse.Namespace(
+        username="", password="explicit-password", ssh_key="", ssh_key_passphrase=""
+    )
+    assert _resolve_credentials(args, "netconf") == (
+        "envuser",
+        "explicit-password",
+        None,
+        None,
+    )
+
+
+def test_explicit_key_ignores_environment_password_and_passphrase(
+    tmp_path, monkeypatch
+):
+    """An explicit key owns its source: no DEVICE_PASS, no env passphrase.
+
+    Inheriting DEVICE_SSH_KEY_PASSPHRASE here would make a valid unencrypted
+    key unusable because of unrelated environment state. It belongs only to a
+    key that itself came from DEVICE_SSH_KEY.
+    """
+    import argparse
+    from unittest import mock
+
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    monkeypatch.setenv("DEVICE_USER", "keyuser")
+    monkeypatch.setenv("DEVICE_PASS", "env-account-password")
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeyexplicitkey")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="keyuser",
+            key_filename=str(key),
+        )
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["key_filename"] == [str(key)]
+    assert kwargs["password"] is None
+    assert client.password is None
+    assert client.passphrase is None
+
+    args = argparse.Namespace(
+        username="keyuser", password="", ssh_key=str(key), ssh_key_passphrase=""
+    )
+    assert _resolve_credentials(args, "netconf") == (
+        "keyuser",
+        None,
+        str(key),
+        None,
+    )
+
+
+def test_explicit_password_and_key_ambiguity_is_not_silent(
+    tmp_path, monkeypatch, capsys
+):
+    """Both explicit credentials are ambiguous; neither is silently discarded.
+
+    The generated client and downloader reject the pair. sdk-verify warns and
+    lets the key win, because ``--protocol both`` legitimately uses a password
+    for RESTCONF and a key for NETCONF in one invocation.
+    """
+    import argparse
+
+    from yang2sdk.cli.downloader import YangDownloader
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeyboth")
+    sm = _import_fresh(out, "session_manager")
+    with pytest.raises(ValueError, match="alternatives"):
+        sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            password="account-password",
+            key_filename=str(key),
+        )
+
+    with pytest.raises(ValueError, match="alternatives"):
+        YangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            password="account-password",
+            output_dir=tmp_path,
+            key_filename=str(key),
+        )
+
+    args = argparse.Namespace(
+        username="u",
+        password="account-password",
+        ssh_key=str(key),
+        ssh_key_passphrase="",
+    )
+    assert _resolve_credentials(args, "netconf") == (
+        "u",
+        None,
+        str(key),
+        None,
+    )
+    assert "both --password and --ssh-key were given" in capsys.readouterr().err
+
+
+def test_environment_password_and_key_warns_and_key_wins(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    """With no explicit argument, env ambiguity is resolved loudly.
+
+    DEVICE_SSH_KEY wins because a host can pair a password for RESTCONF with a
+    key for NETCONF; passing an explicit password still forces password auth.
+    """
+    import argparse
+    import logging
+    from unittest import mock
+
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    monkeypatch.setenv("DEVICE_USER", "envuser")
+    monkeypatch.setenv("DEVICE_PASS", "env-password")
+    monkeypatch.setenv("DEVICE_SSH_KEY", str(key))
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+
+    caplog.set_level(logging.WARNING)
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeyenvboth")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(management_ip="127.0.0.1")
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["key_filename"] == [str(key)]
+    assert kwargs["password"] == "env-key-pass"
+    assert client.password is None
+    assert "Both DEVICE_PASS and DEVICE_SSH_KEY are set" in caplog.text
+
+    args = argparse.Namespace(
+        username="", password="", ssh_key="", ssh_key_passphrase=""
+    )
+    assert _resolve_credentials(args, "netconf") == (
+        "envuser",
+        None,
+        str(key),
+        "env-key-pass",
+    )
+    assert "both DEVICE_PASS and DEVICE_SSH_KEY are set" in capsys.readouterr().err
+
+
+def test_netconf_ssh_certificate_and_passphrase_reach_ncclient(
+    tmp_path, monkeypatch, caplog
+):
+    """An OpenSSH certificate is a first-class key_filename, and a key
+    passphrase occupies ncclient's single password slot.
+
+    paramiko resolves `<key>-cert.pub` to the adjacent private key and attaches
+    the certificate, so either path is valid. ncclient has no separate
+    passphrase parameter (`SSHSession._auth` uses `password` to unlock keys),
+    which is why asserting the transport kwarg -- not just the attribute -- is
+    the only way to know an encrypted key will actually open.
+    """
+    import logging
+    from unittest import mock
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    cert = tmp_path / "id_ed25519-cert.pub"
+    key.write_text("dummy key material")
+    cert.write_text("ssh-ed25519-cert-v01@openssh.com AAAA dummy cert")
+
+    caplog.set_level(logging.WARNING)
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tcert")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            key_filename=str(cert),
+            passphrase="key-secret",
+            verify=False,
+        )
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["key_filename"] == [str(cert)]
+    assert kwargs["password"] == "key-secret", (
+        "encrypted keys are unlocked with ncclient's password parameter"
+    )
+    assert kwargs["allow_agent"] is False
+    assert kwargs["look_for_keys"] is False
+    assert client.password is None, "the key passphrase is not an account password"
+    assert client.passphrase == "key-secret"
+    assert "try it as a password" in caplog.text, (
+        "encrypted-key auth must warn about ncclient's password fallback"
+    )
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="ssh-keygen is required")
+def test_paramiko_loads_real_key_encrypted_key_and_openssh_certificate(tmp_path):
+    """Exercise the real key/certificate loading path, not just kwargs.
+
+    The generated client delegates the actual parsing to
+    ``paramiko.PKey.from_path``. This creates real key material with
+    ssh-keygen, including a CA-signed OpenSSH certificate, and pins the
+    behaviours the client relies on: an unencrypted key has no certificate,
+    an encrypted key opens only with its passphrase, and the certificate works
+    from either member of the ``<key>`` / ``<key>-cert.pub`` pair.
+    """
+    import paramiko
+
+    def keygen(*args: str) -> None:
+        subprocess.run(
+            ["ssh-keygen", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    plain = tmp_path / "id_plain"
+    keygen("-q", "-t", "ed25519", "-N", "", "-f", str(plain))
+    encrypted = tmp_path / "id_encrypted"
+    keygen("-q", "-t", "ed25519", "-N", "secret", "-f", str(encrypted))
+    ca = tmp_path / "id_ca"
+    keygen("-q", "-t", "ed25519", "-N", "", "-f", str(ca))
+    signed = tmp_path / "id_signed"
+    keygen("-q", "-t", "ed25519", "-N", "", "-f", str(signed))
+    keygen("-q", "-s", str(ca), "-I", "test", "-n", "user", f"{signed}.pub")
+
+    assert paramiko.PKey.from_path(str(plain)).public_blob is None
+    # paramiko's annotation says str, but cryptography requires bytes here.
+    encrypted_key = paramiko.PKey.from_path(str(encrypted), cast(str, b"secret"))
+    assert encrypted_key.get_name() == "ssh-ed25519"
+
+    cert = tmp_path / "id_signed-cert.pub"
+    assert cert.exists()
+    for loaded in (
+        paramiko.PKey.from_path(str(signed)),
+        paramiko.PKey.from_path(str(cert)),
+    ):
+        assert loaded.get_name() == "ssh-ed25519"
+        assert loaded.public_blob is not None
+        assert loaded.public_blob.key_type == "ssh-ed25519-cert-v01@openssh.com"
+
+    with pytest.raises(
+        TypeError, match="Password was given but private key is not encrypted"
+    ):
+        paramiko.PKey.from_path(str(plain), cast(str, b"secret"))
+    with pytest.raises(TypeError, match="password-protected"):
+        paramiko.PKey.from_path(str(encrypted))
+
+
+def test_ncclient_tries_the_key_passphrase_as_a_password_after_key_failure(
+    monkeypatch,
+):
+    """Pin the dependency behaviour the documentation must not overclaim.
+
+    ncclient's ``SSHSession._auth`` takes one password slot. With a key it is
+    the passphrase; if public-key auth fails, ncclient falls back to
+    ``auth_password`` using that slot. This test is deliberately about
+    ncclient, not yang2sdk: if the dependency changes, the security wording in
+    AGENTS.md / SECURITY.md / docs/usage.md must change with it.
+    """
+    import logging
+
+    from ncclient.transport import ssh
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.password_calls: list[tuple[str, str]] = []
+
+        def auth_publickey(self, *_args: object) -> None:
+            raise AssertionError("key parsing is expected to fail first")
+
+        def auth_password(self, username: str, password: str) -> None:
+            self.password_calls.append((username, password))
+
+    def _reject(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("key rejected")
+
+    monkeypatch.setattr(ssh.paramiko.PKey, "from_path", _reject)
+    transport = _Transport()
+    session: Any = object.__new__(ssh.SSHSession)
+    session.logger = logging.getLogger("test-ncclient-auth")
+    session._transport = transport
+
+    session._auth("u", "key-passphrase", ["/tmp/not-a-real-key"], False, False)
+
+    assert transport.password_calls == [("u", "key-passphrase")]
+
+
+def test_netconf_ssh_key_environment_fallback(tmp_path, monkeypatch):
+    """DEVICE_SSH_KEY / DEVICE_SSH_KEY_PASSPHRASE work like the password pair."""
+    from unittest import mock
+
+    _key_auth_env(monkeypatch)
+    # Keep `~` expansion without touching the real home directory.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DEVICE_USER", "envkeyuser")
+    monkeypatch.setenv("DEVICE_SSH_KEY", "~/keys/id_ed25519")
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+    expected = os.path.expanduser("~/keys/id_ed25519")
+    Path(expected).parent.mkdir(parents=True, exist_ok=True)
+    Path(expected).write_text("dummy key material")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tkeyenv")
+    sm = _import_fresh(out, "session_manager")
+    with mock.patch.object(
+        sm.manager, "connect", return_value=_FakeNcclientManager(_BASE_CAPS)
+    ) as connect:
+        client = sm.NetconfClient(management_ip="127.0.0.1")
+
+    kwargs = connect.call_args.kwargs
+    assert client.username == "envkeyuser"
+    assert kwargs["key_filename"] == [expected]
+    assert kwargs["password"] == "env-key-pass"
+
+
+def test_netconf_missing_key_path_fails_closed(tmp_path, monkeypatch):
+    """A typo must fail before the transport, not fall back to another identity.
+
+    ncclient silently falls through to the agent/~/.ssh when an explicit key
+    cannot be loaded, so a nonexistent path could otherwise authenticate as
+    whoever the host happens to have keys for.
+    """
+    _key_auth_env(monkeypatch)
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tbadkey")
+    sm = _import_fresh(out, "session_manager")
+    missing = tmp_path / "no-such-key"
+    with pytest.raises(ValueError, match="not found"):
+        sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            key_filename=str(missing),
+        )
+
+    # A certificate path is not a credential by itself: paramiko needs the
+    # adjacent private key, and explicit paths never fall back to the agent.
+    cert = tmp_path / "id_ed25519-cert.pub"
+    cert.write_text("ssh-ed25519-cert-v01@openssh.com AAAA dummy cert")
+    with pytest.raises(ValueError, match="adjacent private key"):
+        sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            key_filename=str(cert),
+        )
+
+    # A stray passphrase must not silently replace the account password in
+    # ncclient's shared transport slot.
+    with pytest.raises(ValueError, match="without key_filename"):
+        sm.NetconfClient(
+            management_ip="127.0.0.1",
+            username="u",
+            password="p",
+            passphrase="stray",
+        )
+
+
+def test_downloader_and_sdk_verify_accept_key_credentials(tmp_path, monkeypatch):
+    """The two CLI consumers resolve the same key names as a generated client.
+
+    `yang-downloader` reads DEVICE_SSH_KEY / DEVICE_SSH_KEY_PASSPHRASE, and
+    sdk-verify accepts --ssh-key (or the environment) for NETCONF while still
+    refusing a RESTCONF run with no password. Pinned here because the
+    generated client is not the only place the credential contract is stated.
+    """
+    import argparse
+
+    from yang2sdk.cli import downloader as downloader_mod
+    from yang2sdk.cli.downloader import main as downloader_main
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    seen: dict[str, object] = {}
+    RealYangDownloader = downloader_mod.YangDownloader
+
+    # Explicit credentials are alternatives. With a key the transport slot is
+    # its passphrase or empty, never the account password; without a key it is
+    # the password.
+    with pytest.raises(ValueError, match="alternatives"):
+        RealYangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            password="p",
+            output_dir=tmp_path,
+            key_filename=str(key),
+        )
+    assert (
+        RealYangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            output_dir=tmp_path,
+            key_filename=str(key),
+        ).transport_password
+        is None
+    )
+    assert (
+        RealYangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            password="p",
+            output_dir=tmp_path,
+        ).transport_password
+        == "p"
+    )
+
+    class _FakeDownloader:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def download_all(self):
+            return 0
+
+    monkeypatch.setattr(downloader_mod, "YangDownloader", _FakeDownloader)
+    monkeypatch.setattr(downloader_mod, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("DEVICE_IP", "127.0.0.1")
+    monkeypatch.setenv("NETCONF_PORT", "830")
+    monkeypatch.setenv("DEVICE_NAME", "fake")
+    monkeypatch.setenv("DEVICE_USER", "envuser")
+    monkeypatch.setenv("DEVICE_SSH_KEY", str(key))
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+    downloader_main()
+    assert seen["user"] == "envuser"
+    assert seen["key_filename"] == str(key)
+    assert seen["passphrase"] == "env-key-pass"
+    assert seen["password"] is None
+
+    args = argparse.Namespace(
+        username="",
+        password="",
+        ssh_key=str(key),
+        ssh_key_passphrase="env-key-pass",
+    )
+    user, password, key_filename, passphrase = _resolve_credentials(args, "netconf")
+    assert (user, password, key_filename, passphrase) == (
+        "envuser",
+        None,
+        str(key),
+        "env-key-pass",
+    )
+    with pytest.raises(SystemExit, match="RESTCONF needs"):
+        _resolve_credentials(args, "restconf")
+
+
+def test_downloader_environment_password_and_key_warns_and_uses_key(
+    tmp_path, monkeypatch, caplog
+):
+    """The downloader mirrors the client's environment-ambiguity rule."""
+    import logging
+
+    from yang2sdk.cli import downloader as downloader_mod
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    seen: dict[str, object] = {}
+
+    class _FakeDownloader:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def download_all(self):
+            return 0
+
+    monkeypatch.setattr(downloader_mod, "YangDownloader", _FakeDownloader)
+    monkeypatch.setattr(downloader_mod, "_configure_logging", lambda: None)
+    monkeypatch.setattr(downloader_mod, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("DEVICE_IP", "127.0.0.1")
+    monkeypatch.setenv("NETCONF_PORT", "830")
+    monkeypatch.setenv("DEVICE_NAME", "fake")
+    monkeypatch.setenv("DEVICE_USER", "u")
+    monkeypatch.setenv("DEVICE_PASS", "env-password")
+    monkeypatch.setenv("DEVICE_SSH_KEY", str(key))
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "env-key-pass")
+
+    with caplog.at_level(logging.WARNING, logger=downloader_mod.__name__):
+        downloader_mod.main()
+
+    assert seen["password"] is None
+    assert seen["key_filename"] == str(key)
+    assert seen["passphrase"] == "env-key-pass"
+    assert "Both DEVICE_PASS and DEVICE_SSH_KEY are set" in caplog.text
+
+
+def test_downloader_explicit_key_disables_agent_and_default_key_fallbacks(
+    tmp_path, monkeypatch
+):
+    """The downloader must not fall through to another host identity.
+
+    ncclient's SSHSession._auth tries the named key, then the SSH agent, then
+    ~/.ssh/id_* before giving up. A valid but unauthorized key would therefore
+    still authenticate as whoever the host has keys for. Measured on SR Linux
+    in containerlab: an unsigned, unauthorized key connected successfully via
+    ~/.ssh/id_ed25519 until these two flags were forced off.
+    """
+    from unittest import mock
+
+    from yang2sdk.cli import downloader as downloader_mod
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+
+    class _Manager:
+        server_capabilities: tuple[str, ...] = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(
+        downloader_mod.YangDownloader, "get_schema_list", lambda self, manager: []
+    )
+    with mock.patch.object(
+        downloader_mod.manager, "connect", return_value=_Manager()
+    ) as connect:
+        downloader = downloader_mod.YangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            output_dir=tmp_path,
+            key_filename=str(key),
+        )
+        assert downloader.download_all() == 0
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["key_filename"] == str(key)
+    assert kwargs["allow_agent"] is False
+    assert kwargs["look_for_keys"] is False
+
+
+def test_downloader_warns_when_key_passphrase_is_supplied(
+    tmp_path, monkeypatch, caplog
+):
+    """The downloader repeats the encrypted-key fallback warning."""
+    import logging
+
+    from yang2sdk.cli import downloader as downloader_mod
+
+    _key_auth_env(monkeypatch)
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy key material")
+    caplog.set_level(logging.WARNING, logger=downloader_mod.__name__)
+
+    downloader = downloader_mod.YangDownloader(
+        host="127.0.0.1",
+        port=830,
+        user="u",
+        output_dir=tmp_path,
+        key_filename=str(key),
+        passphrase="key-secret",
+    )
+
+    assert downloader.transport_password == "key-secret"
+    assert "try it as a password" in caplog.text
+
+
+def test_downloader_exits_nonzero_when_extraction_fails(monkeypatch):
+    """A failed authentication or a total extraction failure must not exit 0.
+
+    `download_all()` returned a failure count, but `main()` ignored it, so an
+    unauthorized key printed CRITICAL SYSTEM ERROR and still looked successful
+    to a script or CI step.
+    """
+    from yang2sdk.cli import downloader as downloader_mod
+
+    _key_auth_env(monkeypatch)
+
+    class _FailingDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def download_all(self):
+            return 1
+
+    monkeypatch.setattr(downloader_mod, "YangDownloader", _FailingDownloader)
+    monkeypatch.setattr(downloader_mod, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("DEVICE_IP", "127.0.0.1")
+    monkeypatch.setenv("NETCONF_PORT", "830")
+    monkeypatch.setenv("DEVICE_NAME", "fake")
+    monkeypatch.setenv("DEVICE_USER", "u")
+    monkeypatch.setenv("DEVICE_PASS", "p")
+
+    with pytest.raises(SystemExit) as exc_info:
+        downloader_mod.main()
+    assert exc_info.value.code == 1
+
+
+def test_downloader_rejects_a_non_xml_username(tmp_path, monkeypatch):
+    """RFC 6242 Sec 3 / RFC 6241 Sec 2.2 apply to the downloader too."""
+    from yang2sdk.cli.downloader import YangDownloader
+
+    _key_auth_env(monkeypatch)
+    with pytest.raises(ValueError, match="XML Char"):
+        YangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="bad\x00user",
+            password="p",
+            output_dir=tmp_path,
+        )
+
+
+def test_a_key_passphrase_without_a_key_is_refused(tmp_path, monkeypatch):
+    """A stray passphrase must never displace the account password.
+
+    ncclient's transport has one `password` slot, used first as the key
+    passphrase and only then for password auth. Accepting a passphrase with no
+    key would replace DEVICE_PASS with a value that cannot authenticate, and
+    the failure would look like a wrong password rather than a misconfiguration.
+    """
+    import argparse
+
+    from yang2sdk.cli.downloader import YangDownloader
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    with pytest.raises(ValueError, match="without key_filename"):
+        YangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            password="p",
+            output_dir=tmp_path,
+            passphrase="stray",
+        )
+
+    args = argparse.Namespace(
+        username="u",
+        password="p",
+        ssh_key="",
+        ssh_key_passphrase="stray",
+    )
+    with pytest.raises(SystemExit, match="without --ssh-key"):
+        _resolve_credentials(args, "netconf")
+
+    # The same rule applies when the stray passphrase comes from the
+    # environment and the password is the only credential.
+    monkeypatch.setenv("DEVICE_PASS", "p")
+    monkeypatch.setenv("DEVICE_SSH_KEY_PASSPHRASE", "stray")
+    args = argparse.Namespace(
+        username="u", password="", ssh_key="", ssh_key_passphrase=""
+    )
+    with pytest.raises(SystemExit, match="without --ssh-key"):
+        _resolve_credentials(args, "netconf")
+
+    out, _ = _gen(tmp_path, "netconf", REPLACE_YANG, "tstrayenv")
+    sm = _import_fresh(out, "session_manager")
+    with pytest.raises(ValueError, match="without key_filename"):
+        sm.NetconfClient(management_ip="127.0.0.1", username="u")
+
+
+def test_certificate_without_its_private_key_is_refused(tmp_path, monkeypatch):
+    """An explicit certificate is not a credential by itself.
+
+    paramiko resolves `<key>-cert.pub` by loading the adjacent private key and
+    attaching the certificate. With agent/~/.ssh discovery disabled for
+    explicit paths, a cert without that key cannot authenticate, so both CLI
+    consumers reject it before touching the transport.
+    """
+    import argparse
+
+    from yang2sdk.cli.downloader import YangDownloader
+    from yang2sdk.cli.sdk_verify import _resolve_credentials
+
+    _key_auth_env(monkeypatch)
+    cert = tmp_path / "id_ed25519-cert.pub"
+    cert.write_text("ssh-ed25519-cert-v01@openssh.com AAAA dummy cert")
+
+    with pytest.raises(ValueError, match="adjacent private key"):
+        YangDownloader(
+            host="127.0.0.1",
+            port=830,
+            user="u",
+            output_dir=tmp_path,
+            key_filename=str(cert),
+        )
+
+    args = argparse.Namespace(
+        username="u",
+        password="",
+        ssh_key=str(cert),
+        ssh_key_passphrase="",
+    )
+    with pytest.raises(SystemExit, match="adjacent private key"):
+        _resolve_credentials(args, "netconf")
+
+    # Placing the private key alongside the certificate makes it usable.
+    (tmp_path / "id_ed25519").write_text("dummy key material")
+    assert YangDownloader(
+        host="127.0.0.1",
+        port=830,
+        user="u",
+        output_dir=tmp_path,
+        key_filename=str(cert),
+    ).key_filename == str(cert)
+    assert _resolve_credentials(args, "netconf")[2] == str(cert)
+
+
+def test_sdk_verify_reports_connection_failure_without_a_traceback(
+    tmp_path, monkeypatch
+):
+    """An unauthorized key is an operator error, not a Python crash.
+
+    The negative control against SR Linux produced a full ncclient traceback
+    ending in `AuthenticationError`, which buries the one actionable line.
+    """
+    import argparse
+
+    from yang2sdk.cli import sdk_verify
+
+    client_dir = tmp_path / "fake-client"
+    client_dir.mkdir()
+    (client_dir / "__init__.py").write_text("")
+
+    class _RejectingClient:
+        def __init__(self, **kwargs):
+            raise RuntimeError("Authentication failed.")
+
+    module = type("FakeModule", (), {"NetconfClient": _RejectingClient})
+    monkeypatch.setattr(
+        sdk_verify, "_import_client", lambda *args, **kwargs: (module, None)
+    )
+    monkeypatch.setenv("DEVICE_IP", "127.0.0.1")
+    monkeypatch.setenv("NETCONF_PORT", "830")
+    args = argparse.Namespace(
+        client_dir=str(client_dir),
+        device="fake",
+        verify_tls=False,
+        debug=False,
+    )
+
+    with pytest.raises(SystemExit, match="connection failed: Authentication failed."):
+        sdk_verify.run_protocol(
+            "netconf", args, {"read"}, "u", None, str(tmp_path / "id_ed25519")
+        )
 
 
 def test_missing_yang_dir_fails_fast_with_actionable_error(tmp_path):

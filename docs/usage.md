@@ -35,12 +35,33 @@ The emitter compiles every generated `.py` before reporting success, so a client
 
 ## Credentials and connection security
 
-No credentials are ever baked into generated code. Both clients resolve them at runtime in the same order:
+No credentials are ever baked into generated code. Both clients resolve them at runtime **by source**, not field by field:
 
-1. the `username` / `password` constructor arguments, if given;
-2. otherwise `DEVICE_USER` and `DEVICE_PASS` from the environment.
+1. an explicit `password` is used and the environment key pair is ignored;
+2. an explicit `key_filename` is used and `DEVICE_PASS` is ignored; its passphrase comes only from the explicit `passphrase` argument (or from `DEVICE_SSH_KEY_PASSPHRASE` when the key itself came from `DEVICE_SSH_KEY`);
+3. otherwise the environment is used: `DEVICE_USER` plus `DEVICE_PASS`, or — for NETCONF — `DEVICE_SSH_KEY` / `DEVICE_SSH_KEY_PASSPHRASE`. If both password and key are set there, the key wins with a logged warning, never silently.
 
-If either value is still missing, the constructor raises `ValueError` before any transport work — there is no unauthenticated client that fails later with an opaque error. Exactly two names, both protocols, no aliases: the same `.env` that `yang-downloader` and `sdk-verify` read also works for a generated client. `DEVICE_USERNAME` / `DEVICE_PASSWORD` are retired and ignored.
+Supplying both an explicit password and an explicit key is rejected by generated clients and `yang-downloader`; `sdk-verify` warns and uses the key for NETCONF, so `--protocol both` can pair a RESTCONF password with a NETCONF key.
+
+A username is always required. NETCONF then accepts **either** a password **or** an SSH key; RESTCONF accepts a password only (SSH transport belongs to NETCONF). If no credential is available, the constructor raises `ValueError` before any transport work — there is no unauthenticated client that fails later with an opaque error. The names are not aliased: `DEVICE_USERNAME` / `DEVICE_PASSWORD` are retired and ignored, and the same `.env` that `yang-downloader` and `sdk-verify` read also works for a generated client. The NETCONF username is forwarded to the SSH layer unchanged, so it must consist of XML `Char` code points (RFC 6242 §3, RFC 6241 §2.2); a name containing e.g. a NUL is rejected before connecting.
+
+```python
+from g30_1_4_0 import NetconfClient
+
+# Password
+client = NetconfClient(management_ip="192.0.2.10")
+
+# SSH key (or `...-cert.pub` for an OpenSSH user certificate)
+client = NetconfClient(
+    management_ip="192.0.2.10",
+    key_filename="~/.ssh/id_ed25519",
+    passphrase=None,  # only for an encrypted key
+)
+```
+
+`key_filename` takes one path or a sequence. OpenSSH certificates use the conventional `<private-key>-cert.pub` filename: paramiko strips that suffix to load the private key and then attaches the certificate, so passing either member of the pair works. The authentication method is the RFC 4252 §7 `publickey` method; the certificate *encoding* is the OpenSSH vendor extension specified by the IETF Internet-Draft `draft-ietf-sshm-cert`, not by an RFC. The adjacent private key must be present, because an explicit path disables the SSH agent and `~/.ssh` key discovery. Paths are validated before connecting, so a typo — or a valid but unauthorized key — fails closed instead of silently falling through to another key. The **account password** is never placed in ncclient's single SSH `password` slot when a key is used: that slot carries the key passphrase (or nothing for an unencrypted key), because paramiko rejects an unencrypted key when a password is supplied. ncclient will, however, try an encrypted key's passphrase as a password if public-key authentication fails (`SSHSession._auth`); the client logs a warning naming that fallback. Use an unencrypted key if that behaviour is unacceptable. A passphrase without a key is rejected as misconfiguration rather than being tried as an account password.
+
+`yang-downloader` reads the same two key names, and `sdk-verify` exposes them as `--ssh-key` / `--ssh-key-passphrase` (or the environment) for `--protocol netconf`.
 
 | Transport | Default | Opt-out (explicit + logged warning) |
 | --- | --- | --- |

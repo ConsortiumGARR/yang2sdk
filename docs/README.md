@@ -4,6 +4,7 @@ Start in [`../README.md`](../README.md), then pick your track:
 
 | Doc | Audience | Contents |
 | --- | --- | --- |
+| [`../README.md`](../README.md) | everyone | Value proposition, quick start, authentication, safety, validation |
 | [`usage.md`](usage.md) | network engineer | Compile flags, credentials, transport defaults, NETCONF write safety, RPCs/actions, packaging, HAL |
 | [`lab.md`](lab.md) | network engineer | `sdk-verify` tiers and write gates, simulator matrix, SR Linux job |
 | [`dev.md`](dev.md) | contributor | Gates, tool pinning and the bump procedure, tests, CI |

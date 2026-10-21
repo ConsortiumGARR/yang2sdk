@@ -152,7 +152,9 @@ class RestconfClient:
         # and a host exporting both authenticated as two different identities
         # depending on transport. Failing closed is deliberate -- an
         # unauthenticated RESTCONF session would silently 401 on the first
-        # call, so raise before any transport work happens.
+        # call, so raise before any transport work happens. There is no SSH
+        # key alternative here: RESTCONF runs over HTTPS, so `key_filename`
+        # belongs to the NETCONF client only.
         user = username or os.environ.get("DEVICE_USER")
         pw = password or os.environ.get("DEVICE_PASS")
         if not user or not pw:

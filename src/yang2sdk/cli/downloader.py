@@ -23,6 +23,27 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+
+def _is_netconf_username(value: str) -> bool:
+    """True when every character matches the XML 1.0 ``Char`` production.
+
+    RFC 6242 Sec 3 passes the SSH username to NETCONF unchanged and requires
+    an invalid name to be rejected; RFC 6241 Sec 2.2 defines the username as a
+    string of XML ``Char`` characters.
+    """
+    for char in value:
+        code = ord(char)
+        if (
+            code in (0x09, 0x0A, 0x0D)
+            or 0x20 <= code <= 0xD7FF
+            or 0xE000 <= code <= 0xFFFD
+            or 0x10000 <= code <= 0x10FFFF
+        ):
+            continue
+        return False
+    return True
+
+
 _configured = False
 
 
@@ -93,11 +114,90 @@ def _revision_key(version: str) -> tuple:
 class YangDownloader:
     """Download YANG models directly from a running network node."""
 
-    def __init__(self, host, port, user, password, output_dir):
+    def __init__(
+        self,
+        host,
+        port,
+        user,
+        password=None,
+        output_dir=".",
+        *,
+        key_filename=None,
+        passphrase=None,
+    ):
+        """Configure a downloader session.
+
+        Authentication is either `password` or SSH public-key
+        `key_filename` (a private key or its OpenSSH `<key>-cert.pub`;
+        paramiko loads the adjacent private key for certificates).
+        `passphrase` unlocks an encrypted key. ncclient carries the passphrase
+        in its single SSH `password` transport slot. The *account password* is
+        never placed there, but ncclient will also try the passphrase as a
+        password if public-key authentication fails; use an unencrypted key if
+        that fallback is unacceptable. An explicit key also disables ncclient's
+        SSH-agent and `~/.ssh` fallbacks, so an unauthorized key cannot
+        silently authenticate as another identity.
+
+        `password` and `key_filename` are alternatives; supplying both is a
+        configuration error rather than a silent preference for one.
+        """
         self.host = host
         self.port = port
         self.user = user
-        self.password = password
+        if self.user and not _is_netconf_username(self.user):
+            raise ValueError(
+                "NETCONF username must match the XML Char production "
+                "(RFC 6241 Sec 2.2, RFC 6242 Sec 3)."
+            )
+        if password and key_filename:
+            raise ValueError(
+                "password and key_filename are alternatives; pass exactly one."
+            )
+        self.password = None if key_filename else password
+        self.passphrase = passphrase
+        self.key_filename = (
+            os.path.expanduser(os.fspath(key_filename)) if key_filename else None
+        )
+        if self.key_filename and not os.path.isfile(self.key_filename):
+            raise ValueError(
+                f"SSH key/certificate file not found: {self.key_filename!r}"
+            )
+        cert_suffix = "-cert.pub"
+        if self.key_filename and self.key_filename.endswith(cert_suffix):
+            private_key = self.key_filename[: -len(cert_suffix)]
+            if not os.path.isfile(private_key):
+                raise ValueError(
+                    f"SSH certificate {self.key_filename!r} has no adjacent "
+                    f"private key {private_key!r}; agent-held keys are not "
+                    "used when an explicit path is given."
+                )
+        if self.passphrase and not self.key_filename:
+            raise ValueError(
+                "Passphrase was given without key_filename; a key passphrase "
+                "only applies to an explicit SSH key."
+            )
+        if not self.password and not self.key_filename:
+            raise ValueError(
+                "Authentication credentials missing: pass password or "
+                "key_filename, or set DEVICE_PASS / DEVICE_SSH_KEY."
+            )
+        # ncclient has one transport password slot. With a key configured it
+        # holds the key passphrase or nothing -- never the account password:
+        # an account password passed to an unencrypted key makes paramiko
+        # refuse the key ("Password was given but private key is not
+        # encrypted"), so key auth would never be attempted. For an encrypted
+        # key ncclient will also use this slot for password authentication if
+        # the public-key attempt fails (SSHSession._auth).
+        self.transport_password = (
+            self.passphrase if self.key_filename else self.password
+        )
+        if self.passphrase and self.key_filename:
+            logger.warning(
+                "A key passphrase was supplied. ncclient uses its password slot "
+                "for the passphrase and will try it as a password if public-key "
+                "authentication fails; use an unencrypted key if that fallback "
+                "is unacceptable."
+            )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,8 +231,21 @@ class YangDownloader:
                 host=self.host,
                 port=self.port,
                 username=self.user,
-                password=self.password,
+                # See YangDownloader.__init__: with a key configured this is
+                # its passphrase (or None), never the account password.
+                password=self.transport_password,
+                key_filename=self.key_filename,
+                # RFC 6242 Sec 6 requires the client to verify the SSH server
+                # identity. This CLI is LAB ONLY (see module docstring) and
+                # deliberately opts out for throwaway devices; the warning
+                # above is part of that contract. Generated clients keep the
+                # secure `verify=True` default.
                 hostkey_verify=False,
+                # ncclient tries the agent and ~/.ssh after an explicit key
+                # fails. With a key configured, the named key is the only
+                # identity this run may present.
+                allow_agent=not self.key_filename,
+                look_for_keys=not self.key_filename,
             ) as m:
                 schemas = self.get_schema_list(m)
                 saved = 0
@@ -248,21 +361,47 @@ def main():
         ip = os.environ["DEVICE_IP"]
         port = os.environ["NETCONF_PORT"]
         username = os.environ["DEVICE_USER"]
-        password = os.environ["DEVICE_PASS"]
         device_name = os.environ["DEVICE_NAME"]
     except KeyError as e:
         print(f"Environment configuration missing key: {e}", file=sys.stderr)
         sys.exit(2)
 
+    # Password and SSH key are alternatives. Both are optional here so the
+    # constructor can report the single actionable "credentials missing" error
+    # rather than this loop failing on whichever name is absent.
+    password = os.environ.get("DEVICE_PASS")
+    key_filename = os.environ.get("DEVICE_SSH_KEY")
+    passphrase = os.environ.get("DEVICE_SSH_KEY_PASSPHRASE")
+    if password and key_filename:
+        # Same rule as the generated NETCONF client: an environment key wins
+        # over an environment password, but never silently. The downloader
+        # constructor rejects an explicit override of both.
+        logger.warning(
+            "Both DEVICE_PASS and DEVICE_SSH_KEY are set; using the SSH key. "
+            "Unset DEVICE_SSH_KEY to authenticate with the password."
+        )
+        password = None
+
     output_path = Path.cwd() / "temp" / "yang_modules" / device_name
-    extractor = YangDownloader(
-        host=ip,
-        port=int(port),
-        user=username,
-        password=password,
-        output_dir=output_path,
-    )
-    extractor.download_all()
+    try:
+        extractor = YangDownloader(
+            host=ip,
+            port=int(port),
+            user=username,
+            password=password,
+            output_dir=output_path,
+            key_filename=key_filename,
+            passphrase=passphrase,
+        )
+    except ValueError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(2)
+    failed = extractor.download_all()
+    if failed:
+        # download_all() already reported the failure; make the CLI status
+        # agree with it. Returning normally here made an authentication error
+        # or a total extraction failure look like success to scripts and CI.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

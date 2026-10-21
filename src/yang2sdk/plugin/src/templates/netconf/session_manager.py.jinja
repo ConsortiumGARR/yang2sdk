@@ -24,6 +24,89 @@ _CAP_CONFIRMED_COMMIT = "urn:ietf:params:netconf:capability:confirmed-commit:1.1
 _CAP_ROLLBACK_ON_ERROR = "urn:ietf:params:netconf:capability:rollback-on-error:1.0"
 _CAP_VALIDATE = "urn:ietf:params:netconf:capability:validate:1.0"
 
+# SSH public-key authentication. `DEVICE_SSH_KEY` points at the private key
+# (or at its OpenSSH certificate, which paramiko resolves to the adjacent
+# private key -- see _resolve_key_files); `DEVICE_SSH_KEY_PASSPHRASE` unlocks
+# an encrypted key. Both are optional: the credential contract still fails
+# closed, requiring a password or a key before any transport work.
+_ENV_SSH_KEY = "DEVICE_SSH_KEY"
+_ENV_SSH_KEY_PASSPHRASE = "DEVICE_SSH_KEY_PASSPHRASE"
+
+
+def _resolve_key_files(key_filename):
+    """Normalize and validate key/certificate paths for ncclient.
+
+    Accepts one path or a sequence. OpenSSH certificate authentication uses
+    the conventional `<private-key>-cert.pub` filename: paramiko's
+    `PKey.from_path` strips that suffix to load the private key and then
+    attaches the certificate, so passing either member of the pair works. A
+    certificate path therefore requires its adjacent private key. Paths are
+    expanded (~) but never read or parsed here -- key material stays out of
+    this module.
+    """
+    if key_filename is None:
+        return None
+    if isinstance(key_filename, (str, os.PathLike)):
+        entries = [key_filename]
+    else:
+        try:
+            entries = list(key_filename)
+        except TypeError:
+            raise ValueError(
+                "key_filename must be a path or a sequence of paths, "
+                f"not {type(key_filename).__name__}"
+            ) from None
+    if not entries:
+        raise ValueError("key_filename was given but contains no paths")
+    resolved = []
+    for entry in entries:
+        try:
+            path = os.path.expanduser(os.fspath(entry))
+        except TypeError:
+            raise ValueError(
+                "key_filename entries must be str or os.PathLike, "
+                f"not {type(entry).__name__}"
+            ) from None
+        if not os.path.isfile(path):
+            raise ValueError(f"SSH key/certificate file not found: {path!r}")
+        # paramiko resolves `<key>-cert.pub` by loading the adjacent private
+        # key and attaching the certificate. Agent and ~/.ssh discovery are
+        # disabled for explicit paths, so a certificate without that private
+        # key can never authenticate; reject it here instead of failing later
+        # with an opaque transport error.
+        cert_suffix = "-cert.pub"
+        if path.endswith(cert_suffix):
+            private_key = path[: -len(cert_suffix)]
+            if not os.path.isfile(private_key):
+                raise ValueError(
+                    f"SSH certificate {path!r} has no adjacent private key "
+                    f"{private_key!r}; agent-held keys are not used when an "
+                    "explicit path is given."
+                )
+        resolved.append(path)
+    return resolved
+
+
+def _is_netconf_username(value: str) -> bool:
+    """True when every character matches the XML 1.0 ``Char`` production.
+
+    RFC 6242 Sec 3 passes the SSH username to NETCONF unchanged and requires
+    an invalid name to be rejected; RFC 6241 Sec 2.2 defines the username as a
+    string of XML ``Char`` characters. Validate client-side so a bad name
+    fails before any transport work.
+    """
+    for char in value:
+        code = ord(char)
+        if (
+            code in (0x09, 0x0A, 0x0D)
+            or 0x20 <= code <= 0xD7FF
+            or 0xE000 <= code <= 0xFFFD
+            or 0x10000 <= code <= 0x10FFFF
+        ):
+            continue
+        return False
+    return True
+
 
 def _has_capability(capabilities, uri: str) -> bool:
     """True when `uri` is advertised as a base capability (exact match)."""
@@ -217,9 +300,22 @@ class NetconfClient:
     port, username, password, verify, log_bodies, timeout) share names and
     secure defaults; protocol extras live in **kwargs (auto_commit here,
     scheme on RESTCONF).
+
+    NETCONF also accepts SSH public-key authentication: pass `key_filename`
+    (one path or a sequence) instead of `password`, with `passphrase` for an
+    encrypted key. A path to an OpenSSH certificate (`<key>-cert.pub`) works
+    as well; paramiko loads the adjacent private key and attaches the
+    certificate. Without an explicit path, ncclient still queries the SSH
+    agent and `~/.ssh` as usual; with one, those fallbacks are disabled so an
+    unauthorized key fails instead of authenticating as another identity.
+    The account password is never used with a key. For an encrypted key
+    ncclient puts the passphrase in its password slot and will also try it as
+    a password if public-key authentication fails; use an unencrypted key if
+    that fallback is unacceptable. `password` and `key_filename` are
+    alternatives; supplying both is rejected.
     """
 
-    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = False, log_bodies: bool = False, **kwargs):
+    def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = False, log_bodies: bool = False, key_filename: str | os.PathLike[str] | list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] | None = None, passphrase: str | None = None, **kwargs):
         # Back-compat alias: older generated code / call sites used
         # hostkey_verify explicitly. `verify` wins when both are given.
         if "hostkey_verify" in kwargs:
@@ -244,12 +340,102 @@ class NetconfClient:
         # session and failed later with an opaque transport error. Raising
         # before the connect keeps the two protocols symmetrical and fails
         # closed.
+        #
+        # SSH public-key authentication relaxes only the *password* half of
+        # that rule: a key is a credential too, so `password` and
+        # `key_filename` are alternatives, not both required. The username is
+        # still mandatory (the peer needs an identity to authorize).
         self.username = username or os.environ.get("DEVICE_USER")
-        self.password = password or os.environ.get("DEVICE_PASS")
-        if not self.username or not self.password:
+        if self.username and not _is_netconf_username(self.username):
             raise ValueError(
-                "Authentication credentials missing: pass username/password, "
-                "or set DEVICE_USER and DEVICE_PASS in the environment."
+                "NETCONF username must match the XML Char production "
+                "(RFC 6241 Sec 2.2, RFC 6242 Sec 3)."
+            )
+        # Resolve credentials by SOURCE, not field by field. An explicit
+        # password must not be silently overridden by DEVICE_SSH_KEY, and an
+        # explicit key must not inherit an unrelated environment passphrase.
+        # The rule:
+        #   * both explicit      -> reject as ambiguous;
+        #   * explicit password  -> use it, ignore the environment key pair;
+        #   * explicit key       -> use it, ignore DEVICE_PASS and only take a
+        #                           passphrase from the explicit argument;
+        #   * neither explicit   -> environment, where DEVICE_SSH_KEY wins over
+        #                           DEVICE_PASS with a warning.
+        explicit_password = password or None
+        explicit_key = key_filename or None
+        explicit_passphrase = passphrase or None
+        env_password = os.environ.get("DEVICE_PASS")
+        env_key = os.environ.get(_ENV_SSH_KEY)
+        env_passphrase = os.environ.get(_ENV_SSH_KEY_PASSPHRASE)
+
+        if explicit_password and explicit_key:
+            raise ValueError(
+                "password and key_filename are alternatives; pass exactly one. "
+                "Leave both unset to use DEVICE_PASS / DEVICE_SSH_KEY."
+            )
+        if explicit_password:
+            self.password = explicit_password
+            self.key_filename = None
+            self.passphrase = explicit_passphrase
+        elif explicit_key:
+            self.password = None
+            self.key_filename = explicit_key
+            self.passphrase = explicit_passphrase
+        elif env_key:
+            self.password = None
+            self.key_filename = env_key
+            self.passphrase = explicit_passphrase or env_passphrase
+            if env_password:
+                log.warning(
+                    "Both DEVICE_PASS and DEVICE_SSH_KEY are set; using the SSH "
+                    "key. Pass password=... explicitly to force password auth."
+                )
+        else:
+            self.password = env_password
+            self.key_filename = None
+            # No explicit source: a stray environment passphrase with no
+            # environment key is still a misconfiguration, not something to
+            # silently ignore (it was rejected before source-aware resolution).
+            self.passphrase = explicit_passphrase or env_passphrase
+        self.key_filenames = _resolve_key_files(self.key_filename)
+        # ncclient's SSHSession._auth tries every explicit key, then the SSH
+        # agent, then ~/.ssh/id_{rsa,ecdsa,ed25519}. With an explicit key, a
+        # failed key must be a failure: falling through would silently
+        # authenticate as another identity the host happens to hold. Agent and
+        # default-key discovery stay available only when no path was supplied.
+        allow_agent = kwargs.pop("allow_agent", True)
+        look_for_keys = kwargs.pop("look_for_keys", True)
+        if self.key_filenames:
+            allow_agent = False
+            look_for_keys = False
+        if self.passphrase and not self.key_filenames:
+            # ncclient has one transport `password` value and it is handed to
+            # password authentication after the key attempts. A stray key
+            # passphrase would therefore be tried as the account password
+            # instead of DEVICE_PASS and fail as a confusing auth error.
+            raise ValueError(
+                "passphrase was given without key_filename; a key passphrase "
+                "only applies to an explicit SSH key."
+            )
+        if self.passphrase and self.key_filenames:
+            # ncclient has no "publickey only" switch: SSHSession._auth tries
+            # the key, then falls back to auth_password(username, password)
+            # when its single password slot is non-None. For an encrypted key
+            # that slot holds the passphrase, so the passphrase -- not the
+            # account password -- can be sent as a password attempt. Pin the
+            # dependency behaviour in test_matrix; do not turn this into a
+            # "key only" claim.
+            log.warning(
+                "A key passphrase was supplied. ncclient uses its password slot "
+                "for the passphrase and will try it as a password if public-key "
+                "authentication fails; use an unencrypted key if that fallback "
+                "is unacceptable."
+            )
+        if not self.username or not (self.password or self.key_filenames):
+            raise ValueError(
+                "Authentication credentials missing: pass username plus either "
+                "password or key_filename, or set DEVICE_USER and DEVICE_PASS / "
+                "DEVICE_SSH_KEY in the environment."
             )
         self.auto_commit = auto_commit
         self.log_bodies = log_bodies
@@ -280,14 +466,28 @@ class NetconfClient:
         if not self.host:
             raise ValueError("Either loopback_ip or management_ip must be provided")
 
+        # ncclient exposes one `password` transport parameter and uses it for
+        # two things in order: the passphrase that unlocks each
+        # `key_filename`, then password authentication if key auth failed
+        # (ncclient.transport.ssh.SSHSession._auth). When a key is configured
+        # that slot must carry its passphrase or nothing: handing an account
+        # password to an *unencrypted* key makes paramiko raise "Password was
+        # given but private key is not encrypted", so the key is never tried
+        # and the client silently falls back to password auth (or fails on a
+        # device that forbids it). Password authentication is therefore not
+        # attempted when key_filename is set.
+        transport_password = self.passphrase if self.key_filenames else self.password
         log.info(f"Connecting to NETCONF server {self.host}:{self.port}")
         self._manager = manager.connect(
             host=self.host,
             port=self.port,
             username=self.username,
-            password=self.password,
+            password=transport_password,
+            key_filename=self.key_filenames,
             hostkey_verify=verify,
             timeout=timeout,
+            allow_agent=allow_agent,
+            look_for_keys=look_for_keys,
             **kwargs
         )
         
