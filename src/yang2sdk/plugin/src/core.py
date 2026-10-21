@@ -9,6 +9,8 @@ Converts YANG modules to Pydantic v2 Python classes with proper handling of:
 - RFC 7951 JSON encoding compliance
 """
 
+import ast
+import builtins
 import json
 import optparse
 import os
@@ -351,11 +353,13 @@ class Yang2Restconf(plugin.PyangPlugin):
             module_names.append(mod.py_name)
             all_data_props.extend(mod.root_data_props)
             all_rpc_props.extend(mod.root_rpc_props)
+        module_aliases = _module_annotation_aliases(ir_modules)
 
         with open(os.path.join(models_dir, "__init__.py"), "w") as f:
             f.write(
                 env.get_template("restconf/data_models/__init__.py.jinja").render(
                     module_names=module_names,
+                    module_aliases=module_aliases,
                     data_props=all_data_props,
                     rpc_props=all_rpc_props,
                 )
@@ -452,11 +456,13 @@ class Yang2Netconf(plugin.PyangPlugin):
             module_names.append(mod.py_name)
             all_data_props.extend(mod.root_data_props)
             all_rpc_props.extend(mod.root_rpc_props)
+        module_aliases = _module_annotation_aliases(ir_modules)
 
         with open(os.path.join(models_dir, "__init__.py"), "w") as f:
             f.write(
                 env.get_template("netconf/data_models/__init__.py.jinja").render(
                     module_names=module_names,
+                    module_aliases=module_aliases,
                     data_props=all_data_props,
                     rpc_props=all_rpc_props,
                 )
@@ -500,8 +506,164 @@ class Yang2Netconf(plugin.PyangPlugin):
         fd.write(f"Generated NETCONF SDK in: {output_dir}\n")
 
 
+def _module_annotation_aliases(ir_modules) -> dict[str, str]:
+    """Map each module's ``py_name`` to a collision-proof annotation alias.
+
+    The aggregate ``data_models/__init__.py`` refers to top-level model
+    classes as ``<module>.<class>``. Pydantic evaluates those annotations at
+    class-creation time, and a bare module stem can resolve to a builtin
+    (``license``) or to a name the template itself imported (``element``,
+    ``Field``) -- the resulting ``AttributeError`` is not deferred the way a
+    ``NameError`` is. A prefixed alias is undefined at runtime, so pydantic
+    defers exactly as it does for every ordinary cross-module reference,
+    while type checkers still see the real module.
+    """
+    aliases: dict[str, str] = {}
+    taken = {module.py_name for module in ir_modules}
+    for module in ir_modules:
+        base = re.sub(r"[^0-9A-Za-z_]", "_", module.py_name)
+        alias = f"_m_{base}"
+        while alias in taken:
+            alias += "_"
+        taken.add(alias)
+        aliases[module.py_name] = alias
+    return aliases
+
+
+def _target_names(node: ast.expr) -> set[str]:
+    """Names bound by an assignment target."""
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Starred):
+        return _target_names(node.value)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in node.elts:
+            names.update(_target_names(element))
+        return names
+    return set()
+
+
+def _annotation_runtime_names(tree: ast.Module) -> set[str]:
+    """Names an aggregate annotation would see before pydantic evaluates it.
+
+    Only top-level statements count: the aggregate imports its own modules
+    under ``if TYPE_CHECKING``, and those names are deliberately *not* bound
+    at runtime. A module import shadows a builtin (``from . import license``
+    would make ``license.Licenses`` valid), so module bindings are removed
+    from the dangerous set; object bindings (the template's ``element`` /
+    ``Field`` / ``ConfigDict``) are added to it. Assignments, classes and
+    functions are treated as objects, which is all the aggregate emits.
+    """
+    dangerous = set(dir(builtins))
+    safe_modules: set[str] = set()
+
+    def bind_module(name: str) -> None:
+        dangerous.discard(name)
+        safe_modules.add(name)
+
+    def bind_object(name: str) -> None:
+        safe_modules.discard(name)
+        dangerous.add(name)
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                bind_module(alias.asname or alias.name.split(".")[0])
+        elif isinstance(stmt, ast.ImportFrom):
+            if stmt.module == "__future__":
+                continue
+            # `from . import x` binds a submodule; `from .models import X`
+            # binds an attribute of a module, which may be a class.
+            if stmt.level and stmt.module is None:
+                for alias in stmt.names:
+                    if alias.name != "*":
+                        bind_module(alias.asname or alias.name)
+            else:
+                for alias in stmt.names:
+                    if alias.name != "*":
+                        bind_object(alias.asname or alias.name)
+        elif isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind_object(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                for name in _target_names(target):
+                    bind_object(name)
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            for name in _target_names(stmt.target):
+                bind_object(name)
+    return dangerous
+
+
+def _root_name(node: ast.expr) -> str | None:
+    """Left-most name of an ``a.b.c`` expression."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _root_name(node.value)
+    return None
+
+
+def _module_stem(node: ast.expr) -> str | None:
+    """Return the module stem of a module-qualified annotation, if any.
+
+    Handles the shapes the aggregate can emit: ``license.X``, quoted
+    ``'license.X | None'``, PEP 604 unions, and module-qualified types nested
+    in a subscript (``list[license.X]``). Plain builtin annotations such as
+    ``dict[str, Any]`` have no attribute access and are correctly ignored.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        match = re.match(r"\s*([A-Za-z_]\w*)\s*\.", node.value)
+        return match.group(1) if match else None
+    if isinstance(node, ast.Attribute):
+        return _root_name(node.value)
+    if isinstance(node, ast.BinOp):
+        return _module_stem(node.left) or _module_stem(node.right)
+    if isinstance(node, ast.Subscript):
+        return _module_stem(node.slice)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        for element in node.elts:
+            stem = _module_stem(element)
+            if stem:
+                return stem
+    return None
+
+
+def _aggregate_annotation_errors(path: Path, source: str | None = None) -> list[str]:
+    """Report aggregate annotations that resolve to a runtime name.
+
+    This is the AST half of ``_validate_generated``: it catches the shape that
+    parses but cannot import, without importing generated code (the NETCONF
+    client needs ``lxml``/``ncclient``, which are not base dependencies).
+    """
+    try:
+        tree = ast.parse(
+            source if source is not None else path.read_text(encoding="utf-8"),
+            filename=str(path),
+        )
+    except SyntaxError:
+        return []
+    dangerous = _annotation_runtime_names(tree)
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.AnnAssign):
+                continue
+            stem = _module_stem(stmt.annotation)
+            if stem is None or stem not in dangerous:
+                continue
+            errors.append(
+                f"  {path}:{stmt.lineno}: aggregate annotation "
+                f"{ast.unparse(stmt.annotation)!r} resolves to runtime name "
+                f"{stem!r}; use the generated module alias instead"
+            )
+    return errors
+
+
 def _validate_generated(output_dir: str) -> None:
-    """Fail the build if any emitted .py file does not parse.
+    """Fail the build if any emitted .py file cannot be imported as written.
 
     A code generator that reports success while shipping a file Python cannot
     import is worse than one that crashes: the failure surfaces in the
@@ -509,19 +671,33 @@ def _validate_generated(output_dir: str) -> None:
     A YANG `description` containing a triple quote or a trailing backslash used
     to do exactly that. Validating here turns any future escaping bug into a
     build-time error with the offending file and line.
+
+    Parsing is necessary but not sufficient. The aggregate
+    ``data_models/__init__.py`` annotates fields as ``<module>.<Class>``, and
+    pydantic evaluates those annotations at class-creation time. A module
+    stem that resolves at runtime -- a builtin (``license``) or one of the
+    template's own imports (``element``, ``Field``) -- raises ``AttributeError``
+    instead of being deferred, so the file parses and still cannot be imported.
+    ``_aggregate_annotation_errors`` checks that shape without importing the
+    generated package.
     """
     errors: list[str] = []
     for path in sorted(Path(output_dir).rglob("*.py")):
         try:
-            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            source = path.read_text(encoding="utf-8")
+            compile(source, str(path), "exec")
         except SyntaxError as e:
             errors.append(f"  {path}:{e.lineno}: {e.msg}")
+            continue
         except (OSError, UnicodeDecodeError) as e:  # pragma: no cover - IO guard
             errors.append(f"  {path}: {e}")
+            continue
+        if path.name == "__init__.py" and path.parent.name == "data_models":
+            errors.extend(_aggregate_annotation_errors(path, source))
     if errors:
         raise SyntaxError(
-            "Generated Python does not parse; refusing to ship a client that "
-            "cannot be imported:\n" + "\n".join(errors)
+            "Generated Python is not importable; refusing to ship a client "
+            "that cannot be imported:\n" + "\n".join(errors)
         )
 
 

@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
 {% for mod_name in module_names %}
-    from . import {{ mod_name }}
+    from . import {{ mod_name }} as {{ module_aliases[mod_name] }}
 {% endfor %}
 
 class Data(BaseModel):
@@ -17,7 +17,7 @@ class Data(BaseModel):
     pass
     {% else %}
     {% for prop in data_props %}
-    {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
+    {{ prop.module }}_{{ prop.field }}: {{ module_aliases[prop.module] }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
     {% endfor %}
     {% endif %}
 
@@ -30,6 +30,6 @@ class Operations(BaseModel):
     pass
     {% else %}
     {% for prop in rpc_props %}
-    {{ prop.module }}_{{ prop.field }}: {{ prop.module }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
+    {{ prop.module }}_{{ prop.field }}: {{ module_aliases[prop.module] }}.{{ prop.cls }} | None = Field(None, alias='{{ prop.alias }}')
     {% endfor %}
     {% endif %}
