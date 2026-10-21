@@ -7,6 +7,8 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.10.21] - 2026-10-21
+
 ### Added
 
 - **SSH public-key and certificate authentication for NETCONF.** Generated
