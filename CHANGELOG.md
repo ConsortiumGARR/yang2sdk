@@ -7,6 +7,70 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Added
+
+- **SSH public-key and certificate authentication for NETCONF.** Generated
+  `NetconfClient` accepts `key_filename` (one path or a sequence) and
+  `passphrase` as alternatives to `password`; the environment names are
+  `DEVICE_SSH_KEY` / `DEVICE_SSH_KEY_PASSPHRASE`. An OpenSSH user certificate is
+  passed with the conventional `<private-key>-cert.pub` name — paramiko strips
+  the suffix to load the key and attaches the certificate, so either member of
+  the pair works; the adjacent private key must exist. With a key configured,
+  the account password is never placed in ncclient's single SSH `password`
+  slot: that slot carries the key passphrase (or nothing for an unencrypted
+  key), because paramiko rejects an unencrypted key when a password is
+  supplied. ncclient may still try an encrypted key's passphrase as a password
+  if public-key authentication fails; the client logs a warning naming that
+  dependency behaviour, and an unencrypted key avoids it. `yang-downloader`
+  reads the same names, and `sdk-verify` adds
+  `--ssh-key` / `--ssh-key-passphrase` for `--protocol netconf`. The credential
+  contract still fails closed: a username plus a password **or** a key is
+  required before any transport work, and an explicit key disables ncclient's
+  agent and `~/.ssh` fallbacks, so a nonexistent or unauthorized key raises
+  instead of silently authenticating as another identity. The *method* is RFC
+  4252 §7 `publickey`; the OpenSSH certificate encoding itself is an IETF
+  Internet-Draft (`draft-ietf-sshm-cert`), not an RFC.
+
+### Fixed
+
+- **Credentials resolve by source, not field by field.** An explicit
+  `password` was silently ignored whenever `DEVICE_SSH_KEY` was exported, so a
+  caller asking for password auth got key-only auth; an explicit key could also
+  inherit an unrelated `DEVICE_SSH_KEY_PASSPHRASE` and become unusable. An
+  explicit password now suppresses the environment key pair, an explicit key
+  suppresses `DEVICE_PASS` and only takes an explicit passphrase, both explicit
+  values are rejected as ambiguous by the generated client and
+  `yang-downloader`, and when neither is explicit a set environment key wins
+  over `DEVICE_PASS` with a logged warning. `sdk-verify` mirrors the rules but
+  warns and uses the key for NETCONF when both are explicit, so `--protocol
+  both` can pair a RESTCONF password with a NETCONF key.
+- **Encrypted-key documentation no longer claims "key only" authentication.**
+  The account password is not placed in ncclient's password slot, but ncclient
+  does try an encrypted key's passphrase as a password when public-key auth
+  fails (`SSHSession._auth`). The templates, `AGENTS.md`, `SECURITY.md`,
+  `docs/usage.md`, and the README now say exactly that, warn when a passphrase
+  is supplied, and pin the dependency behaviour in a test.
+- **The SSH auth tests are hermetic and parse real key material.**
+  Credential tests now clear every environment name before asserting, so a
+  developer's `.env` cannot make the suite pass or fail differently from CI.
+  New tests generate an unencrypted key, an encrypted key, and a CA-signed
+  OpenSSH certificate with `ssh-keygen` and load them through
+  `paramiko.PKey.from_path`.
+- **The README no longer says CRUD is not automated in CI.** CRUD runs in the
+  non-blocking SR Linux job; it is not part of the notconf simulator matrix.
+- **NETCONF usernames are validated against XML's `Char` production.** RFC 6242
+  §3 forwards the SSH username to NETCONF unchanged and RFC 6241 §2.2 defines
+  it as XML text, but the generated client and `yang-downloader` accepted any
+  Python string and relied on the server to drop an unrepresentable name. Both
+  now fail closed before connecting.
+- **`yang-downloader` now exits non-zero when extraction fails.** `download_all()`
+  returned a failure count, but `main()` ignored it, so an authentication error
+  or a total `get-schema` failure printed `CRITICAL SYSTEM ERROR` and still
+  exited 0 — a CI or script step saw success.
+- **`sdk-verify` reports a failed connection without a traceback.** An
+  unauthorized key now prints one actionable `sdk-verify: netconf connection
+  failed: ...` line instead of an ncclient stack trace.
+
 ## [2026.10.16.1] - 2026-10-16
 
 ### Removed (breaking)

@@ -38,13 +38,31 @@ accidentally commit a credential, rotate it — do not rely on history rewriting
 alone, since a pushed secret must be assumed disclosed.
 
 Generated packages must never embed credentials. The generated clients read
-`DEVICE_USER` / `DEVICE_PASS` from the environment at runtime, or take explicit
-constructor arguments, and nothing else. That is enforced by
-`test_both_protocols_fail_closed_without_credentials` in `tests/test_matrix.py`:
-both protocols raise `ValueError` before any transport work when no credential
-is available. `DEVICE_USERNAME` / `DEVICE_PASSWORD` are **retired and must stay
-inert** — see `AGENTS.md` for why re-adding them as an alias was tried and
-reverted.
+`DEVICE_USER` plus `DEVICE_PASS` (password) or `DEVICE_SSH_KEY` /
+`DEVICE_SSH_KEY_PASSPHRASE` (NETCONF public-key authentication) from the
+environment at runtime, or take the equivalent constructor arguments, and
+nothing else. Credentials are resolved by source: an explicit password
+suppresses the environment key pair; an explicit key suppresses `DEVICE_PASS`
+and only accepts a passphrase from the explicit argument; both explicit values
+are rejected as ambiguous by the generated clients and downloader
+(`sdk-verify` warns and uses the key for NETCONF to keep `--protocol both`
+usable). With neither explicit, the environment is used, and
+if both `DEVICE_PASS` and `DEVICE_SSH_KEY` are set the key wins with a logged
+warning. That is enforced by
+`test_both_protocols_fail_closed_without_credentials` and the key-auth tests in
+`tests/test_matrix.py`: a client with neither a password nor a key raises
+`ValueError` before any transport work. Key paths are validated for the same
+reason, and an explicit key disables the SSH agent and `~/.ssh` lookups — a
+nonexistent or unauthorized explicit key must not silently authenticate as a
+different identity. A certificate path also requires its adjacent private key.
+The **account password** is never placed in ncclient's key-passphrase slot
+(paramiko rejects an unencrypted key when a password is supplied, which would
+silently downgrade to password auth). ncclient will, however, try an encrypted
+key's passphrase as a password if public-key authentication fails
+(`SSHSession._auth`); the client logs a warning naming that fallback. Use an
+unencrypted key if that behaviour is unacceptable.
+`DEVICE_USERNAME` / `DEVICE_PASSWORD` are **retired and must stay inert** — see
+`AGENTS.md` for why re-adding them as an alias was tried and reverted.
 
 ## Transport defaults
 

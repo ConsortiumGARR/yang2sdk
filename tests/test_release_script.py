@@ -210,6 +210,25 @@ def on_a_frozen_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(changelog, "CHANGELOG", target)
 
 
+@pytest.fixture
+def a_releasable_changelog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A changelog that is already releasable, isolated from the repository.
+
+    Content under `## [Unreleased]` is the normal state between releases; the
+    release-time gate is supposed to refuse it, but a *dry run of a bump* is
+    not a release. Pointing these rehearsals at the live file made them fail
+    the moment anyone wrote down a change, which is the opposite of what the
+    gate exists for. The temp file keeps their subject -- whether a rehearsal
+    writes anything -- independent of release-day state.
+    """
+    target = tmp_path / "CHANGELOG.md"
+    target.write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [2026.10.16.1] - 2026-10-16\n\n- old\n"
+    )
+    monkeypatch.setattr(changelog, "CHANGELOG", target)
+    return target
+
+
 # --- the git-state guards ----------------------------------------------------
 
 
@@ -626,16 +645,22 @@ def test_a_dry_run_reports_the_tag_and_writes_nothing(
 
 
 def test_a_dry_run_never_edits_the_changelog_on_disk(
-    published_off: list[str], on_a_clean_main: None
+    published_off: list[str],
+    on_a_clean_main: None,
+    a_releasable_changelog: Path,
 ) -> None:
     """--dry-run previews the promotion; it must not perform it."""
-    before = (REPO_ROOT / "CHANGELOG.md").read_bytes()
+    before = a_releasable_changelog.read_bytes()
+    repository_before = (REPO_ROOT / "CHANGELOG.md").read_bytes()
     assert release.main(["--bump", "2026.10.16.1", "--dry-run"]) == 0
-    assert (REPO_ROOT / "CHANGELOG.md").read_bytes() == before
+    assert a_releasable_changelog.read_bytes() == before
+    assert (REPO_ROOT / "CHANGELOG.md").read_bytes() == repository_before
 
 
 def test_the_dry_run_of_a_bump_is_not_blocked_by_the_bump_it_previews(
-    published_off: list[str], on_a_clean_main: None
+    published_off: list[str],
+    on_a_clean_main: None,
+    a_releasable_changelog: Path,
 ) -> None:
     """Regression: it checked the lock against a version only `bump()` creates.
 
@@ -676,6 +701,7 @@ def test_bump_with_no_argument_derives_the_version(
 def test_a_stale_tag_on_an_explicit_version_is_reported_not_refused(
     published_off: list[str],
     on_a_clean_main: None,
+    a_releasable_changelog: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

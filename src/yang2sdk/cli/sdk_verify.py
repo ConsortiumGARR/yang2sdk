@@ -837,7 +837,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--username", default="", help="Device username. Falls back to $DEVICE_USER."
     )
     parser.add_argument(
-        "--password", default="", help="Device password. Falls back to $DEVICE_PASS."
+        "--password",
+        default="",
+        help="Device password. An explicit value wins over DEVICE_SSH_KEY; "
+        "falls back to $DEVICE_PASS only when no key is supplied. If "
+        "--ssh-key is also explicit, NETCONF warns and uses the key.",
+    )
+    parser.add_argument(
+        "--ssh-key",
+        default="",
+        help="NETCONF SSH private key (or its OpenSSH <key>-cert.pub "
+        "certificate) for public-key authentication. Falls back to "
+        "$DEVICE_SSH_KEY. The account password is not used with a key; for an "
+        "encrypted key ncclient will also try its passphrase as a password if "
+        "public-key authentication fails.",
+    )
+    parser.add_argument(
+        "--ssh-key-passphrase",
+        default="",
+        help="Passphrase for an encrypted --ssh-key. Falls back to "
+        "$DEVICE_SSH_KEY_PASSPHRASE only when the key itself came from the "
+        "environment. ncclient carries it in the SSH password slot and may "
+        "try it as a password if key auth fails.",
     )
     parser.add_argument(
         "--max-depth",
@@ -958,16 +979,110 @@ def _enable_debug_logging(stub: str) -> None:
         logger.addHandler(logging.StreamHandler(sys.stderr))
 
 
-def _resolve_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    """Args win, then DEVICE_USER/DEVICE_PASS -- the generated clients' contract."""
+def _validate_ssh_key_path(key_filename: str) -> str:
+    """Expand a key path and fail closed if it cannot authenticate by itself."""
+    path = os.path.expanduser(key_filename)
+    if not os.path.isfile(path):
+        raise SystemExit(f"sdk-verify: SSH key/certificate not found: {path!r}")
+    cert_suffix = "-cert.pub"
+    if path.endswith(cert_suffix):
+        private_key = path[: -len(cert_suffix)]
+        if not os.path.isfile(private_key):
+            raise SystemExit(
+                f"sdk-verify: SSH certificate {path!r} has no adjacent private "
+                f"key {private_key!r}; agent-held keys are not used when an "
+                "explicit path is given."
+            )
+    return path
+
+
+def _resolve_credentials(
+    args: argparse.Namespace, protocol: str
+) -> tuple[str, str | None, str | None, str | None]:
+    """Resolve credentials by source, never field by field.
+
+    An explicit ``--password`` suppresses the environment key pair, and an
+    explicit ``--ssh-key`` suppresses ``DEVICE_PASS`` plus an environment
+    passphrase. If both explicit arguments are present, NETCONF uses the key
+    and warns, which keeps ``--protocol both`` usable with a password for
+    RESTCONF and a key for NETCONF. With neither explicit, the environment is
+    the only source; if both environment credentials are set, NETCONF uses the
+    key and warns instead of choosing silently.
+
+    RESTCONF authenticates with username/password only. NETCONF also accepts
+    an SSH key (or its OpenSSH certificate) instead of a password.
+    """
     username = args.username or os.environ.get("DEVICE_USER")
-    password = args.password or os.environ.get("DEVICE_PASS")
-    if not username or not password:
+    explicit_password = args.password or None
+    explicit_key = getattr(args, "ssh_key", "") or None
+    explicit_passphrase = getattr(args, "ssh_key_passphrase", "") or None
+    env_password = os.environ.get("DEVICE_PASS")
+    env_key = os.environ.get("DEVICE_SSH_KEY")
+    env_passphrase = os.environ.get("DEVICE_SSH_KEY_PASSPHRASE")
+    if not username:
         raise SystemExit(
-            "sdk-verify: credentials missing. Pass --username/--password or set "
-            "DEVICE_USER and DEVICE_PASS. Refusing to run unauthenticated."
+            "sdk-verify: username missing. Pass --username or set DEVICE_USER."
         )
-    return username, password
+
+    if protocol == "restconf":
+        # The SSH key does not apply to HTTP/TLS. An explicit --ssh-key is
+        # harmless for `--protocol both`, but a password is still required.
+        password = explicit_password or env_password
+        if not password:
+            raise SystemExit(
+                "sdk-verify: RESTCONF needs --password or DEVICE_PASS. "
+                "SSH key authentication applies to NETCONF only."
+            )
+        return username, password, None, None
+
+    if explicit_password and explicit_key:
+        print(
+            "sdk-verify: both --password and --ssh-key were given; NETCONF "
+            "uses the SSH key. Pass only one if that is not intentional.",
+            file=sys.stderr,
+        )
+        return username, None, _validate_ssh_key_path(explicit_key), explicit_passphrase
+    if explicit_password:
+        if explicit_passphrase:
+            raise SystemExit(
+                "sdk-verify: --ssh-key-passphrase was given without --ssh-key."
+            )
+        return username, explicit_password, None, None
+    if explicit_key:
+        # An explicit key owns its passphrase. Do not inherit
+        # DEVICE_SSH_KEY_PASSPHRASE, which belongs to a different key source.
+        return username, None, _validate_ssh_key_path(explicit_key), explicit_passphrase
+
+    if env_password and env_key:
+        print(
+            "sdk-verify: both DEVICE_PASS and DEVICE_SSH_KEY are set; NETCONF "
+            "uses the SSH key. Pass --password to force password auth.",
+            file=sys.stderr,
+        )
+    if env_key:
+        return (
+            username,
+            None,
+            _validate_ssh_key_path(env_key),
+            explicit_passphrase or env_passphrase,
+        )
+    if env_password:
+        if explicit_passphrase or env_passphrase:
+            raise SystemExit(
+                "sdk-verify: --ssh-key-passphrase/DEVICE_SSH_KEY_PASSPHRASE "
+                "was given without --ssh-key/DEVICE_SSH_KEY."
+            )
+        return username, env_password, None, None
+    if explicit_passphrase:
+        raise SystemExit(
+            "sdk-verify: --ssh-key-passphrase/DEVICE_SSH_KEY_PASSPHRASE was "
+            "given without --ssh-key/DEVICE_SSH_KEY."
+        )
+    raise SystemExit(
+        "sdk-verify: credentials missing. Pass --username plus --password "
+        "or --ssh-key, or set DEVICE_USER and DEVICE_PASS / DEVICE_SSH_KEY. "
+        "Refusing to run unauthenticated."
+    )
 
 
 def run_protocol(
@@ -975,7 +1090,9 @@ def run_protocol(
     args: argparse.Namespace,
     tiers: set[str],
     username: str,
-    password: str,
+    password: str | None,
+    key_filename: str | None = None,
+    passphrase: str | None = None,
 ) -> Report:
     client_dir = Path(args.client_dir or f"temp/{protocol}_clients/{args.device}")
     if not (client_dir / "__init__.py").exists():
@@ -1011,9 +1128,19 @@ def run_protocol(
         "management_ip": host,
         "port": port,
         "username": username,
-        "password": password,
         "verify": verify,
     }
+    # NETCONF may authenticate without an account password; RESTCONF cannot,
+    # so password=None there would only obscure the earlier per-protocol
+    # check. The generated NETCONF client decides the transport slot: with
+    # key_filename set it is the passphrase or None, never the account
+    # password (ncclient may still try that passphrase as a password after a
+    # failed public-key attempt).
+    kwargs["password"] = password
+    if protocol == "netconf":
+        kwargs["key_filename"] = key_filename
+        if passphrase:
+            kwargs["passphrase"] = passphrase
     if bool(getattr(args, "debug", False)):
         # Light up wire logging on both transports. Older generated clients
         # still gate bodies behind `log_bodies`; current ones log redacted
@@ -1027,7 +1154,12 @@ def run_protocol(
         kwargs["auto_commit"] = False
     else:
         kwargs["scheme"] = args.restconf_scheme
-    client = cls(**kwargs)
+    try:
+        client = cls(**kwargs)
+    except Exception as exc:
+        if bool(getattr(args, "debug", False)):
+            raise
+        raise SystemExit(f"sdk-verify: {protocol} connection failed: {exc}") from exc
 
     report = Report(device=args.device or client_dir.name, protocol=protocol)
     verifier = Verifier(
@@ -1598,13 +1730,25 @@ def _verify_restored(verifier: Verifier, protocol: str, snapshot_path: Path) -> 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    username, password = _resolve_credentials(args)
     tiers = {t.strip() for t in args.tiers.split(",") if t.strip()}
     protocols = ["restconf", "netconf"] if args.protocol == "both" else [args.protocol]
 
     reports: list[Report] = []
     for protocol in protocols:
-        reports.append(run_protocol(protocol, args, tiers, username, password))
+        username, password, key_filename, passphrase = _resolve_credentials(
+            args, protocol
+        )
+        reports.append(
+            run_protocol(
+                protocol,
+                args,
+                tiers,
+                username,
+                password,
+                key_filename,
+                passphrase,
+            )
+        )
 
     total_fail = 0
     total_checked = 0

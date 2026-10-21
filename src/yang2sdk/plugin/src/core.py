@@ -618,6 +618,8 @@ def _write_package_files(
             if protocol == "restconf"
             else f"from {pkg_name} import NetconfClient\n"
             "client = NetconfClient(management_ip=..., username=..., password=..., verify=True)\n"
+            "# or SSH key / OpenSSH certificate:\n"
+            "client = NetconfClient(management_ip=..., username=..., key_filename='~/.ssh/id_ed25519', verify=True)\n"
         )
         + "```\n",
         encoding="utf-8",

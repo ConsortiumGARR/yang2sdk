@@ -76,6 +76,15 @@ NOTCONF_SMOKE_ONLY=1 uv run pytest tests/ --integration   # one image per family
 | `tests/test_lab_device_netconf.py` | a real lab device | no, lab only |
 | `uv run sdk-verify` | a lab device (or simulator) | no, manual lab harness (see `docs/lab.md`) |
 
+`tests/test_matrix.py` also pins the NETCONF SSH public-key/certificate auth
+contract: source-aware argument/environment resolution, key-path validation,
+the XML username check, fail-closed credentials, the explicit-key agent
+fallback gate, the encrypted-key passphrase warning, and the
+downloader/`sdk-verify` failure status. Those are offline tests. No device or
+pre-existing key material is required: the real-key test generates an
+unencrypted key, an encrypted key, and a CA-signed OpenSSH certificate with
+`ssh-keygen` and loads them through `paramiko.PKey.from_path`.
+
 CI: `ci-pr.yaml` (lint → typecheck → offline gate → smoke per family), `ci-nightly.yaml` (full 11-image matrix + `workflow_dispatch`), `ci-srl.yaml` (SR Linux; deploy/get-schema/generate block, pytest + `sdk-verify --tiers read,rpc,crud` report). `test_lab_device_netconf.py` is in no workflow — nothing it asserts gates a merge.
 
 `sdk-verify` is now a gate. `tests/test_sdk_verify_ci.py` calls the same verifier in-process, so it adds no container startup beyond what the smoke job already pays for; `ci-srl.yaml` runs the CLI itself with `crud`, which is a writer and so is confined to that lab job. It was a manual harness in no workflow until 2026-10-13, which is how the RESTCONF ancestor-envelope unwrap, the augment-closure gap, and the `ietf-notification-capabilities` model hole all shipped. A test that covers zero nodes skips with a reason rather than passing vacuously. Tests that build a generated client against a simulator pass `verify=False` explicitly with a comment; the `verify=True` default is never weakened for tests. NETCONF write read-backs run edit → `validate` → `commit`, skipping `validate` when `:validate` is not advertised (RFC 6241 §8.6.4.1 optional).

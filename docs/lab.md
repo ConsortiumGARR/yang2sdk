@@ -32,7 +32,7 @@ redacted by construction on both transports; `message-id` attributes are left
 intact for request/reply correlation. Outside `--debug` nothing changes: the
 default log level emits no bodies, so production sessions pay nothing.
 
-It needs the `lab` extra, reads `DEVICE_IP` / `DEVICE_USER` / `DEVICE_PASS` (same contract as a generated client: args win, then the environment), and exits non-zero if any endpoint fails.
+It needs the `lab` extra, reads `DEVICE_IP` / `DEVICE_USER` / `DEVICE_PASS` (same contract as a generated client: credentials are resolved by source, with explicit arguments suppressing the environment), and exits non-zero if any endpoint fails. For NETCONF it also accepts `--ssh-key` / `--ssh-key-passphrase`, or `DEVICE_SSH_KEY` / `DEVICE_SSH_KEY_PASSPHRASE`, as alternatives to the password; an explicit password suppresses an environment key, and an explicit key suppresses an environment password. If both `--password` and `--ssh-key` are explicit, NETCONF warns and uses the key (which keeps `--protocol both` usable). RESTCONF still needs a password. For an encrypted key, ncclient may try the passphrase as a password if public-key authentication fails; `sdk-verify` logs the same warning as the generated client.
 
 ## Tiers
 
