@@ -21,6 +21,7 @@ from __future__ import annotations
 import email.message
 import hashlib
 import importlib.util
+import re
 import subprocess
 import sys
 import tomllib
@@ -847,6 +848,17 @@ def _job_shell(name: str) -> str:
     )
 
 
+def _job_text(name: str) -> str:
+    """Every string a job carries, `env:` values included.
+
+    `needs.build.outputs.version` may legitimately reach the shell through an
+    `env:` entry rather than inline, and `_job_shell` cannot see that.
+    """
+    import yaml
+
+    return yaml.safe_dump(_workflow()["jobs"][name], sort_keys=True)
+
+
 def test_verify_published_never_checks_out_the_workspace() -> None:
     """It must install from PyPI, or the check is theatre.
 
@@ -871,9 +883,9 @@ def test_the_post_publish_jobs_read_the_build_job_output() -> None:
     wiring, not the text.
     """
     for job in ("verify-published", "github-release"):
-        shell = _job_shell(job)
-        assert "steps.version.outputs.value" not in shell, job
-        assert "needs.build.outputs.version" in shell, job
+        text = _job_text(job)
+        assert "steps.version.outputs.value" not in text, job
+        assert "needs.build.outputs.version" in text, job
         assert "build" in _needs(job), (
             f"{job} reads `needs.build.outputs.version` but does not list "
             f"`build` in `needs:` (it has {_needs(job)}), so the expression "
@@ -900,6 +912,78 @@ def test_verify_published_installs_the_exact_published_version() -> None:
     """Not `yang2sdk` unpinned: that would install whatever is newest."""
     assert "yang2sdk==${{ needs.build.outputs.version }}" in _job_shell(
         "verify-published"
+    )
+
+
+# Contexts GitHub substitutes inside `${{ ... }}`. A workflow string that names
+# one of them with no leading `$` is a typo, not shell.
+_GITHUB_CONTEXTS = (
+    "needs",
+    "steps",
+    "github",
+    "secrets",
+    "matrix",
+    "env",
+    "inputs",
+    "vars",
+    "runner",
+    "job",
+    "strategy",
+)
+
+
+def _workflow_strings(node: Any) -> Iterator[str]:
+    """Every string scalar in a parsed workflow; mapping keys are static text."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _workflow_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _workflow_strings(value)
+
+
+def test_no_workflow_carries_a_github_expression_missing_its_dollar() -> None:
+    """The v2026.10.21 release died on exactly one missing `$`.
+
+    Written inline as `{{ needs.build.outputs.version }}` it was a *shell
+    literal*, so GitHub substituted nothing, the `case` pattern never matched,
+    and the job announced `expected version {{ needs.build.outputs.version }}`
+    after the installed CLI had correctly printed `yang2sdk 2026.10.21`.
+
+    Docker's `--format '{{.Names}}'` is a real shell argument and must not
+    trip this, which is why the pattern names a GitHub context explicitly
+    instead of matching a bare `{{`.
+    """
+    import yaml
+
+    expression = re.compile(r"(?<!\$)\{\{\s*(?:" + "|".join(_GITHUB_CONTEXTS) + r")\.")
+    offenders = [
+        f"{path.name}: {text.strip()}"
+        for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yaml"))
+        for text in _workflow_strings(yaml.safe_load(path.read_text()))
+        if expression.search(text)
+    ]
+    assert not offenders, (
+        "these workflow strings hold a GitHub expression without its `$`, so "
+        "GitHub will substitute nothing and shell will see the text verbatim: "
+        + "; ".join(offenders)
+    )
+
+
+def test_the_version_check_compares_against_env_not_an_inline_expression() -> None:
+    """The comparison must consume the substituted value, and refuse an empty one.
+
+    `*""*` matches every string, so an unresolved job output has to be an
+    explicit failure or this step passes while proving nothing.
+    """
+    steps = _workflow()["jobs"]["verify-published"]["steps"]
+    step = next(s for s in steps if "yang2sdk --version" in str(s.get("run", "")))
+    assert step["env"]["EXPECTED"] == "${{ needs.build.outputs.version }}"
+    assert "$EXPECTED" in step["run"]
+    assert 'test -n "$EXPECTED"' in step["run"], (
+        "an empty EXPECTED would make the `case` pattern match anything"
     )
 
 

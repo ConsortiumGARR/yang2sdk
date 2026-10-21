@@ -147,14 +147,30 @@ jobs:
           uv pip install --python /tmp/published/bin/python \
             "yang2sdk==${{ needs.build.outputs.version }}"
 
+      # The expression goes through `env`, never inline in the `run:` body.
+      # Written inline it was mistyped as `{{ needs.build.outputs.version }}`
+      # -- one `$` short of an expression, i.e. a shell *literal* -- so the
+      # `case` pattern never matched and the job reported
+      # `expected version {{ needs.build.outputs.version }}` while the CLI had
+      # printed the right version. GitHub substitutes expressions before bash
+      # parses the script and does not expand a malformed one, so nothing failed
+      # until the comparison did. The empty-output guard is the second half:
+      # `*""*` matches every string, so an unresolved `needs` output must be an
+      # explicit failure rather than a vacuous pass.
       - name: The installed CLI reports the published version
+        env:
+          EXPECTED: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          test -n "$EXPECTED" || {
+            echo "build.outputs.version is empty, so this step could not verify anything" >&2
+            exit 1
+          }
           got="$(/tmp/published/bin/yang2sdk --version)"
           echo "$got"
           case "$got" in
-            *"{{ needs.build.outputs.version }}"*) ;;
-            *) echo "expected version {{ needs.build.outputs.version }}, got: $got" >&2; exit 1 ;;
+            *"$EXPECTED"*) ;;
+            *) echo "expected version $EXPECTED, got: $got" >&2; exit 1 ;;
           esac
 
       # Generate from a module small enough to read in full, then import what
