@@ -3225,6 +3225,20 @@ BUILTIN_COLLISION_YANG = """module tbi {
 }"""
 
 
+MODULE_NAME_COLLISION_YANG = """module {name} {{
+  prefix m;
+  namespace "urn:test:{name}";
+  revision 2026-01-01;
+  container root {{
+    leaf value {{ type string; }}
+  }}
+  rpc do-it {{
+    input {{ leaf value {{ type string; }} }}
+    output {{ leaf ok {{ type boolean; }} }}
+  }}
+}}"""
+
+
 def test_fields_never_shadow_a_pydantic_attribute(tmp_path):
     """A YANG leaf whose Python name collides with a `BaseModel` /
     `BaseXmlModel` attribute resolves to the inherited attribute instead of
@@ -3344,6 +3358,185 @@ def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
             assert do_it_in["str_"].alias == "str"
         else:
             assert (do_it_in["str_"].json_schema_extra or {})["tag"] == "str"
+
+
+@pytest.mark.parametrize("fmt", ["restconf", "netconf"])
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "license",  # builtin: resolves to the builtin _Printer at runtime
+        "element",  # NETCONF template global: from pydantic_xml import element
+        "Field",  # RESTCONF template global: from pydantic import Field
+    ],
+)
+def test_module_names_colliding_with_runtime_names_still_import(
+    tmp_path, fmt, module_name
+):
+    """A YANG module stem must never be used bare in an aggregate annotation.
+
+    Regression: `license@2015-08-25.yang` produced
+
+        license_licenses: 'license.Licenses | None' = element(...)
+
+    in `data_models/__init__.py`. Pydantic evaluates that annotation at class
+    creation, and `license` resolves to the builtin `_Printer`; attribute access
+    raises `AttributeError`, which pydantic does not catch (it only defers
+    `NameError`). The generated client could not be imported at all. `element`
+    (NETCONF) and `Field` (RESTCONF) fail the same way because both are bound
+    in the aggregate module's globals.
+
+    The alias is an emitter detail: the navigator surface and the per-module
+    files must keep their raw names.
+    """
+    out, compiled = _gen(
+        tmp_path,
+        fmt,
+        MODULE_NAME_COLLISION_YANG.format(name=module_name),
+        module_name,
+    )
+    assert compiled, f"{fmt}/{module_name}: generated code failed to compile"
+
+    # 1. The aggregate package imports, and both the data and rpc fields exist.
+    models = _import(out, "data_models")
+    assert f"{module_name}_root" in models.Data.model_fields, sorted(
+        models.Data.model_fields
+    )
+    assert f"{module_name}_do_it" in models.Operations.model_fields, sorted(
+        models.Operations.model_fields
+    )
+    assert not any(name.startswith("_m_") for name in models.Data.model_fields), sorted(
+        models.Data.model_fields
+    )
+
+    # 2. The per-module models still import under their raw module name.
+    module_models = _import(out, f"data_models.{module_name}")
+    assert hasattr(module_models, "Root")
+    assert hasattr(module_models, "DoIt")
+
+    # 3. The public navigator surface is unchanged: raw property names, no
+    #    alias leak, raw per-module navigator file.
+    navigators = _import(out, "data_navigators")
+    assert hasattr(navigators.Data, f"{module_name}_root")
+    assert hasattr(navigators.Operations, f"{module_name}_do_it")
+    assert not any(name.startswith("_m_") for name in dir(navigators.Data)), [
+        name for name in dir(navigators.Data) if name.startswith("_m_")
+    ]
+    assert (out / "data_models" / f"{module_name}.py").is_file()
+    assert (out / "data_navigators" / f"{module_name}.py").is_file()
+    assert not (out / "data_models" / f"_m_{module_name}.py").exists()
+    assert not (out / "data_navigators" / f"_m_{module_name}.py").exists()
+
+
+@pytest.mark.parametrize(
+    ("binding", "annotation", "stem"),
+    [
+        (
+            "from pydantic import BaseModel\n",
+            "'license.Thing | None'",
+            "license",
+        ),
+        (
+            "from pydantic import BaseModel\nfrom pydantic_xml import element\n",
+            "'element.Thing | None'",
+            "element",
+        ),
+        (
+            "from pydantic import BaseModel, Field\n",
+            "'Field.Thing | None'",
+            "Field",
+        ),
+    ],
+)
+def test_aggregate_annotation_guard_rejects_runtime_name(
+    tmp_path, binding, annotation, stem
+):
+    """The offline guard must reject the shape that parses but cannot import."""
+    from yang2sdk.plugin.src.core import _aggregate_annotation_errors
+
+    path = tmp_path / "data_models" / "__init__.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "from __future__ import annotations\n"
+        "from typing import TYPE_CHECKING\n"
+        f"{binding}"
+        "if TYPE_CHECKING:\n"
+        "    from . import license\n"
+        "class Data(BaseModel):\n"
+        f"    x: {annotation} = None\n"
+    )
+    errors = _aggregate_annotation_errors(path)
+    assert any(stem in error for error in errors), errors
+
+
+def test_aggregate_annotation_guard_accepts_aliases_and_builtin_types(tmp_path):
+    """The guard must not reject a safe alias or an ordinary builtin type."""
+    from yang2sdk.plugin.src.core import _aggregate_annotation_errors
+
+    path = tmp_path / "data_models" / "__init__.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "from __future__ import annotations\n"
+        "from typing import TYPE_CHECKING, Any\n"
+        "from pydantic import BaseModel, Field\n"
+        "if TYPE_CHECKING:\n"
+        "    from . import license as _m_license\n"
+        "class Data(BaseModel):\n"
+        "    x: _m_license.Thing | None = Field(None, alias='license:x')\n"
+        "    y: dict[str, Any] = {}\n"
+    )
+    assert _aggregate_annotation_errors(path) == []
+
+
+def test_aggregate_annotation_guard_allows_a_runtime_module_import(tmp_path):
+    """A runtime module import shadows a builtin, so the bare stem is safe."""
+    from yang2sdk.plugin.src.core import _aggregate_annotation_errors
+
+    path = tmp_path / "data_models" / "__init__.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "from __future__ import annotations\n"
+        "from . import license\n"
+        "class Data:\n"
+        "    x: license.Thing | None = None\n"
+    )
+    assert _aggregate_annotation_errors(path) == []
+
+
+def test_module_annotation_aliases_are_unique_and_never_a_module_stem():
+    """The alias must not collide with a real module named like an alias."""
+    from types import SimpleNamespace
+
+    from yang2sdk.plugin.src.core import _module_annotation_aliases
+
+    modules = [
+        SimpleNamespace(py_name="license"),
+        SimpleNamespace(py_name="_m_license"),
+        SimpleNamespace(py_name="_m_license_"),
+    ]
+    aliases = _module_annotation_aliases(modules)
+    assert len(set(aliases.values())) == len(modules)
+    assert not set(aliases.values()) & {m.py_name for m in modules}
+    assert all(alias.startswith("_m_") for alias in aliases.values())
+
+
+def test_validate_generated_rejects_a_bare_aggregate_module_stem(tmp_path):
+    """`_validate_generated` must run the annotation guard, not just compile."""
+    from yang2sdk.plugin.src.core import _validate_generated
+
+    out = tmp_path / "out"
+    models = out / "data_models"
+    models.mkdir(parents=True)
+    (models / "__init__.py").write_text(
+        "from __future__ import annotations\n"
+        "from typing import TYPE_CHECKING\n"
+        "from pydantic import BaseModel\n"
+        "if TYPE_CHECKING:\n"
+        "    from . import license\n"
+        "class Data(BaseModel):\n"
+        "    x: 'license.Thing | None' = None\n"
+    )
+    with pytest.raises(SyntaxError, match="license"):
+        _validate_generated(str(out))
 
 
 def test_netconf_edit_config_rollback_on_error_is_running_only(tmp_path):

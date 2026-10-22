@@ -6,7 +6,7 @@ from ._base import NetconfXmlModel
 
 if TYPE_CHECKING:
 {% for mod_name in module_names %}
-    from . import {{ mod_name }}
+    from . import {{ mod_name }} as {{ module_aliases[mod_name] }}
 {% endfor %}
 
 {% set seen_data_ns = [] %}
@@ -16,7 +16,7 @@ class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netco
     
     {% if not data_props %}pass{% else %}
     {% for prop in data_props %}
-    {{ prop.module }}_{{ prop.field }}: '{{ prop.module }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
+    {{ prop.module }}_{{ prop.field }}: '{{ module_aliases[prop.module] }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
     {% endfor %}
     {% endif %}
 
@@ -27,6 +27,6 @@ class Operations(NetconfXmlModel, tag='operations', nsmap={'': 'urn:ietf:params:
     
     {% if not rpc_props %}pass{% else %}
     {% for prop in rpc_props %}
-    {{ prop.module }}_{{ prop.field }}: '{{ prop.module }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
+    {{ prop.module }}_{{ prop.field }}: '{{ module_aliases[prop.module] }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
     {% endfor %}
     {% endif %}
