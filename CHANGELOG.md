@@ -7,6 +7,39 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Generated `data_models/__init__.py` no longer annotates fields with a bare
+  module stem.** The aggregate imports each module under `TYPE_CHECKING` and
+  annotates top-level fields as `<module>.<Class>`, but pydantic evaluates
+  those annotations when it creates `Data` / `Operations`. A stem that also
+  names something at runtime — a builtin (`license@2015-08-25.yang` resolved to
+  the builtin `_Printer`) or one of the template's own imports (`element` in
+  NETCONF, `Field` in RESTCONF) — produced an `AttributeError` that pydantic
+  does not defer, so the package parsed and still could not be imported.
+  `_validate_generated`'s `compile()` check cannot see that. Every module is
+  now imported as a uniquified `_m_<stem>` alias: undefined at runtime, so the
+  annotation defers exactly as an ordinary cross-module reference does, and
+  still the real module to a type checker. Field names, navigator attributes
+  and per-module file names are unchanged. `_validate_generated` additionally
+  AST-checks the aggregate for the old shape, so generation fails instead of
+  shipping a broken package — without importing generated code, since the
+  NETCONF client needs `lxml`/`ncclient`, which are not base dependencies.
+  Pinned by `test_module_names_colliding_with_runtime_names_still_import` (all
+  three names, both protocols) plus the alias and guard unit tests.
+
+- **`release.yaml`'s post-publish version check compared against a literal.**
+  Run 39585230260 on `v2026.10.21` published correctly and then failed its own
+  check with `expected version {{ needs.build.outputs.version }}`: the `case`
+  pattern was written inline, one `$` short of an expression, so GitHub
+  substituted nothing and bash matched the version string against that text.
+  The expression now arrives through the step's `env:`, and an empty `EXPECTED`
+  fails loudly — `*""*` matches every string, which had turned an unresolved
+  `needs` output into a vacuous pass. Two tests pin it: every workflow string
+  is scanned for a GitHub context missing its `$` (named contexts only, so
+  docker's `--format '{{.Names}}'` stays legal), and the version check must
+  compare against `env` rather than an inline expression.
+
 ## [2026.10.21] - 2026-10-21
 
 ### Added

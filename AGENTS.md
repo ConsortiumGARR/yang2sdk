@@ -325,6 +325,7 @@ uv run python scripts/release.py                   # derive the tag, push it
 - Keep `ir.py` ↔ templates in sync: new IR fields require template rendering + a generated sample proving the output imports.
 - Preserve strictness: `extra="forbid"`, `validate_assignment`, alias/tag/ns plumbing, `is_config` filtering, choice-exclusion validator, 64-bit serializers.
 - Commit messages: concise, match existing style (`git log --oneline -10` first). Never commit secrets, `temp/`, or `.venv/`. Stage only intended files (`git status` + `git diff` before commit).
+- **Behaviour change ⇒ `## [Unreleased]` entry, same commit**, under the matching `### Added|Changed|Fixed|Removed`; say what broke, not what the diff did. Tests/docs/CI-only churn folds into the entry it supports. `scripts/changelog.py` still gates release.
 - PRs touching protocols must cite RFC sections; PRs touching safety defaults must call out the warning behavior explicitly.
 
 ## Trust protocol
