@@ -7,6 +7,8 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.10.22] - 2026-10-22
+
 ### Fixed
 
 - **Generated `data_models/__init__.py` no longer annotates fields with a bare
