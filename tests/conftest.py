@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from yang2sdk import layout
 from yang2sdk.cli.downloader import YangDownloader
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -341,14 +342,14 @@ def _compile_all(yang_files, roots, image):
     own process. This also covers the real `yang2sdk --protocol` CLI.
 
     `image` is the matrix entry, and the three names are deliberately derived
-    from it rather than passed separately: `slug` names the on-disk directory
-    (and the import path `_import_pkg` uses), while `--device` /
-    `--device-version` are what core.py builds the package NAME from
-    (`<device>_<device_version>` -> `_sanitize_pkg`). Passing the version-
-    bearing slug as `--device` double-encodes it: notconf-cisco-nx 10.4-4
-    became `notconf_cisco_nx_10_4_4_0_0_0` instead of `notconf_cisco_nx_10_4_4`,
-    shipping a README that claimed version `0.0.0` and an import name that
-    did not match the installed distribution.
+    from it rather than passed separately: `slug` names the on-disk container
+    (`temp/notconf_clients/<slug>_<fmt>`, resolved by `layout.resolve_package`
+    in `_import_pkg`), while `--device` / `--device-version` are what the
+    package NAME is built from (`yang2sdk.layout.package_name`). Passing the
+    version-bearing slug as `--device` double-encodes it: notconf-cisco-nx
+    10.4-4 became `notconf_cisco_nx_10_4_4_0_0_0` instead of
+    `notconf_cisco_nx_10_4_4`, shipping a README that claimed version `0.0.0`
+    and an import name that did not match the installed distribution.
     """
     slug = _slug(image)
     yangs_dir = yang_files[0].parent
@@ -377,16 +378,22 @@ def _compile_all(yang_files, roots, image):
             timeout=900,
         )
         assert proc.returncode == 0, f"{fmt} compile failed: {proc.stderr[-2000:]}"
-        assert (out / "__init__.py").exists()
-        assert (out / "session_manager.py").exists()
-        assert (out / "data_models").is_dir()
-        assert (out / "data_navigators").is_dir()
+        # One copy, in the project the README tells the operator to `uv add`:
+        # <out>/<package>/src/<package>/ (see yang2sdk.layout).
+        project = layout.resolve_package(out).parent.parent
+        package = layout.resolve_package(out)
+        assert (project / "pyproject.toml").is_file(), project
+        assert (package / "__init__.py").exists(), package
+        assert (package / "session_manager.py").exists(), package
+        assert (package / "data_models").is_dir(), package
+        assert (package / "data_navigators").is_dir(), package
 
 
 def _import_pkg(slug, fmt):
-    if str(TEMP_CLIENTS) not in sys.path:
-        sys.path.insert(0, str(TEMP_CLIENTS))
-    return importlib.import_module(f"{slug}_{fmt}")
+    package = layout.resolve_package(TEMP_CLIENTS / f"{slug}_{fmt}")
+    if str(package.parent) not in sys.path:
+        sys.path.insert(0, str(package.parent))
+    return importlib.import_module(package.name)
 
 
 @pytest.fixture(scope="function")
@@ -505,11 +512,13 @@ def lab_device_client(lab_device):
 
     slug = lab_device["id"]
     clients = REPO_ROOT / "temp" / "netconf_clients"
-    if not (clients / slug / "__init__.py").is_file():
+    try:
+        package = layout.resolve_package(clients / slug)
+    except LookupError:
         pytest.skip(f"generated client for {slug} not found in temp/netconf_clients")
-    if str(clients) not in sys.path:
-        sys.path.insert(0, str(clients))
-    module = importlib.import_module(slug)
+    if str(package.parent) not in sys.path:
+        sys.path.insert(0, str(package.parent))
+    module = importlib.import_module(package.name)
     kwargs = {
         "management_ip": lab_device["host"],
         "port": lab_device["port"],

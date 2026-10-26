@@ -42,7 +42,7 @@ The pipeline, end to end:
      Naming a .yang file positionally works too, and skips the picker.
 
   3. Read the generated package (a self-contained, installable Python package)
-       uv add ./temp/netconf_clients/<device>_<os-version>
+       uv add ./temp/netconf_clients/<device>/<device>_<os-version>
        from <device>_<os_version> import NetconfClient
 
   4. Optional, lab only: validate the whole generated client against a device

@@ -1,7 +1,9 @@
 """Offline checks: matrix completeness + template contract. No docker needed."""
 
+import ast
 import compileall
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -15,6 +17,7 @@ from typing import Any, ClassVar, cast
 
 import pytest
 
+from yang2sdk import layout
 from yang2sdk.cli.compiler import resolve_features
 from yang2sdk.cli.features import (
     parse_capability_features,
@@ -486,12 +489,11 @@ def test_generate_rpc_free_module_compiles_and_imports(fmt, tmp_path):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
     assert compileall.compile_dir(str(out), quiet=1), f"{fmt} output has syntax errors"
-    sys.path.insert(0, str(tmp_path))
-    try:
-        pkg = __import__(f"tmod_{fmt}")
-        assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Import the package the README names, from `src/` -- not the container,
+    # which is not a package (it would import as an empty namespace package and
+    # fail with a confusing AttributeError).
+    pkg = _import(out, "")
+    assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
 
 
 def _gen_restconf(yang_text: str, name: str, tmp_path):
@@ -526,8 +528,9 @@ def _gen_restconf(yang_text: str, name: str, tmp_path):
     # Don't hardcode the version directory: the default device_version differs
     # between the console script and run_compiler(). The manifest is the
     # authoritative statement of what was emitted.
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
-    pkg_root = out / manifest["package_name"]
+    project = _project(out)
+    manifest = json.loads((project / "MANIFEST.yang-revisions.json").read_text())
+    pkg_root = project / "src" / manifest["package_name"]
     assert pkg_root.is_dir(), f"expected package at {pkg_root}"
     sys.path.insert(0, str(pkg_root.parent))
     return str(pkg_root.parent), pkg_root.name
@@ -779,8 +782,8 @@ def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
 
-    models = next(out.glob("*/data_models/tbase.py"), None)
-    assert models is not None, f"no generated model for tbase under {out}"
+    models = _pkg_file(out, "data_models", "tbase.py")
+    assert models.is_file(), f"no generated model for tbase under {out}"
     text = models.read_text()
     has_augmented_field = "load" in text
     # Default: the augment IS resolved into the model.
@@ -814,13 +817,13 @@ def test_generated_package_name_matches_the_matrix_slug():
     pins, by actually compiling.
     """
     from tests.conftest import _slug, load_matrix
-    from yang2sdk.plugin.src.core import _sanitize_pkg
+    from yang2sdk.layout import sanitize_package_name
 
     images = load_matrix()["images"]
     assert images, "matrix declares no images"
     for image in images:
         want = _slug(image)
-        got = _sanitize_pkg(f"{image['package']}_{image['tag']}")
+        got = sanitize_package_name(f"{image['package']}_{image['tag']}")
         assert got == want, (
             f"{image['package']}:{image['tag']}: package name {got!r} != "
             f"directory slug {want!r}; the installable copy and the imported "
@@ -859,17 +862,19 @@ def test_compile_all_names_the_installable_package_from_the_matrix_slug(
 
     slug = conftest._slug(image)
     out = tmp_path / "clients" / f"{slug}_restconf"
-    assert (out / "__init__.py").exists(), "flat importable copy missing"
-    # The installable copy is named from --device/--device-version, NOT from
-    # the slug passed as --device. This is the assertion that catches the bug.
-    assert (out / slug).is_dir(), (
-        f"installable copy is not named {slug}; found "
+    # One copy of the code, in an installable project the generated README can
+    # name: `uv add <container>/<package>`.
+    project = _project(out)
+    package = _package(out)
+    assert package.name == slug, (
+        f"installable package is not named {slug}; found "
         f"{sorted(p.name for p in out.iterdir())}"
     )
+    assert package.parent.name == "src", package
     assert not (out / f"{slug}_0_0_0").exists(), "device version double-encoded"
-    pyproject = (out / "pyproject.toml").read_text()
+    pyproject = (project / "pyproject.toml").read_text()
     assert f'name = "{slug}"' in pyproject, pyproject[:400]
-    assert f'packages = ["{slug}"]' in pyproject, pyproject[:400]
+    assert f'packages = ["src/{slug}"]' in pyproject, pyproject[:400]
     # PEP 440: 10.4-4 -> 10.4.4
     assert 'version = "10.4.4"' in pyproject, pyproject[:400]
 
@@ -992,11 +997,12 @@ def test_cli_does_not_stamp_a_foreign_device_version(tmp_path):
         env=env,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    pyproject = (out / "pyproject.toml").read_text()
+    project = _project(out)
+    pyproject = (project / "pyproject.toml").read_text()
     assert "9.9.9" not in pyproject, (
         f"foreign DEVICE_VERSION leaked into the package metadata:\n{pyproject}"
     )
-    readme = (out / "README.md").read_text()
+    readme = (project / "README.md").read_text()
     assert "9.9.9" not in readme, (
         f"foreign DEVICE_VERSION leaked into the generated README:\n{readme[:600]}"
     )
@@ -1204,7 +1210,7 @@ def test_case_differing_siblings_are_not_merged_into_one_model(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    model = next(out.glob("*/data_models/tcollide.py"))
+    model = _pkg_file(out, "data_models", "tcollide.py")
     text = model.read_text()
 
     classes = re.findall(r"^class (\w+)\(.*?tag=\"([^\"]+)\"", text, re.MULTILINE)
@@ -1249,12 +1255,8 @@ def test_content_filter_prunes_nested_state(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    sys.path.insert(0, str(tmp_path))
-    try:
-        models = __import__("tcontent_restconf.data_models.tcontent", fromlist=["*"])
-        data_cls = models.TcontentData
-    finally:
-        sys.path.remove(str(tmp_path))
+    models = _import(out, "data_models.tcontent")
+    data_cls = models.TcontentData
 
     m = data_cls.model_validate(
         {
@@ -1350,71 +1352,65 @@ def test_restconf_write_bodies_are_module_qualified(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    sys.path.insert(0, str(tmp_path))
-    try:
-        nav_mod = importlib.import_module("env_restconf.data_navigators")
-        models = importlib.import_module("env_restconf.data_models.env")
+    nav_mod = _import(out, "data_navigators")
+    models = _import(out, "data_models.env")
 
-        client = _RecordingClient()
-        data = nav_mod.Data(client, "/data", "")
-        list_nav = data.env_parent.things
+    client = _RecordingClient()
+    data = nav_mod.Data(client, "/data", "")
+    list_nav = data.env_parent.things
 
-        thing = models.ThingsItem.model_validate(
-            {"id": "a", "val": "x", "some_leaf": "s"}
-        )
-        full = {"id": "a", "val": "x", "some-leaf": "s"}
+    thing = models.ThingsItem.model_validate({"id": "a", "val": "x", "some_leaf": "s"})
+    full = {"id": "a", "val": "x", "some-leaf": "s"}
 
-        list_nav.create([thing])
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.4.1 + App. B.2.1: POST to the parent with a
-        # single-element array, one POST per entry (Sec 4.4.1 MUST exactly
-        # one instance). See _base.py.jinja _create.
-        assert method == "POST" and path == "/data/env:parent"
-        assert body == {"env:things": [full]}, (
-            f"create body must be a qualified single-element array: {body}"
-        )
+    list_nav.create([thing])
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.4.1 + App. B.2.1: POST to the parent with a
+    # single-element array, one POST per entry (Sec 4.4.1 MUST exactly
+    # one instance). See _base.py.jinja _create.
+    assert method == "POST" and path == "/data/env:parent"
+    assert body == {"env:things": [full]}, (
+        f"create body must be a qualified single-element array: {body}"
+    )
 
-        list_nav.replace([thing])
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4: whole-list PUT targets the
-        # list resource itself with name/array encoding.
-        assert method == "PUT" and path == "/data/env:parent/things"
-        assert body == {"env:things": [full]}, (
-            f"list replace body must be a qualified array: {body}"
-        )
+    list_nav.replace([thing])
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4: whole-list PUT targets the
+    # list resource itself with name/array encoding.
+    assert method == "PUT" and path == "/data/env:parent/things"
+    assert body == {"env:things": [full]}, (
+        f"list replace body must be a qualified array: {body}"
+    )
 
-        list_nav("a").update(thing)
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.5 jukebox PUT array + RFC 7951 Sec 5.4 list/array;
-        # PATCH list-instance follows the same JSON encoding (no JSON PATCH
-        # list-instance example in RFC 8040; XML bare <album> differs by
-        # design). Matches rousette tests/restconf-plain-patch.cpp (204).
-        assert body == {"env:things": [full]}, (
-            f"item PATCH body must be a qualified array: {body}"
-        )
+    list_nav("a").update(thing)
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.5 jukebox PUT array + RFC 7951 Sec 5.4 list/array;
+    # PATCH list-instance follows the same JSON encoding (no JSON PATCH
+    # list-instance example in RFC 8040; XML bare <album> differs by
+    # design). Matches rousette tests/restconf-plain-patch.cpp (204).
+    assert body == {"env:things": [full]}, (
+        f"item PATCH body must be a qualified array: {body}"
+    )
 
-        list_nav("a").replace(thing)
-        method, path, body = client.calls[-1]
-        assert method == "PUT" and path == "/data/env:parent/things=a"
-        assert body == {"env:things": [full]}, (
-            f"item PUT body must be a qualified array: {body}"
-        )
+    list_nav("a").replace(thing)
+    method, path, body = client.calls[-1]
+    assert method == "PUT" and path == "/data/env:parent/things=a"
+    assert body == {"env:things": [full]}, (
+        f"item PUT body must be a qualified array: {body}"
+    )
 
-        parent = models.Parent.model_validate({"things": [full]})
-        data.env_parent.update(parent)
-        method, path, body = client.calls[-1]
-        assert method == "PATCH" and path == "/data/env:parent"
-        assert body == {"env:parent": {"things": [full]}}, (
-            f"container envelope must be qualified: {body}"
-        )
+    parent = models.Parent.model_validate({"things": [full]})
+    data.env_parent.update(parent)
+    method, path, body = client.calls[-1]
+    assert method == "PATCH" and path == "/data/env:parent"
+    assert body == {"env:parent": {"things": [full]}}, (
+        f"container envelope must be qualified: {body}"
+    )
 
-        # Response keys stay simple for same-module nodes: retrieve must
-        # still match the unqualified key.
-        client.responses.append({"things": [full]})
-        items = list_nav.retrieve(content="all", depth=2)
-        assert [i.id for i in items] == ["a"]
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Response keys stay simple for same-module nodes: retrieve must
+    # still match the unqualified key.
+    client.responses.append({"things": [full]})
+    items = list_nav.retrieve(content="all", depth=2)
+    assert [i.id for i in items] == ["a"]
 
 
 TB_BASE_YANG = """module tbase {
@@ -1488,53 +1484,44 @@ def test_netconf_identityref_binding_and_normalization(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
     assert compileall.compile_dir(str(out), quiet=1), "netconf output has syntax errors"
-    sys.path.insert(0, str(tmp_path))
-    try:
-        models = importlib.import_module("tmain_netconf.data_models.tmain")
-        from lxml import etree  # ty: ignore[unresolved-import] - lxml stubs (cf. src/)
+    models = _import(out, "data_models.tmain")
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml stubs (cf. src/)
 
-        # Generated by this test at runtime; import dynamically so the
-        # type checkers do not try to resolve a nonexistent source module.
-        bind_module_prefixes = importlib.import_module(
-            "tmain_netconf.session_manager"
-        ).bind_module_prefixes
+    # Generated by this test at runtime; import dynamically so the
+    # type checkers do not try to resolve a nonexistent source module.
+    bind_module_prefixes = _import(out, "session_manager").bind_module_prefixes
 
-        item_cls = models.ItemsItem
-        assert (
-            item_cls.model_fields["kind"].json_schema_extra.get("is_identityref")
-            is True
-        )
+    item_cls = models.ItemsItem
+    assert item_cls.model_fields["kind"].json_schema_extra.get("is_identityref") is True
 
-        # Write side: module-name prefix gets its xmlns declaration.
-        cfg = etree.fromstring(
-            '<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
-            '<stuff xmlns="urn:test:tmain"><items>'
-            "<id>a</id><kind>tbase:base-id</kind></items></stuff></config>"
-        )
-        bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
-        assert 'xmlns:tbase="urn:test:tbase"' in etree.tostring(cfg).decode()
-        # Idempotent, and never rebinds a prefix already in scope.
-        bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
-        assert etree.tostring(cfg).count(b"xmlns:tbase") == 1
-        cfg2 = etree.fromstring('<a xmlns:tbase="urn:other"><t>tbase:x</t></a>')
-        bind_module_prefixes(cfg2, {"tbase": "urn:test:tbase"})
-        assert 'xmlns:tbase="urn:other"' in etree.tostring(cfg2).decode()
+    # Write side: module-name prefix gets its xmlns declaration.
+    cfg = etree.fromstring(
+        '<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<stuff xmlns="urn:test:tmain"><items>'
+        "<id>a</id><kind>tbase:base-id</kind></items></stuff></config>"
+    )
+    bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
+    assert 'xmlns:tbase="urn:test:tbase"' in etree.tostring(cfg).decode()
+    # Idempotent, and never rebinds a prefix already in scope.
+    bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
+    assert etree.tostring(cfg).count(b"xmlns:tbase") == 1
+    cfg2 = etree.fromstring('<a xmlns:tbase="urn:other"><t>tbase:x</t></a>')
+    bind_module_prefixes(cfg2, {"tbase": "urn:test:tbase"})
+    assert 'xmlns:tbase="urn:other"' in etree.tostring(cfg2).decode()
 
-        # Read side: server prefix form normalizes to the module name.
-        xml = (
-            '<items xmlns="urn:test:tmain"><id>a</id>'
-            '<kind xmlns:xx="urn:test:tbase">xx:base-id</kind></items>'
-        )
-        m = item_cls.from_xml(xml, module_namespaces={"tbase": "urn:test:tbase"})
-        assert m.kind == "tbase:base-id"
+    # Read side: server prefix form normalizes to the module name.
+    xml = (
+        '<items xmlns="urn:test:tmain"><id>a</id>'
+        '<kind xmlns:xx="urn:test:tbase">xx:base-id</kind></items>'
+    )
+    m = item_cls.from_xml(xml, module_namespaces={"tbase": "urn:test:tbase"})
+    assert m.kind == "tbase:base-id"
 
-        # Round trip: module-name form serializes unchanged.
-        payload = item_cls(id="a", kind="tbase:base-id").to_xml_payload()
-        assert b"tbase:base-id" in (
-            payload if isinstance(payload, bytes) else payload.encode()
-        )
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Round trip: module-name form serializes unchanged.
+    payload = item_cls(id="a", kind="tbase:base-id").to_xml_payload()
+    assert b"tbase:base-id" in (
+        payload if isinstance(payload, bytes) else payload.encode()
+    )
 
 
 def test_no_nonexistent_rfc_sections_cited():
@@ -1601,8 +1588,8 @@ def test_generated_package_is_registry_ready(tmp_path):
     """Generated SDK is a securely publishable package (AGENTS.md packaging).
 
     Asserts pyproject.toml + README.md + MANIFEST + py.typed exist, manifest
-    carries module revisions, no secrets/lab paths, and the namespaced copy
-    imports (import <package_name>).
+    carries module revisions, no secrets/lab paths, and the package imports as
+    `<package_name>` with nothing but the project on `sys.path`.
     """
     yang = tmp_path / "tmod.yang"
     yang.write_text(MINIMAL_YANG)
@@ -1614,31 +1601,38 @@ def test_generated_package_is_registry_ready(tmp_path):
         out,
         ["--device-version", "1.2.3", "--package-version", "1.2.3"],
     )
-    assert (out / "pyproject.toml").exists()
-    assert (out / "README.md").exists()
-    assert (out / "MANIFEST.yang-revisions.json").exists()
-    assert (out / "py.typed").exists()
+    project = _project(out)
+    package = _package(out)
+    assert (project / "pyproject.toml").exists()
+    assert (project / "README.md").exists()
+    assert (project / "MANIFEST.yang-revisions.json").exists()
+    assert (package / "py.typed").exists()
     import tomllib
 
-    pyproj = tomllib.loads((out / "pyproject.toml").read_text())
+    pyproj = tomllib.loads((project / "pyproject.toml").read_text())
     assert pyproj["project"]["name"] == "tmod_1_2_3"
     assert pyproj["project"]["version"] == "1.2.3"
     assert "data_models" not in pyproj["project"]["name"]
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    assert pyproj["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "src/tmod_1_2_3"
+    ]
+    manifest = json.loads((project / "MANIFEST.yang-revisions.json").read_text())
     assert manifest["device"] == "tmod"
     assert manifest["device_version"] == "1.2.3"
     assert manifest["protocol"] == "restconf"
     assert any(m["name"] == "tmod" for m in manifest["modules"])
-    hay = (out / "pyproject.toml").read_text() + (out / "README.md").read_text()
+    hay = (project / "pyproject.toml").read_text() + (project / "README.md").read_text()
     for secret in ("DEVICE_PASS", "DEVICE_USER", "192.168", "BEGIN PRIVATE"):
         assert secret not in hay
-    # Namespaced installable copy imports without temp/lab paths.
-    sys.path.insert(0, str(out))
+    # The installable package imports with only `src/` on the path: no temp/,
+    # no lab path, no second copy.
+    assert package.parent.name == "src"
+    sys.path.insert(0, str(package.parent))
     try:
         pkg = importlib.import_module("tmod_1_2_3")
         assert pkg.RestconfClient is not None
     finally:
-        sys.path.remove(str(out))
+        sys.path.remove(str(package.parent))
 
 
 def test_package_manifest_records_deviations_and_features(tmp_path):
@@ -1678,7 +1672,7 @@ def test_package_manifest_records_deviations_and_features(tmp_path):
             "tmod:myfeat",
         ],
     )
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    manifest = json.loads((_project(out) / "MANIFEST.yang-revisions.json").read_text())
     assert any("my-dev.yang" in d for d in manifest["deviations"])
     assert "tmod:myfeat" in manifest["features"]
     assert manifest["features_source"] == "manual"
@@ -1722,44 +1716,40 @@ def test_logging_hygiene_generated_client(tmp_path):
     yang.write_text(MINIMAL_YANG)
     out = tmp_path / "tmod_log"
     _run_compiler("restconf", yang, tmp_path, out)
-    sys.path.insert(0, str(tmp_path))
-    try:
-        sm_mod = importlib.import_module("tmod_log.session_manager")
+    sm_mod = _import(out, "session_manager")
 
-        class FakeResp:
-            status_code = 200
-            text = '{"tmod:top": {"name": "x", "password": "s3cret"}}'
+    class FakeResp:
+        status_code = 200
+        text = '{"tmod:top": {"name": "x", "password": "s3cret"}}'
 
-            def raise_for_status(self):
-                return None
+        def raise_for_status(self):
+            return None
 
-            def json(self):
-                return {"tmod:top": {"name": "x"}}
+        def json(self):
+            return {"tmod:top": {"name": "x"}}
 
-        class FakeSession:
-            verify = True
-            trust_env = True
-            auth = ("u", "p")
+    class FakeSession:
+        verify = True
+        trust_env = True
+        auth = ("u", "p")
 
-            def __init__(self):
-                self.headers: dict = {}
+        def __init__(self):
+            self.headers: dict = {}
 
-            def mount(self, *a, **k):
-                return None
+        def mount(self, *a, **k):
+            return None
 
-            def request(self, method, url, timeout=None, **kwargs):
-                return FakeResp()
+        def request(self, method, url, timeout=None, **kwargs):
+            return FakeResp()
 
-        from unittest import mock
+    from unittest import mock
 
-        with mock.patch.object(sm_mod.requests, "Session", return_value=FakeSession()):
-            client = sm_mod.RestconfClient(
-                management_ip="127.0.0.1", username="u", password="p", verify=False
-            )
-            # Default: bodies hidden from INFO.
-            assert client.log_bodies is False
-    finally:
-        sys.path.remove(str(tmp_path))
+    with mock.patch.object(sm_mod.requests, "Session", return_value=FakeSession()):
+        client = sm_mod.RestconfClient(
+            management_ip="127.0.0.1", username="u", password="p", verify=False
+        )
+        # Default: bodies hidden from INFO.
+        assert client.log_bodies is False
 
 
 # --- device feature set (RFC 7950 if-feature -> pyang --features) -------------
@@ -1942,19 +1932,25 @@ def test_auto_device_features_reach_pyang(tmp_path):
 
     auto = tmp_path / "auto"
     _run_compiler("restconf", yang, tmp_path, auto)
-    auto_manifest = json.loads((auto / "MANIFEST.yang-revisions.json").read_text())
+    auto_manifest = json.loads(
+        (_project(auto) / "MANIFEST.yang-revisions.json").read_text()
+    )
     assert auto_manifest["features_source"] == "device"
     assert auto_manifest["features"] == ["tfeat:other"]
     # `g` is `if-feature "not f"` and f is unsupported, so the auto-detected
     # device set must keep it in the model.
-    assert "G" in (auto / "data_models" / "tfeat.py").read_text()
+    assert "G" in (_package(auto) / "data_models" / "tfeat.py").read_text()
 
     opted_out = tmp_path / "opted_out"
     _run_compiler("restconf", yang, tmp_path, opted_out, ["--no-device-features"])
-    out_manifest = json.loads((opted_out / "MANIFEST.yang-revisions.json").read_text())
+    out_manifest = json.loads(
+        (_project(opted_out) / "MANIFEST.yang-revisions.json").read_text()
+    )
     assert out_manifest["features_source"] == "none"
     assert out_manifest["features"] == []
-    assert "class G(" not in (opted_out / "data_models" / "tfeat.py").read_text()
+    assert (
+        "class G(" not in (_package(opted_out) / "data_models" / "tfeat.py").read_text()
+    )
 
 
 # --- RPC / action wire encoding (offline: no device needed) -------------------
@@ -2054,12 +2050,80 @@ def _gen(tmp_path, fmt, yang_text, name):
     return out, compileall.compile_dir(str(out), quiet=1)
 
 
-def _import(pkg_dir, dotted):
-    """Import `<pkg_dir.name>.dotted`, i.e. the flat lab layout under temp/."""
-    parent = str(pkg_dir.parent)
+def _project(out) -> Path:
+    """The single installable project inside an ``--output-dir`` container.
+
+    The layout is defined in `yang2sdk.layout`; the assert makes a container
+    holding two projects (a stale compile for another device version) loud
+    here rather than in whichever consumer globbed first.
+    """
+    projects = [
+        p for p in sorted(Path(out).iterdir()) if (p / "pyproject.toml").is_file()
+    ]
+    assert len(projects) == 1, (
+        f"expected one project in {out}: {[p.name for p in projects]}"
+    )
+    return projects[0]
+
+
+def _package(out) -> Path:
+    """The importable package inside a container/project: ``<project>/src/<pkg>``."""
+    return layout.resolve_package(Path(out))
+
+
+def _pkg_file(out, *parts) -> Path:
+    """A path inside the generated package: ``<project>/src/<pkg>/<parts...>``."""
+    return _package(out).joinpath(*parts)
+
+
+_IMPORTED_FROM: dict[str, str] = {}
+
+
+def _purge_package(name: str) -> None:
+    """Drop a package and its submodules from `sys.modules`."""
+    prefix = f"{name}."
+    for stale in [n for n in sys.modules if n == name or n.startswith(prefix)]:
+        del sys.modules[stale]
+
+
+def _import(out, dotted, alias=None):
+    """Import ``<package>.<dotted>`` from a generated container or project.
+
+    The generated package is named after the *device*, so several tests here
+    compile the same device name from different YANG into different tmp dirs.
+    Python caches the first one, and a later test then silently asserts against
+    an earlier test's model -- tests that pass alone and fail in a full run.
+    Purge only when the package is being imported from a *different* directory,
+    so two imports inside one test still see the same module objects (a
+    navigator's lazy `from .x import Y` must resolve to the same classes the
+    test holds).
+
+    ``alias`` loads the package under a private top-level name instead, which
+    is what a caller needs when two *protocols* for one device are alive in the
+    same process: they share one distribution name (`<device>_<version>`, no
+    protocol in it), so they cannot both answer to it -- and they could not be
+    installed side by side either. `sdk-verify --protocol both` loads them the
+    same way for the same reason.
+    """
+    package = _package(out)
+    parent = str(package.parent)
+    if alias:
+        spec = importlib.util.spec_from_file_location(
+            alias, package / "__init__.py", submodule_search_locations=[str(package)]
+        )
+        assert spec is not None and spec.loader is not None, package
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = module
+        spec.loader.exec_module(module)
+        target = alias if not dotted else f"{alias}.{dotted}"
+        return importlib.import_module(target)
+    if _IMPORTED_FROM.get(package.name, parent) != parent:
+        _purge_package(package.name)
+    _IMPORTED_FROM[package.name] = parent
     sys.path.insert(0, parent)
     try:
-        return importlib.import_module(f"{pkg_dir.name}.{dotted}")
+        target = package.name if not dotted else f"{package.name}.{dotted}"
+        return importlib.import_module(target)
     finally:
         sys.path.remove(parent)
 
@@ -3421,10 +3485,10 @@ def test_module_names_colliding_with_runtime_names_still_import(
     assert not any(name.startswith("_m_") for name in dir(navigators.Data)), [
         name for name in dir(navigators.Data) if name.startswith("_m_")
     ]
-    assert (out / "data_models" / f"{module_name}.py").is_file()
-    assert (out / "data_navigators" / f"{module_name}.py").is_file()
-    assert not (out / "data_models" / f"_m_{module_name}.py").exists()
-    assert not (out / "data_navigators" / f"_m_{module_name}.py").exists()
+    assert _pkg_file(out, "data_models", f"{module_name}.py").is_file()
+    assert _pkg_file(out, "data_navigators", f"{module_name}.py").is_file()
+    assert not _pkg_file(out, "data_models", f"_m_{module_name}.py").exists()
+    assert not _pkg_file(out, "data_navigators", f"_m_{module_name}.py").exists()
 
 
 @pytest.mark.parametrize(
@@ -3698,7 +3762,7 @@ def test_undeclared_xml_attributes_are_dropped_but_elements_are_not(tmp_path):
 
     # And exactly one definition of each survives in the generated base, so a
     # future edit cannot silently reintroduce the shadowing.
-    base_src = (out / "data_models" / "_base.py").read_text()
+    base_src = _pkg_file(out, "data_models", "_base.py").read_text()
     assert base_src.count("def from_xml(cls") == 1, base_src.count("def from_xml(cls")
     assert base_src.count("def from_xml_tree(cls") == 1, base_src.count(
         "def from_xml_tree(cls"
@@ -3786,11 +3850,10 @@ def test_list_key_named_like_python_keyword(tmp_path):
     """
     for proto in ("netconf", "restconf"):
         out, _ = _gen(tmp_path, proto, KEYWORD_KEY_YANG, "tkw")
-        src = (
-            (out / "data_navigators" / "tkw.py").read_text()
-            if (out / "data_navigators" / "tkw.py").exists()
-            else (out / "data_navigators" / "navigators.py").read_text()
-        )
+        nav_file = _pkg_file(out, "data_navigators", "tkw.py")
+        if not nav_file.exists():
+            nav_file = _pkg_file(out, "data_navigators", "navigators.py")
+        src = nav_file.read_text()
         if proto == "netconf":
             # NETCONF keys are Python parameters on the navigator's __call__,
             # so they must be keyword-safe...
@@ -3806,11 +3869,10 @@ def test_list_key_named_like_python_keyword(tmp_path):
                 "restconf: keyword-safe __call__ signature not emitted"
             )
         # the model attribute is also keyword-safe
-        models = (
-            (out / "data_models" / "tkw.py").read_text()
-            if (out / "data_models" / "tkw.py").exists()
-            else (out / "data_models" / "models.py").read_text()
-        )
+        model_file = _pkg_file(out, "data_models", "tkw.py")
+        if not model_file.exists():
+            model_file = _pkg_file(out, "data_models", "models.py")
+        models = model_file.read_text()
         assert "if_: str" in models or "if_: " in models, (
             f"{proto}: model field for key 'if' is not keyword-safe"
         )
@@ -4083,12 +4145,12 @@ def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
     rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tcred")
-    rest = _import(rout, "session_manager")
+    rest = _import(rout, "session_manager", alias="_tcred_restconf")
     with pytest.raises(ValueError, match="credentials"):
         rest.RestconfClient(management_ip="127.0.0.1", port=8181)
 
     nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tcred")
-    netc = _import(nout, "session_manager")
+    netc = _import(nout, "session_manager", alias="_tcred_netconf")
     with pytest.raises(ValueError, match="credentials"):
         netc.NetconfClient(management_ip="127.0.0.1")
 
@@ -4141,12 +4203,12 @@ def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVICE_PASSWORD", "retiredpass")
 
     rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tlong")
-    rest = _import(rout, "session_manager")
+    rest = _import(rout, "session_manager", alias="_tlong_restconf")
     with pytest.raises(ValueError, match="credentials"):
         rest.RestconfClient(management_ip="127.0.0.1", port=8181)
 
     nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tlong")
-    netc = _import(nout, "session_manager")
+    netc = _import(nout, "session_manager", alias="_tlong_netconf")
     with pytest.raises(ValueError, match="credentials"):
         netc.NetconfClient(management_ip="127.0.0.1")
 
@@ -5142,8 +5204,8 @@ def test_output_dir_is_created_on_demand(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert (out / "__init__.py").is_file()
-    assert (out / "session_manager.py").is_file()
+    assert _pkg_file(out, "__init__.py").is_file()
+    assert _pkg_file(out, "session_manager.py").is_file()
 
 
 def test_importing_downloader_creates_no_files(tmp_path):
@@ -5173,16 +5235,11 @@ def test_importing_downloader_creates_no_files(tmp_path):
 def _import_fresh(pkg_dir, dotted):
     """Import from a freshly compiled package, ignoring an earlier one.
 
-    Several tests here compile a module whose generated package has the same
-    name, and Python caches `tcontent_netconf.data_models.tcontent` from the
-    first of them. Without this purge a later test silently asserts against an
-    earlier test's model -- which showed up as tests that pass alone and fail
-    in a full run.
+    Same failure as `_import` guards against, forced: purge unconditionally.
     """
-    prefix = f"{pkg_dir.name}."
-    stale = [n for n in sys.modules if n == pkg_dir.name or n.startswith(prefix)]
-    for name in stale:
-        del sys.modules[name]
+    package = _package(pkg_dir)
+    _purge_package(package.name)
+    _IMPORTED_FROM.pop(package.name, None)
     return _import(pkg_dir, dotted)
 
 
@@ -5536,27 +5593,42 @@ def test_restconf_keeps_an_emptied_matching_container(tmp_path):
 
 
 def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
-    """A published sdist must not ship the package twice.
+    """One copy of the code, in an installable project the README can name.
 
-    The emitter writes the client twice on purpose: flat at the output dir so
-    the lab harness can `import temp.<proto>_clients.<device>`, and namespaced
-    so pip installs `import <package_name>`. The wheel already carried only the
-    namespaced copy, but hatchling puts the whole project tree in an sdist, so
-    the tarball shipped both -- measured on a 25-entry tarball with two
-    data_models/, two data_navigators/, two __init__.py, two
-    session_manager.py and two py.typed. Two identical-looking trees in one
-    artifact is also a trap for anyone hand-editing before publishing.
+    The emitter used to write the client twice: flat at the output dir so the
+    lab harness could `import temp.<proto>_clients.<device>`, and namespaced so
+    pip could install it. Two trees could drift, the sdist needed a hand-written
+    exclude to ship one (measured: a 25-entry tarball with two `data_models/`,
+    two `data_navigators/`, two `__init__.py`, two `session_manager.py`, two
+    `py.typed`), and the generated README's install line -- `uv add
+    path/to/<package_name>` -- pointed at a directory with no `pyproject.toml`,
+    so `uv build` refused it outright.
 
     Asserted on the artifact rather than on the generator's intent, and the
     wheel-from-sdist path is exercised too, because that is what `pip install
-    <sdist>` does and it is what an excluded path could silently break.
+    <sdist>` does.
     """
     import tarfile
 
     out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tsdist")
+    project = _project(out)
+    package = _package(out)
+
+    # The directory the generated README tells you to `uv add` must be the
+    # project: it carries the packaging metadata itself.
+    readme = (project / "README.md").read_text()
+    assert f"uv add path/to/{package.name}" in readme, readme[:400]
+    for meta in ("pyproject.toml", "README.md", "MANIFEST.yang-revisions.json"):
+        assert (project / meta).is_file(), f"{meta} missing from {project}"
+    # ...and the code lives under src/, once.
+    assert package.parent.name == "src"
+    assert sorted(p.name for p in out.iterdir()) == [package.name], sorted(
+        p.name for p in out.iterdir()
+    )
+
     dist = tmp_path / "dist"
     build = subprocess.run(
-        ["uv", "build", "--out-dir", str(dist), str(out)],
+        ["uv", "build", "--out-dir", str(dist), str(project)],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -5570,27 +5642,26 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
     with tarfile.open(sdists[0]) as tar:
         names = ["/".join(n.split("/")[1:]) for n in tar.getnames()]
 
-    # The flat lab copy must be gone...
-    for flat in ("__init__.py", "data_models", "data_navigators", "session_manager.py"):
-        assert flat not in names, f"sdist still ships the flat {flat}: {sorted(names)}"
-
-    # ...and exactly one namespaced package must remain, holding one copy of
-    # each module. The directory is named after the device, so derive it from the
-    # artifact rather than assuming.
-    roots = {n.split("/")[0] for n in names if "/" in n}
-    assert len(roots) == 1, f"expected one package dir, got {sorted(roots)}"
-    root = roots.pop()
+    # Exactly one copy of the package, under src/, and nothing at the root but
+    # packaging metadata.
+    inits = [n for n in names if n.endswith("/__init__.py") or n == "__init__.py"]
+    top_level_inits = [n for n in inits if n.count("/") == 2 and n.startswith("src/")]
+    nested = [n for n in inits if n.count("/") > 2 and "/data_" not in n]
+    assert len(top_level_inits) == 1, sorted(inits)
+    assert not nested, f"package nested inside itself: {sorted(inits)}"
+    assert not any(n == "__init__.py" for n in names), (
+        f"a flat copy is still in the sdist: {sorted(names)}"
+    )
     for member in ("data_models", "data_navigators"):
         tops = [
-            n for n in names if n.startswith(f"{root}/{member}/") and n.count("/") == 2
+            n
+            for n in names
+            if n.startswith(f"src/{package.name}/{member}/") and n.count("/") == 3
         ]
-        assert tops, f"{root}/{member} missing from sdist: {sorted(names)}"
-    assert not any(n.startswith(f"{root}/{root}/") for n in names), (
-        "the package is nested inside itself: the flat copy was not excluded"
-    )
+        assert tops, f"src/{package.name}/{member} missing from sdist: {sorted(names)}"
 
     # `pip install <sdist>` builds a wheel from the extracted tree: prove the
-    # exclusion did not remove anything the wheel target needs.
+    # src layout survives that round trip.
     extracted = tmp_path / "extracted"
     extracted.mkdir()
     with tarfile.open(sdists[0]) as tar:
@@ -5606,7 +5677,135 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
         timeout=600,
     )
     assert again.returncode == 0, again.stderr[-2000:]
-    assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert wheels, "no wheel built from the extracted sdist"
+    # The wheel must install `import <package_name>`, never bare `data_models`.
+    import zipfile
+
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        wheel_names = wheel.namelist()
+    assert f"{package.name}/__init__.py" in wheel_names, wheel_names
+    assert not any(
+        n.startswith(("data_models/", "session_manager.py")) for n in wheel_names
+    ), f"wheel puts package modules at site-packages root: {wheel_names}"
+
+
+def test_the_container_holds_exactly_one_project(tmp_path):
+    """`--output-dir` is a container, so a second compile must not mix in.
+
+    The generated package name embeds the device *and* OS version, so
+    recompiling the same device after an upgrade would leave
+    `srl_0_0_0/` next to `srl_25_10_1/`. Every consumer then has to pick one,
+    and a stale tree on `sys.path` is the wrong device's models. Refusing is
+    the documented behaviour (the tree is in gitignored `temp/`, where a
+    previous compile is not automatically garbage).
+    """
+    yang = tmp_path / "tstale.yang"
+    yang.write_text(MINIMAL_YANG)
+
+    out, _ = _gen(tmp_path, "netconf", MINIMAL_YANG, "tstale")
+    assert (out / "tstale_0_0_0").is_dir(), sorted(p.name for p in out.iterdir())
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tstale",
+            "--device-version",
+            "9.9",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode != 0, "a second project in one container was accepted"
+    assert "refusing to generate" in proc.stderr, proc.stderr[-800:]
+    assert "tstale_0_0_0/" in proc.stderr, proc.stderr[-800:]
+    # Nothing was written for the refused run.
+    assert not (out / "tstale_9_9").exists()
+    assert sorted(p.name for p in out.iterdir()) == ["tstale_0_0_0"]
+
+
+def test_a_legacy_flat_output_dir_is_refused(tmp_path):
+    """The pre-`src/` layout must be refused, not silently mixed with.
+
+    A container that still holds `__init__.py`/`data_models/` at its root is a
+    compile from before the layout change. Writing the new project next to it
+    would leave two importable trees again -- the duplication this change
+    removed -- and `import <container>` would resolve as an empty namespace
+    package, which is worse than an error.
+    """
+    yang = tmp_path / "tlegacy.yang"
+    yang.write_text(MINIMAL_YANG)
+    out = tmp_path / "legacy"
+    (out / "data_models").mkdir(parents=True)
+    (out / "__init__.py").write_text("")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tlegacy",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode != 0, "a legacy flat output dir was accepted"
+    assert "legacy flat copy: __init__.py" in proc.stderr, proc.stderr[-800:]
+    assert not (out / "tlegacy_0_0_0").exists()
+
+
+def test_consumers_resolve_container_project_and_package(tmp_path):
+    """Every shape an operator has to hand resolves to the one package.
+
+    `sdk-verify --client-dir` and the lab fixtures accept the container (the
+    default), the project (what `uv add` takes) and the package itself. Two
+    projects in one container is ambiguous, and guessing would verify the wrong
+    device.
+    """
+    out, _ = _gen(tmp_path, "netconf", MINIMAL_YANG, "tresolve")
+    project = _project(out)
+    package = _package(out)
+
+    for candidate in (out, project, package):
+        assert layout.resolve_package(candidate) == package, candidate
+
+    with pytest.raises(LookupError):
+        layout.resolve_package(tmp_path / "does-not-exist")
+
+    # A second *package* makes the container ambiguous.
+    other = out / "tresolve_9_9"
+    (other / "src" / "tresolve_9_9").mkdir(parents=True)
+    (other / "src" / "tresolve_9_9" / "__init__.py").write_text("")
+    (other / "pyproject.toml").write_text('[project]\nname = "tresolve_9_9"\n')
+    with pytest.raises(LookupError) as exc:
+        layout.resolve_package(out)
+    assert "exactly one" in str(exc.value), str(exc.value)
 
 
 # --- yang2sdk CLI: root picking ---------------------------------------------
@@ -5850,8 +6049,11 @@ def test_yang2sdk_roots_resolves_names_to_files(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert (tmp_path / "out" / "__init__.py").is_file()
-    assert (tmp_path / "out" / "data_models").is_dir()
+    out = tmp_path / "out"
+    assert (out / "pickerok_1_0" / "pyproject.toml").is_file(), sorted(
+        p.name for p in out.iterdir()
+    )
+    assert (out / "pickerok_1_0" / "src" / "pickerok_1_0" / "data_models").is_dir()
 
 
 def test_yang2sdk_rejects_an_unknown_root_name(tmp_path):
@@ -5958,5 +6160,210 @@ def test_ignore_error_re_enables_generation(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr[-1000:]
-    assert (out / "__init__.py").is_file()
-    assert (out / "data_models").is_dir()
+    assert _pkg_file(out, "__init__.py").is_file()
+    assert _pkg_file(out, "data_models").is_dir()
+
+
+# G30's `coriant-rpc` carries this construct verbatim on the `san` leaf of
+# `cert-gen/input`: a negative lookahead. `pattern` is an XML Schema regular
+# expression (RFC 7950 Sec 9.4.5), and the XSD grammar has no lookaround, so
+# pyang's libxml2 engine rejects the whole model. Python's `re` accepts it, which
+# is why the generated client can still carry the constraint -- but only if the
+# operator opts in with `--ignore-error PATTERN_ERROR`.
+LOOKAHEAD_PATTERN_YANG = """module tpat {
+  prefix tp;
+  namespace "urn:test:tpat";
+  revision 2026-01-01;
+  container top {
+    leaf san {
+      type string {
+        // Single quotes: a double-quoted YANG string would additionally earn an
+        // ILLEGAL_ESCAPE_WARN for "\\-" and "\\." (RFC 7950 Sec 6.1.3).
+        pattern '(IP:|DNS:)(?!x)[A-Za-z0-9\\-\\.:]+';
+      }
+    }
+  }
+}
+"""
+
+# `\\p{IsBasicLatin}` is valid XML Schema and invalid Python: `re` has no
+# `\\p{..}` class, and `_convert_yang_regex` maps only the general categories
+# (\\p{L}, \\p{N}, ...). pyang/libxml2 accept this model.
+XML_SCHEMA_ONLY_PATTERN_YANG = """module txpat {
+  prefix tx;
+  namespace "urn:test:txpat";
+  revision 2026-01-01;
+  container top {
+    leaf block {
+      type string {
+        pattern '\\p{IsBasicLatin}+';
+      }
+    }
+  }
+}
+"""
+
+
+def _compile_one_module(
+    tmp_path, module: str, source: str, protocol: str = "netconf", *extra: str
+):
+    """Compile a one-module tree through the same CLI seam as the tests above."""
+    yang = tmp_path / f"{module}.yang"
+    yang.write_text(source)
+    out = tmp_path / f"{module}_{protocol}_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler(sys.argv[1], sys.argv[2:])"
+            ),
+            protocol,
+            str(yang),
+            "--device",
+            module,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+            *extra,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    return proc, out
+
+
+def test_pattern_error_explains_the_xsd_grammar_and_the_escape_hatch(tmp_path):
+    """A lookahead pattern must be refused with a reason, not with libxml2's.
+
+    The vendor's own error names a facet on a synthetic schema at "line 6" and
+    says nothing about which construct is illegal or what to do. The refusal has
+    to carry the RFC, the reason (`(?!...)` has no XSD equivalent), and the exact
+    flag -- measured on G30's `coriant-rpc@2021-01-20.yang:533`.
+    """
+    proc, out = _compile_one_module(tmp_path, "tpat", LOOKAHEAD_PATTERN_YANG)
+
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "PATTERN_ERROR" in proc.stderr
+    assert "RFC 7950 Sec 9.4.5" in proc.stderr, "the refusal must cite the RFC"
+    assert "hint:" in proc.stderr
+    assert "--ignore-error PATTERN_ERROR" in proc.stderr
+    assert "Generated" not in proc.stdout, "a refused compile must not announce output"
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+def test_pattern_error_escape_hatch_keeps_the_constraint(tmp_path):
+    """`--ignore-error PATTERN_ERROR` must not silently drop the pattern.
+
+    pyang only skips *printing* the error; it never builds a pattern spec, so a
+    client that read the pattern from `i_type_spec` would lose the constraint.
+    The IR reads the `pattern` statement instead, so the emitted validator must
+    still contain the vendor's expression -- and be compilable by `re` (the
+    emitter now proves that before writing, so this also pins the anchor wrapper
+    and the quoting of the emitted literal).
+    """
+    proc, out = _compile_one_module(
+        tmp_path,
+        "tpat",
+        LOOKAHEAD_PATTERN_YANG,
+        "netconf",
+        "--ignore-error",
+        "PATTERN_ERROR",
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert "Generated" in proc.stdout
+    model = _pkg_file(out, "data_models", "tpat.py")
+    assert model.is_file(), sorted(out.rglob("*.py"))
+    tree = ast.parse(model.read_text(encoding="utf-8"))
+    emitted = [
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "check_pattern"
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ]
+    assert len(emitted) == 1, emitted
+    assert "(?!" in emitted[0], f"the vendor constraint was dropped: {emitted}"
+    re.compile(emitted[0])  # raises re.error if the anchor wrapper is wrong
+
+
+@pytest.mark.parametrize("protocol", ["netconf", "restconf"])
+def test_untranslatable_pattern_is_refused_instead_of_shipping_a_late_crash(
+    tmp_path, protocol
+):
+    """A pattern `re` cannot compile must fail here, not in the caller's project.
+
+    Measured before this guard: this exact module generated successfully, the
+    package imported cleanly, and `Top(block="abc")` raised
+    `re.error: bad escape \\p at position 4` from generated code -- because
+    `check_pattern` compiles the regex when a value is assigned, not when the
+    module is imported. pyang accepts the model (`\\p{IsBasicLatin}` is valid XML
+    Schema), so the PATTERN_ERROR path never sees it.
+
+    Both protocols are checked: each `emit()` builds its own IR list, so a guard
+    wired into only one of them would leave the other shipping the crash.
+    """
+    proc, out = _compile_one_module(
+        tmp_path, "txpat", XML_SCHEMA_ONLY_PATTERN_YANG, protocol
+    )
+
+    assert "syntax error in pattern" not in proc.stderr, (
+        "pyang must accept this pattern, or the test proves nothing about the "
+        f"emitter's own guard: {proc.stderr[-800:]}"
+    )
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "cannot be expressed as a Python regular expression" in proc.stderr
+    assert "txpat:block" in proc.stderr, "the refusal must name the leaf"
+    assert "bad escape" in proc.stderr
+    assert "Generated" not in proc.stdout
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+DEVIATION_FOR_XML_SCHEMA_ONLY_PATTERN_YANG = """module txpatdev {
+  prefix txd;
+  namespace "urn:test:txpatdev";
+  import txpat { prefix txpat; }
+  revision 2026-01-01;
+  deviation "/txpat:top/txpat:block" {
+    deviate replace {
+      type string {
+        pattern '[A-Za-z]+';
+      }
+    }
+  }
+}
+"""
+
+
+def test_a_deviation_module_is_the_documented_way_out_of_a_pattern(tmp_path):
+    """The refusal's advice must actually work, not just sound plausible.
+
+    `deviate replace` rewrites the `type` statement and the IR reads the
+    deviated statement, so the client generates with the replacement pattern --
+    which is why the refusal can name `--deviation-module` instead of only
+    telling the operator to edit a vendor model they do not own.
+    """
+    deviation = tmp_path / "txpatdev.yang"
+    deviation.write_text(DEVIATION_FOR_XML_SCHEMA_ONLY_PATTERN_YANG)
+    proc, out = _compile_one_module(
+        tmp_path,
+        "txpat",
+        XML_SCHEMA_ONLY_PATTERN_YANG,
+        "netconf",
+        "--deviation-module",
+        str(deviation),
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert "Generated" in proc.stdout
+    model = _pkg_file(out, "data_models", "txpat.py").read_text(encoding="utf-8")
+    assert "check_pattern('^(?:[A-Za-z]+)$'" in model, model[:1000]
+    assert "IsBasicLatin" not in model

@@ -1,0 +1,146 @@
+"""Where a generated client lives on disk -- stated once, for both directions.
+
+The emitter writes the tree; ``sdk-verify`` and the test harness read it back.
+Those two sides have to agree, so the layout is defined here and imported by
+both rather than recomputed from ambient knowledge on each side. ``core.py``
+runs inside pyang, and ``cli.sdk_verify`` loads ``.env`` at import time, so
+neither is a sensible place for the other to import from.
+
+The layout::
+
+    <output_dir>/<package_name>/                       # the installable project
+        pyproject.toml                                 #   uv add <this dir>
+        README.md
+        MANIFEST.yang-revisions.json
+        src/<package_name>/                            # the importable package
+            __init__.py  session_manager.py  py.typed
+            data_models/  data_navigators/
+
+``--output-dir`` is a *container* for exactly one project, not the package.
+One copy of the code, on disk and in the sdist.
+
+Earlier the same modules were emitted twice: flat at ``<output_dir>`` (so the
+lab harness could ``import temp.<proto>_clients.<device>``) and again at
+``<output_dir>/<package_name>`` (so pip could install it). Two trees could
+drift, the sdist needed a hand-written exclude to ship one, and the generated
+README's install line -- ``uv add path/to/<package_name>`` -- pointed at a
+directory holding no ``pyproject.toml``: measured, ``uv build`` refused it with
+"does not appear to be a Python project".
+
+``src/`` is not decoration. Hatchling cannot package a project whose modules
+sit in its own root: ``packages = ["."]`` yields a wheel of ``./__init__.py``
+and ``./data_models/``, which installs those straight into ``site-packages`` --
+no ``import <package_name>`` at all, plus a ``data_models`` package colliding
+with every other generated client. Measured with ``uv build`` +
+``uv pip install --target``. One nesting level is the minimum; ``src/`` states
+it explicitly.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+#: Marker that identifies an installable project inside a container.
+PROJECT_MARKER = "pyproject.toml"
+#: Entries only a pre-``src/`` (flat) compile leaves in the container.
+LEGACY_ENTRIES = ("__init__.py", "session_manager.py", "data_models", "py.typed")
+
+
+def sanitize_package_name(name: str) -> str:
+    """Make ``<device>_<version>`` importable: ``[A-Za-z0-9_]``, leading alnum."""
+    pkg = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not pkg or not (pkg[0].isalpha() or pkg[0] == "_"):
+        pkg = f"pkg_{pkg}"
+    return pkg
+
+
+def package_name(device: str, device_version: str) -> str:
+    """The distribution name: ``<device>_<device-version>``, sanitized."""
+    device = device or "device"
+    device_version = device_version or "0.0.0"
+    return sanitize_package_name(
+        f"{device}_{device_version}".replace(".", "_").replace("-", "_")
+    )
+
+
+def package_dirs(output_dir: str | Path, pkg_name: str) -> tuple[Path, Path]:
+    """Return ``(project_dir, package_dir)`` inside ``output_dir``."""
+    project_dir = Path(output_dir) / pkg_name
+    return project_dir, project_dir / "src" / pkg_name
+
+
+def stale_entries(output_dir: str | Path, pkg_name: str) -> tuple[list[str], list[str]]:
+    """Return ``(stale_projects, legacy_entries)`` blocking a clean compile.
+
+    ``output_dir`` is a container for one project, so a second one makes every
+    consumer's "find the package" step ambiguous -- and the stale tree is a
+    *different* device or OS version, silently shadowing the fresh one on
+    ``sys.path``. Deleting it is not this tool's call: ``temp/`` is gitignored
+    and holds uncommitted work often enough that a ``rmtree`` is the wrong
+    default. Name what is in the way instead.
+    """
+    root = Path(output_dir)
+    if not root.is_dir():
+        return [], []
+    stale = sorted(
+        p.name
+        for p in root.iterdir()
+        if p.is_dir() and (p / PROJECT_MARKER).is_file() and p.name != pkg_name
+    )
+    legacy = sorted(name for name in LEGACY_ENTRIES if (root / name).exists())
+    return stale, legacy
+
+
+def resolve_package(path: str | Path) -> Path:
+    """Find the importable package under a generated client tree.
+
+    ``path`` may name any of the three things an operator has to hand: the
+    container (``temp/netconf_clients/g30``), the project
+    (``.../g30/g30_4_8_0``), or the package itself
+    (``.../g30_4_8_0/src/g30_4_8_0``).
+
+    Exactly one package is accepted. Two projects in one container means a
+    compile for a different device version sits next to the fresh one, and
+    importing whichever ``glob`` returned first would verify the wrong device
+    and report it as a pass.
+
+    Raises ``LookupError`` with a message naming what was found; callers turn
+    that into their own exit/report style.
+    """
+    root = Path(path)
+    if not root.is_dir():
+        raise LookupError(f"no such directory: {root}")
+    # The package itself. This also matches a client generated by the previous
+    # layout, whose container *was* the package: importable either way, so
+    # there is nothing to resolve.
+    if (root / "__init__.py").is_file():
+        return root
+    projects = (
+        [root]
+        if (root / PROJECT_MARKER).is_file()
+        else [p for p in sorted(root.iterdir()) if (p / PROJECT_MARKER).is_file()]
+    )
+    packages = [
+        found.parent
+        for project in projects
+        for found in sorted((project / "src").glob("*/__init__.py"))
+    ]
+    if len(packages) == 1:
+        return packages[0]
+    if len(projects) == 1 and not packages:
+        # Layout drift: a project that is not src/-shaped. Accept the
+        # `<project>/<package>` spelling, but never `src/` itself.
+        packages = [
+            found.parent
+            for found in sorted(projects[0].glob("*/__init__.py"))
+            if found.parent.name != "src"
+        ]
+        if len(packages) == 1:
+            return packages[0]
+    raise LookupError(
+        f"cannot locate exactly one generated client package under {root} "
+        f"(found {len(projects)} project(s), {len(packages)} package(s)); "
+        "expected <dir>/<package>/src/<package>/ -- remove stale output from a "
+        "previous compile for another device version, or point at the project"
+    )

@@ -7,6 +7,51 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Changed
+
+- **A generated client is now emitted once, as one installable project, instead
+  of twice.** The tree is `<output-dir>/<device>_<os-version>/` (the project:
+  `pyproject.toml`, `README.md`, `MANIFEST.yang-revisions.json`) with the
+  importable package at `<project>/src/<device>_<os-version>/`. Before, the same
+  modules were written flat at `--output-dir` (so the lab harness could
+  `import temp.<proto>_clients.<device>`) and copied again into
+  `<output-dir>/<device>_<os-version>/` (so pip could install it): two trees
+  that could drift, an sdist that needed a hand-written exclude to ship one,
+  and a generated README whose install line `uv add path/to/<package_name>`
+  named a directory with no `pyproject.toml` — measured, `uv build` refused it
+  with "does not appear to be a Python project". Consumers that imported the
+  flat copy (`sdk-verify`, the lab fixtures, `--check-model-gaps`) now resolve
+  the package through `yang2sdk.layout`, which accepts the container, the
+  project or the package itself. Two consequences are deliberate:
+  `--output-dir` is a **container for exactly one** client, so a compile that
+  finds a different package (or a pre-`src/` flat copy) already there is
+  refused with a message naming it rather than deleted — and a recompile drops
+  a previous run's `data_models/`/`data_navigators/` module files, so an orphan
+  model cannot ship in the wheel. The generated README's install line is now
+  true as written.
+
+### Fixed
+
+- **An invalid XML-Schema `pattern` now explains itself, and a pattern Python
+  cannot compile fails generation instead of the caller's first assignment.**
+  `yang2sdk --protocol netconf --device g30` refused the entire client with
+  libxml2's `syntax error in pattern … line 6` and nothing else: G30's
+  `coriant-rpc@2021-01-20.yang:533` ships a negative lookahead, which XML Schema
+  regular expressions do not have (RFC 7950 §9.4.5), so pyang rejects the model
+  even though Python's `re` accepts the expression. The refusal now states the
+  cause and names the escape hatch, and `--ignore-error PATTERN_ERROR` keeps the
+  constraint rather than dropping it — the IR reads the `pattern` statement
+  itself, not pyang's aborted type spec. The same walk now compiles every
+  pattern before anything is written: `\p{IsBasicLatin}` / `\i` / `\c` are valid
+  XML Schema and invalid Python, and previously produced a client that
+  generated, installed and imported cleanly and then raised `re.error` on the
+  first value assigned to the leaf — in the consumer's project, from generated
+  code. Such a model is refused up front, naming the module:leaf and pointing at
+  a deviation module (RFC 7950 §7.20.3). Pinned by four tests: the refusal
+  cites the RFC and the flag, the opt-out keeps the emitted pattern (and it
+  compiles), both protocols refuse an untranslatable pattern, and the suggested
+  `deviate replace` actually generates the client.
+
 ## [2026.10.22] - 2026-10-22
 
 ### Fixed

@@ -49,6 +49,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from yang2sdk import layout
 from yang2sdk.cli.features import read_features_file, to_pyang_args
 
 #: Introspection runs in its own interpreter: importing a generated package
@@ -310,13 +311,23 @@ def compile_variant(
 def introspect(
     out_dir: Path, *, max_depth: int = 64, max_paths: int = 200000
 ) -> Surface:
-    """Import the generated package in a subprocess and return its surface."""
+    """Import the generated package in a subprocess and return its surface.
+
+    ``out_dir`` is whatever the caller has: the compile container, the
+    project, or the package itself. The layout lives in `yang2sdk.layout`, and
+    the subprocess gets the resolved package so `INSPECT_SOURCE` needs no
+    knowledge of it.
+    """
+    try:
+        package_dir = layout.resolve_package(out_dir)
+    except LookupError as exc:
+        raise ModelGapsError(f"introspect ({out_dir.name}): {exc}") from exc
     proc = _run(
         [
             sys.executable,
             "-c",
             INSPECT_SOURCE,
-            str(out_dir),
+            str(package_dir),
             str(max_depth),
             str(max_paths),
         ],

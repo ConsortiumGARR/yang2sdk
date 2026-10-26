@@ -211,6 +211,10 @@ class IRBuilder:
         self.enum_registry = {}
         self.uses_refs = {}
         self._synth_prefixes: dict[str, str] = {}
+        #: Patterns that `re` cannot compile after `_convert_yang_regex`, already
+        #: formatted with their YANG position. Non-empty means "refuse to write
+        #: a client": see `_pattern_validators`.
+        self.pattern_errors: list[str] = []
 
         ns = module.search_one("namespace")
 
@@ -817,10 +821,9 @@ class IRBuilder:
             type_str, constraints = self._get_leaf_type(stmt)
             is_identityref = constraints.pop("_identityref", False)
             if "_patterns" in constraints:
-                validators = [
-                    f"AfterValidator(lambda v: check_pattern({f'^(?:{self._convert_yang_regex(p)})$'!r}, v))"
-                    for p in constraints.pop("_patterns")
-                ]
+                validators = self._pattern_validators(
+                    constraints.pop("_patterns"), stmt
+                )
                 type_str = f"Annotated[{type_str}, {', '.join(validators)}]"
             # State (config false) leaves are device-generated; a
             # get/get-config response may legitimately omit them (e.g. an
@@ -841,10 +844,9 @@ class IRBuilder:
             if inner:
                 item_type = f"Annotated[{item_type}, Field({', '.join(inner)})]"
             if "_patterns" in constraints:
-                validators = [
-                    f"AfterValidator(lambda v: check_pattern({f'^(?:{self._convert_yang_regex(p)})$'!r}, v))"
-                    for p in constraints.pop("_patterns")
-                ]
+                validators = self._pattern_validators(
+                    constraints.pop("_patterns"), stmt
+                )
                 item_type = f"Annotated[{item_type}, {', '.join(validators)}]"
 
             type_str = (
@@ -936,6 +938,47 @@ class IRBuilder:
             )
 
         return IRField(name=field_name, type_str=field_def, assignment=assign)
+
+    def _pattern_validators(self, patterns: list[str], stmt) -> list[str]:
+        """Render YANG ``pattern`` arguments as ``AfterValidator`` expressions.
+
+        The pattern is read from the statement itself, not from pyang's
+        compiled type spec, so it survives ``PATTERN_ERROR`` (a model pyang
+        rejects, reachable only with ``--ignore-error``). Dropping the
+        constraint there would be the silent fidelity loss the flag exists to
+        avoid.
+
+        That makes this the one place where an arbitrary vendor regex becomes
+        Python source, so it is also the place that proves Python can compile
+        it. ``check_pattern`` calls ``re.match`` when a value is *assigned*, not
+        when the module is imported, so an untranslatable pattern used to
+        produce a client that generated, installed and imported cleanly and
+        then raised ``re.error`` on the first caller that set the leaf -- in
+        their project, not here. XML Schema regular expressions (RFC 7950
+        Sec 9.4.5 defers to them) allow constructs ``re`` cannot express,
+        e.g. ``\\p{IsBasicLatin}``, ``\\i`` and ``\\c``;
+        ``_convert_yang_regex`` maps only a subset of the ``\\p{..}`` forms.
+        Anything left over is reported through ``self.pattern_errors`` and
+        refused by the emitter.
+        """
+        validators: list[str] = []
+        for pattern in patterns:
+            anchored = f"^(?:{self._convert_yang_regex(pattern)})$"
+            try:
+                re.compile(anchored)
+            except re.error as exc:
+                pos = getattr(stmt, "pos", None)
+                where = f"{getattr(pos, 'ref', '?')}:{getattr(pos, 'line', '?')}"
+                self.pattern_errors.append(
+                    f"{where}: {self.module.arg}:{getattr(stmt, 'arg', '?')}: "
+                    f"pattern {pattern!r} is not a Python regular expression "
+                    f"after translation ({exc})"
+                )
+                continue
+            validators.append(
+                f"AfterValidator(lambda v: check_pattern({anchored!r}, v))"
+            )
+        return validators
 
     def _convert_yang_regex(self, pattern: str) -> str:
         """

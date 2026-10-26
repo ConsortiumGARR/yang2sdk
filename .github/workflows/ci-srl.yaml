@@ -140,9 +140,13 @@ jobs:
           uv run yang2sdk --protocol netconf \
             --roots srl_nokia-system,srl_nokia-interfaces \
             --device srl \
+            --device-version 25.10.1 \
             --yang-dir temp/yang_modules/srl \
             --output-dir temp/netconf_clients/srl
-          test -f temp/netconf_clients/srl/__init__.py
+          # One copy, in the installable project the generated README names
+          # (tests/srl/PINNED.md pins the image tag this version comes from).
+          test -f temp/netconf_clients/srl/srl_25_10_1/pyproject.toml
+          test -f temp/netconf_clients/srl/srl_25_10_1/src/srl_25_10_1/__init__.py
 
       - name: SR Linux NETCONF suite
         # NON-BLOCKING on purpose. Everything above must pass for this step to

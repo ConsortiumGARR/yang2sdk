@@ -83,25 +83,28 @@ uv run pyang -p temp/yang_modules/<device>/ -f tree \
 
 ## What you get
 
-Each compile emits a self-contained package at
-`temp/<protocol>_clients/<device>_<os-version>/`:
+Each compile emits one self-contained, installable project per device **and**
+OS version, inside the `--output-dir` container:
 
 ```text
-<device>_<os-version>/
-  __init__.py                  # RestconfClient / NetconfClient
-  session_manager.py           # transport and credentials
-  data_models/
-  data_navigators/             # client.data.<module>_<node>(...)
-  pyproject.toml
-  README.md
-  MANIFEST.yang-revisions.json
-  py.typed
+temp/<protocol>_clients/<device>/          # container: holds one project
+└── <device>_<os-version>/                 # the project: `uv add` this
+    ├── pyproject.toml                     # name/version/deps (hatchling, src layout)
+    ├── README.md                          # device, OS version, YANG revisions
+    ├── MANIFEST.yang-revisions.json       # provenance: modules, features, deviations
+    └── src/<device>_<os-version>/         # the importable package
+        ├── __init__.py                    # RestconfClient / NetconfClient
+        ├── session_manager.py             # transport and credentials
+        ├── data_models/
+        ├── data_navigators/               # client.data.<module>_<node>(...)
+        └── py.typed
 ```
 
-Install it like any other dependency:
+One copy of the code, on disk and in the sdist. Install it like any other
+dependency:
 
 ```bash
-uv add path/to/temp/restconf_clients/<device>_<os-version>
+uv add path/to/temp/restconf_clients/<device>/<device>_<os-version>
 ```
 
 ```python

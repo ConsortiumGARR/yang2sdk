@@ -42,6 +42,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from yang2sdk import layout
+
 # NETCONF needs ncclient/lxml/pydantic-xml; both transports need `requests`.
 # These live in the `lab` extra, matching yang-downloader and the tester that
 # sdk-verify replaces. Probed rather than imported: the generated NETCONF client
@@ -943,12 +945,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_client_package(path: Path) -> Path:
+    """Locate the importable package for ``--client-dir``.
+
+    ``--client-dir`` (default ``temp/<proto>_clients/<device>``) may name the
+    container, the installable project, or the package itself; the layout
+    itself is defined once in `yang2sdk.layout`. Here we only translate its
+    refusal into this tool's exit style.
+    """
+    try:
+        return layout.resolve_package(path)
+    except LookupError as exc:
+        raise SystemExit(f"sdk-verify: {exc}") from exc
+
+
 def _import_client(client_dir: Path, protocol: str) -> tuple[Any, str]:
-    # --protocol both runs two clients in one process, and both are packages named
-    # after the device (temp/restconf_clients/g30 and temp/netconf_clients/g30).
-    # A plain importlib.import_module(client_dir.name) would hand the second
-    # protocol the *first* module from sys.modules, silently validating the
-    # RESTCONF client twice. Import under a unique per-protocol name instead.
+    # --protocol both runs two clients in one process, and both are packages
+    # generated for the same device (temp/restconf_clients/g30 and
+    # temp/netconf_clients/g30). A plain importlib.import_module(client_dir.name)
+    # would hand the second protocol the *first* module from sys.modules,
+    # silently validating the RESTCONF client twice. Import under a unique
+    # per-protocol name instead.
     # The name is also returned so --debug can find the client's loggers: every
     # generated module logs under this dotted prefix.
     name = f"_sdkverify_{protocol}_{client_dir.name}"
@@ -1095,17 +1112,15 @@ def run_protocol(
     passphrase: str | None = None,
 ) -> Report:
     client_dir = Path(args.client_dir or f"temp/{protocol}_clients/{args.device}")
-    if not (client_dir / "__init__.py").exists():
-        raise SystemExit(
-            f"sdk-verify: no generated {protocol} client at {client_dir}. "
-            f"Run 'uv run yang2{protocol} <root.yang> ...' first."
-        )
-    module, stub = _import_client(client_dir, protocol)
+    package_dir = _resolve_client_package(client_dir)
+    module, stub = _import_client(package_dir, protocol)
     cls = getattr(
         module, "RestconfClient" if protocol == "restconf" else "NetconfClient", None
     )
     if cls is None:
-        raise SystemExit(f"sdk-verify: {client_dir} exposes no {protocol} client class")
+        raise SystemExit(
+            f"sdk-verify: {package_dir} exposes no {protocol} client class"
+        )
 
     host = os.environ.get("DEVICE_IP")
     if not host:
@@ -1178,7 +1193,7 @@ def run_protocol(
         # Connection context without secrets: which client, where it points,
         # and what will run. Never log username or password here (AGENTS.md:
         # no creds in output).
-        where = f"client={client_dir}"
+        where = f"client={package_dir}"
         if protocol == "restconf":
             where += f" base={args.restconf_scheme}://{host}:{port}/restconf"
         else:

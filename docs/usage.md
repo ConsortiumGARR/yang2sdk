@@ -26,8 +26,10 @@ uv run yang2sdk --protocol netconf --device <device> --roots ietf-interfaces,iet
 | `--feature mod:feat` | enable a feature (repeatable); unions with the device set, never narrows it |
 | `--features-file` | feature set JSON; defaults to `<yang-dir>/features.json` when present |
 | `--no-device-features` | ignore the device feature set and use pyang defaults |
-| `--ignore-error TAG` | downgrade a pyang error tag (repeatable), e.g. `XPATH_SYNTAX_ERROR` |
+| `--ignore-error TAG` | downgrade a pyang error tag (repeatable), e.g. `XPATH_SYNTAX_ERROR`, `PATTERN_ERROR` |
 | `--check-model-gaps` | report device data nodes the model lacks (NETCONF only; exits non-zero on gaps) |
+
+`PATTERN_ERROR` is worth knowing by name. A YANG `pattern` is an XML Schema regular expression (RFC 7950 §9.4.5), so the XSD engine pyang validates with rejects Python-only constructs such as a negative lookahead (`(?!...)`) — which a vendor model may still contain. `--ignore-error PATTERN_ERROR` accepts the model and **keeps** the constraint: the pattern is read from the `pattern` statement itself, not from pyang's aborted type spec, so the emitted validator still carries it. A pattern Python's `re` cannot express either (`\p{IsBasicLatin}`, `\i`, `\c`) is refused instead of emitted, because the validator runs when a value is assigned, not when the module is imported; replace it through a deviation module (RFC 7950 §7.20.3).
 
 Without a flag, the compiler picks up `<yang-dir>/features.json` automatically (written by `yang-downloader` from the `<hello>` capability set, RFC 6241 §8.3, newest revision per module per RFC 6022 §3.1.2). Keep that default: pyang otherwise assumes every `if-feature` is on and prunes subtrees the device implements, and the strict models (`extra="forbid"`) then reject real device data. `--feature` unions on purpose — narrowing produces a silently wrong model.
 
@@ -110,10 +112,25 @@ client.data.ietf_interfaces_interface("ethernet-1/1").reset(delay=3)
 
 ## Generated package
 
-Each compile emits a self-contained, installable package: client, models, navigators, own `pyproject.toml`, README (device, OS version, source YANG revisions, protocol), deviations/features provenance (`MANIFEST.yang-revisions.json`), and `py.typed`. No `sdk-verify`, no `.env`, no logs, no secrets.
+Each compile emits a self-contained, installable project per device *and* OS version: client, models, navigators, own `pyproject.toml`, README (device, OS version, source YANG revisions, protocol), deviations/features provenance (`MANIFEST.yang-revisions.json`), and `py.typed`. No `sdk-verify`, no `.env`, no logs, no secrets.
+
+`--output-dir` is a **container** holding exactly one project; the project is
+the directory named after the package, and the importable package sits under
+`src/` (the layout this repo uses for itself):
+
+```text
+temp/netconf_clients/<device>/          # --output-dir (container)
+└── <device>_<os-version>/              # project: pyproject.toml, README, MANIFEST
+    └── src/<device>_<os-version>/      # package: import <device>_<os_version>
+```
+
+There is one copy of the code, on disk and in the sdist. A container that
+already holds a *different* package (a previous compile for another OS
+version) is refused rather than mixed into, and so is a directory from the
+pre-`src/` layout: both would put two importable trees in one place.
 
 ```bash
-uv add path/to/temp/netconf_clients/<device>_<os-version>   # or --editable
+uv add path/to/temp/netconf_clients/<device>/<device>_<os-version>   # or --editable
 ```
 
 ### Scaling to production (HAL)
@@ -143,17 +160,19 @@ multi_vendor_automation_project/
         ├── pyproject.toml
         ├── README.md
         ├── MANIFEST.yang-revisions.json
-        ├── py.typed
-        ├── __init__.py
-        ├── session_manager.py
-        ├── data_models/
-        │   ├── __init__.py
-        │   ├── _base.py
-        │   └── models.py
-        └── data_navigators/
-            ├── __init__.py
-            ├── _base.py
-            └── navigators.py
+        └── src/
+            └── <device>_<os-version>/
+                ├── py.typed
+                ├── __init__.py
+                ├── session_manager.py
+                ├── data_models/
+                │   ├── __init__.py
+                │   ├── _base.py
+                │   └── models.py
+                └── data_navigators/
+                    ├── __init__.py
+                    ├── _base.py
+                    └── navigators.py
 ```
 
 One package per device *and* OS version.

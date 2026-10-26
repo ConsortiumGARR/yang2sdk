@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from tests.srl.lab import lab_connection
+from yang2sdk import layout
 
 pytestmark = pytest.mark.integration
 
@@ -79,10 +80,21 @@ def clean_candidate():
         pass
 
 
+def _srl_package() -> Path:
+    """The generated SRL package, with `src/` on `sys.path`. Skips if absent."""
+    try:
+        package = layout.resolve_package(CLIENTS / "srl")
+    except LookupError:
+        pytest.skip("generated SRL client not found in temp/netconf_clients")
+    if str(package.parent) not in sys.path:
+        sys.path.insert(0, str(package.parent))
+    return package
+
+
 def _fresh_client():
     """A client for teardown/repair paths; never logged, never printed."""
     host, port, user, password = lab_connection()
-    client = importlib.import_module("srl").NetconfClient(
+    client = importlib.import_module(_srl_package().name).NetconfClient(
         management_ip=host,
         port=port,
         username=user,
@@ -96,8 +108,7 @@ def _fresh_client():
 
 @pytest.fixture(scope="module")
 def srl_client():
-    if not (CLIENTS / "srl" / "__init__.py").is_file():
-        pytest.skip("generated SRL client not found in temp/netconf_clients")
+    package = _srl_package()
     host, port, user, password = lab_connection()
     if not (user and password):
         pytest.skip(
@@ -106,9 +117,7 @@ def srl_client():
     if not _reachable(host, port):
         pytest.skip("SR Linux lab is not reachable on its NETCONF port")
 
-    if str(CLIENTS) not in sys.path:
-        sys.path.insert(0, str(CLIENTS))
-    pkg = importlib.import_module("srl")
+    pkg = importlib.import_module(package.name)
     client = pkg.NetconfClient(
         management_ip=host,
         port=port,
@@ -153,10 +162,12 @@ def test_all_navigator_references_resolve():
     import ast
 
     client_dir = CLIENTS / "srl"
-    if not (client_dir / "__init__.py").is_file():
+    try:
+        package = layout.resolve_package(client_dir)
+    except LookupError:
         pytest.skip("generated SRL client not found in temp/netconf_clients")
-    nav_dir = client_dir / "data_navigators"
-    models_dir = client_dir / "data_models"
+    nav_dir = package / "data_navigators"
+    models_dir = package / "data_models"
 
     def defined_classes(path: Path) -> set[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -498,7 +509,7 @@ def test_throwaway_interface_crud(srl_client):
     if target is None:
         pytest.skip("no generated interfaces list navigator")
 
-    model_cls = _model_for("srl", target)
+    model_cls = _model_for(_srl_package().name, target)
     payload: dict[str, object] = {"name": TEST_INTERFACE}
     for field, value in (("admin_state", "enable"), ("description", "yang2sdk-crud")):
         if field in model_cls.model_fields:

@@ -23,6 +23,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
 from pyang import plugin
 
+from yang2sdk import layout
 from yang2sdk.plugin.src.ir import IRBuilder
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -104,11 +105,62 @@ def _add_sdk_options_once(optparser) -> None:
     g.add_options(missing)
 
 
-def _sanitize_pkg(name: str) -> str:
-    pkg = re.sub(r"[^A-Za-z0-9_]", "_", name)
-    if not pkg or not (pkg[0].isalpha() or pkg[0] == "_"):
-        pkg = f"pkg_{pkg}"
-    return pkg
+def _package_name(ctx) -> str:
+    """The installable distribution name: ``<device>_<device-version>``."""
+    return layout.package_name(
+        getattr(ctx.opts, "sdk_device", ""),
+        getattr(ctx.opts, "sdk_device_version", ""),
+    )
+
+
+def _package_dirs(output_dir: str, pkg_name: str) -> tuple[Path, Path]:
+    """``(project_dir, package_dir)``; see `yang2sdk.layout` for the layout."""
+    return layout.package_dirs(output_dir, pkg_name)
+
+
+def _reset_package_dir(package_dir: Path) -> None:
+    """Create the package dir, dropping a previous compile's modules first.
+
+    The old two-copy emitter rebuilt the *published* copy from scratch on every
+    run (``rmtree`` + ``copytree``), so a recompile with fewer roots could not
+    leave an orphan ``data_models/<removed-root>.py`` behind. The tree is now
+    written in place, so that guarantee has to be kept explicitly: an orphan
+    module still imports, and it would ship inside the wheel as a model no
+    current YANG describes.
+    """
+    if package_dir.is_dir():
+        for sub in ("data_models", "data_navigators"):
+            stale = package_dir / sub
+            if stale.is_dir():
+                shutil.rmtree(stale)
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _refuse_on_stale_output(output_dir: str, pkg_name: str) -> None:
+    """Refuse to generate into a container that holds another client.
+
+    See `yang2sdk.layout.stale_entries` for why this is a refusal rather than
+    a cleanup.
+    """
+    stale, legacy = layout.stale_entries(output_dir, pkg_name)
+    if not stale and not legacy:
+        return
+    print(
+        f"Error: refusing to generate: {output_dir} already contains output "
+        f"that is not {pkg_name!r}.",
+        file=sys.stderr,
+    )
+    for name in stale:
+        print(f"  stale package: {name}/", file=sys.stderr)
+    for name in legacy:
+        print(f"  legacy flat copy: {name}", file=sys.stderr)
+    print(
+        "  --output-dir is a container for one generated client. Remove the "
+        "entries above (they are previous compiles, not inputs) or pass a "
+        "fresh --output-dir.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def _pep440_version(raw: str) -> str:
@@ -142,6 +194,54 @@ def _refuse_on_error(ctx, modules) -> bool:
         "--ignore-error <TAG> for the errors you accept.",
         file=sys.stderr,
     )
+    if "PATTERN_ERROR" in tags:
+        print(
+            "hint: a YANG `pattern` is an XML Schema regular expression "
+            "(RFC 7950 Sec 9.4.5), and libxml2's XSD engine implements "
+            "neither Python's lookahead/lookbehind nor its backreferences. A "
+            "vendor pattern using `(?!...)` is therefore refused here even "
+            "though Python's `re` would accept it. `--ignore-error "
+            "PATTERN_ERROR` accepts the model and KEEPS the constraint: the "
+            "pattern is read from the statement itself (not from pyang's "
+            "compiled type), emitted as a Python regex, and compiled before "
+            "the client is written.",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+
+
+def _refuse_on_pattern_error(problems: list[str]) -> None:
+    """Refuse a pattern the generated client could not enforce.
+
+    ``check_pattern`` runs ``re.match`` when a value is *assigned*, so an
+    untranslatable pattern never fails generation, import or installation --
+    it fails the first caller that sets the leaf, with a traceback pointing at
+    generated code in *their* project. That is the same failure class
+    ``_validate_generated`` refuses for syntax; it just hides one step later.
+
+    Measured: `pattern "\\p{IsBasicLatin}+"` is a valid XML Schema regex that
+    libxml2 accepts, ``re`` rejects, and the emitter used to ship as
+    ``check_pattern('^(?:\\p{IsBasicLatin}+)$', v)`` -- a model that imported
+    fine and raised ``re.error: bad escape \\p`` on ``Model(leaf="abc")``.
+    """
+    if not problems:
+        return
+    # `build()` intentionally walks top-level containers twice (once to name
+    # them, once through the module root model so collision renames propagate),
+    # and `_register_model` only dedupes the models -- the walk itself runs
+    # again, so the same leaf would be reported twice. Report each pattern once.
+    problems = list(dict.fromkeys(problems))
+    print(
+        f"Error: refusing to generate: {len(problems)} YANG pattern(s) cannot "
+        "be expressed as a Python regular expression. No client written, "
+        "because the pattern is enforced by `re.match` when a value is "
+        "assigned: shipping it would raise `re.error` in the caller's project "
+        "instead of here. Fix the pattern, or replace it with a deviation "
+        "module (RFC 7950 Sec 7.20.3, --deviation-module).",
+        file=sys.stderr,
+    )
+    for problem in problems:
+        print(f"  {problem}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -213,9 +313,7 @@ def _package_context(ctx, modules, ir_modules, protocol: str) -> dict:
         from yang2sdk import __version__ as gen_version
     except Exception:  # noqa: BLE001 -- installed metadata may be missing
         gen_version = "unknown"
-    pkg_name = _sanitize_pkg(
-        f"{device}_{device_version}".replace(".", "_").replace("-", "_")
-    )
+    pkg_name = _package_name(ctx)
     pkg_version = _pep440_version(pkg_version_raw)
     mods = []
     for m, ir in zip(modules, ir_modules):
@@ -307,26 +405,38 @@ class Yang2Restconf(plugin.PyangPlugin):
         # models and exit 1 at the same time.
         if _refuse_on_error(ctx, modules):
             return
-        # `temp/` is untracked and created on demand: ensure the output root
-        # exists before any write (makedirs below would also create it, but
-        # the package/static writers must not depend on that ordering).
-        os.makedirs(output_dir, exist_ok=True)
-        models_dir = os.path.join(output_dir, "data_models")
-        navigators_dir = os.path.join(output_dir, "data_navigators")
-
-        for d in [models_dir, navigators_dir]:
-            os.makedirs(d, exist_ok=True)
 
         env = Environment(
             loader=FileSystemLoader(TEMPLATES_DIR), trim_blocks=True, lstrip_blocks=True
         )
         ir_modules = []
+        pattern_errors: list[str] = []
 
         # 1. Parse AST to IR
         for module in modules:
             builder = IRBuilder(ctx, module, config_only)
             ir_module = builder.build()
             ir_modules.append(ir_module)
+            pattern_errors.extend(builder.pattern_errors)
+
+        # Refuse before any write: an un-compilable pattern is a validation-time
+        # crash for the client's user, not a build-time one.
+        _refuse_on_pattern_error(pattern_errors)
+
+        # `temp/` is untracked and created on demand: ensure the output root
+        # exists before any write (makedirs below would also create it, but
+        # the package/static writers must not depend on that ordering). See
+        # `_package_dirs` for why the package sits one project level deep.
+        os.makedirs(output_dir, exist_ok=True)
+        pkg_name = _package_name(ctx)
+        _refuse_on_stale_output(output_dir, pkg_name)
+        _project_dir, package_dir = _package_dirs(output_dir, pkg_name)
+        _reset_package_dir(package_dir)
+        models_dir = str(package_dir / "data_models")
+        navigators_dir = str(package_dir / "data_navigators")
+
+        for d in [models_dir, navigators_dir]:
+            os.makedirs(d, exist_ok=True)
 
         # 2. Render IR with Jinja2
         for ir_mod in ir_modules:
@@ -375,9 +485,9 @@ class Yang2Restconf(plugin.PyangPlugin):
             )
 
         # Static Scaffold files
-        self._write_static_files(env, output_dir)
+        self._write_static_files(env, str(package_dir))
         _write_package_files(env, output_dir, ctx, modules, ir_modules, "restconf")
-        fd.write(f"Generated SDK in: {output_dir}\n")
+        fd.write(f"Generated SDK in: {_project_dir}\n")
 
     def _write_static_files(self, env: Environment, out_dir: str):
         """Render and write the static scaffolding files from their templates."""
@@ -417,23 +527,32 @@ class Yang2Netconf(plugin.PyangPlugin):
         if _refuse_on_error(ctx, modules):
             return
 
-        # `temp/` is untracked and created on demand: ensure the output root
-        # exists before any write (see the restconf emit above).
-        os.makedirs(output_dir, exist_ok=True)
-        models_dir = os.path.join(output_dir, "data_models")
-        navigators_dir = os.path.join(output_dir, "data_navigators")
-
-        for d in [models_dir, navigators_dir]:
-            os.makedirs(d, exist_ok=True)
-
         env = Environment(
             loader=FileSystemLoader(TEMPLATES_DIR), trim_blocks=True, lstrip_blocks=True
         )
         ir_modules = []
+        pattern_errors: list[str] = []
 
         for module in modules:
             builder = IRBuilder(ctx, module, config_only, target_format="netconf")
             ir_modules.append(builder.build())
+            pattern_errors.extend(builder.pattern_errors)
+
+        # See the restconf emit: refuse before any write.
+        _refuse_on_pattern_error(pattern_errors)
+
+        # `temp/` is untracked and created on demand: ensure the output root
+        # exists before any write (see the restconf emit above).
+        os.makedirs(output_dir, exist_ok=True)
+        pkg_name = _package_name(ctx)
+        _refuse_on_stale_output(output_dir, pkg_name)
+        project_dir, package_dir = _package_dirs(output_dir, pkg_name)
+        _reset_package_dir(package_dir)
+        models_dir = str(package_dir / "data_models")
+        navigators_dir = str(package_dir / "data_navigators")
+
+        for d in [models_dir, navigators_dir]:
+            os.makedirs(d, exist_ok=True)
 
         for ir_mod in ir_modules:
             model_out = env.get_template("netconf/data_models/models.py.jinja").render(
@@ -494,7 +613,7 @@ class Yang2Netconf(plugin.PyangPlugin):
             merged_module_namespaces.update(getattr(ir_module, "module_namespaces", {}))
 
         for target_path, template_path in static_files.items():
-            full_path = os.path.join(output_dir, target_path)
+            full_path = os.path.join(str(package_dir), target_path)
             with open(full_path, "w") as f:
                 f.write(
                     env.get_template(template_path).render(
@@ -503,7 +622,7 @@ class Yang2Netconf(plugin.PyangPlugin):
                 )
 
         _write_package_files(env, output_dir, ctx, modules, ir_modules, "netconf")
-        fd.write(f"Generated NETCONF SDK in: {output_dir}\n")
+        fd.write(f"Generated NETCONF SDK in: {project_dir}\n")
 
 
 def _module_annotation_aliases(ir_modules) -> dict[str, str]:
@@ -706,18 +825,18 @@ def _write_package_files(
 ) -> None:
     """Emit registry-ready packaging (pyproject/README/MANIFEST/py.typed).
 
-    Flat files at out_dir preserve the lab import path
-    (temp.<proto>_clients.<device>); the namespaced copy at
-    out_dir/<package_name>/ is what pip installs (import <package_name>).
-    No secrets, no temp/ absolute imports, secure defaults documented.
+    Packaging metadata goes in the project dir that ``uv add`` is told to
+    point at, ``out_dir/<package_name>/``, next to the ``src/`` tree the
+    README's install line names. No secrets, no ``temp/`` absolute imports,
+    secure defaults documented. See ``_package_dirs`` for the layout.
     """
     pkg = _package_context(ctx, modules, ir_modules, protocol)
     pkg_name, pkg_version = pkg["package_name"], pkg["package_version"]
-    out = Path(out_dir)
-    # Defensive: `emit()` already created this, but `_write_package_files`
+    project_dir, package_dir = _package_dirs(out_dir, pkg_name)
+    # Defensive: `emit()` already created these, but `_write_package_files`
     # must not depend on call ordering (model_gaps introspection, tests).
-    out.mkdir(parents=True, exist_ok=True)
-    # pyproject.toml (project root = out_dir)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    # pyproject.toml (project root = out_dir/<package_name>)
     if protocol == "restconf":
         deps = ['"pydantic>=2.12.5"', '"requests>=2.32.5"']
     else:
@@ -728,7 +847,7 @@ def _write_package_files(
             '"ncclient>=0.7.0"',
         ]
     deps_str = ",\n    ".join(deps)
-    (out / "pyproject.toml").write_text(
+    (project_dir / "pyproject.toml").write_text(
         "[build-system]\n"
         'requires = ["hatchling"]\n'
         'build-backend = "hatchling.build"\n\n'
@@ -740,20 +859,11 @@ def _write_package_files(
         'requires-python = ">=3.12"\n'
         f"dependencies = [\n    {deps_str},\n]\n\n"
         "[tool.hatch.build.targets.wheel]\n"
-        f'packages = ["{pkg_name}"]\n\n'
-        # The package is emitted twice on purpose: flat at out_dir so the lab
-        # harness can `import temp.<proto>_clients.<device>`, and namespaced at
-        # out_dir/<package_name>/ so pip installs `import <package_name>`. Only
-        # the namespaced copy belongs in a published artifact. The wheel already
-        # carried just it; an sdist includes the whole project tree and shipped
-        # both (measured: a 25-entry tarball with two data_models/, two
-        # data_navigators/, two __init__.py, two session_manager.py, two
-        # py.typed). Excluding the flat copy is safe because the wheel target
-        # references the namespaced path, so a wheel built from the extracted
-        # sdist is unaffected.
-        "[tool.hatch.build.targets.sdist]\n"
-        'exclude = ["/__init__.py", "/data_models", "/data_navigators",'
-        ' "/session_manager.py", "/py.typed"]\n',
+        # `src/` layout, spelled out rather than inferred. A project whose
+        # modules sit in its own root cannot be packaged by hatchling: the
+        # wheel gets `./__init__.py` and `./data_models/`, which land directly
+        # in site-packages (measured with uv build + uv pip install --target).
+        f'packages = ["src/{pkg_name}"]\n',
         encoding="utf-8",
     )
     mod_rows = "\n".join(
@@ -762,7 +872,7 @@ def _write_package_files(
     )
     dev_rows = "\n".join(f"- `{d}`" for d in pkg["deviations"]) or "- none"
     feat_rows = "\n".join(f"- `{f}`" for f in pkg["features"]) or "- none"
-    (out / "README.md").write_text(
+    (project_dir / "README.md").write_text(
         f"# {pkg_name}\n\n"
         f"Generated {protocol.upper()} SDK for `{pkg['device']}` "
         f"version `{pkg['device_version']}`.\n\n"
@@ -800,27 +910,13 @@ def _write_package_files(
         + "```\n",
         encoding="utf-8",
     )
-    (out / "MANIFEST.yang-revisions.json").write_text(
+    (project_dir / "MANIFEST.yang-revisions.json").write_text(
         json.dumps(pkg, indent=2), encoding="utf-8"
     )
-    (out / "py.typed").write_text("", encoding="utf-8")
-    # Namespaced installable copy: out/<pkg_name>/...
-    pkg_dir = out / pkg_name
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    for item in ("__init__.py", "session_manager.py", "py.typed"):
-        src = out / item
-        if src.exists():
-            shutil.copy2(src, pkg_dir / item)
-    for sub in ("data_models", "data_navigators"):
-        src_d = out / sub
-        dst_d = pkg_dir / sub
-        if src_d.is_dir():
-            if dst_d.exists():
-                shutil.rmtree(dst_d)
-            shutil.copytree(src_d, dst_d)
-    # py.typed marker inside package (PEP 561)
-    (pkg_dir / "py.typed").write_text("", encoding="utf-8")
+    # py.typed marker inside the package (PEP 561), not at the project root:
+    # the root is not on `sys.path`, the package is.
+    (package_dir / "py.typed").write_text("", encoding="utf-8")
 
-    # Last step, covering both the flat lab copy and the namespaced copy: a
-    # client that cannot be imported is not a deliverable.
-    _validate_generated(str(out))
+    # Last step: a client that cannot be imported is not a deliverable. The
+    # project dir is scanned with `rglob`, so `src/` needs no special case.
+    _validate_generated(str(project_dir))
