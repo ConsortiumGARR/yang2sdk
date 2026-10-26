@@ -52,6 +52,27 @@ documented — a date-versioned scheme carries no compatibility promise.
   compiles), both protocols refuse an untranslatable pattern, and the suggested
   `deviate replace` actually generates the client.
 
+- **A NETCONF read dump now takes `content=` and no longer serialises the whole
+  YANG schema.** `NetconfBaseModel` had no content-aware dump, unlike the
+  RESTCONF base, so `model_dump(content="config")` raised
+  `TypeError: unexpected keyword argument` on every generated NETCONF model and
+  `model_dump_json(indent=4)` emitted the complete schema: every node the device
+  did not return as `null`, plus every YANG `default` materialised into a value
+  that was never on the wire. Measured on the G30 `ne` model, a reply carrying
+  two leaves dumped 16 `null`s out of 23 fields. Both `model_dump` and
+  `model_dump_json` now prune by the same `is_config` rule the RESTCONF base and
+  the NETCONF XML layer already use (RFC 8040 §4.5.2 / RFC 8526 §3.1.2), and a
+  content-scoped dump omits the `nc:operation` attribute (RFC 6241 §7.2), which
+  is metadata rather than resource contents. `content="all"` is unchanged — the
+  plain pydantic dump, byte-identical to before on a generated sample — and
+  `exclude_unset`/`exclude_none` still apply on top. Like the RESTCONF base,
+  `model_dump` now defaults to `mode="json"` and `by_alias=True`, so an
+  unqualified `model_dump()` yields JSON-encodable values (enum members as their
+  values) instead of Python objects.
+  `sdk-verify`'s `_dump_config` no longer needs a NETCONF `TypeError` fallback
+  for this. Pinned by
+  `tests/test_matrix.py::test_netconf_model_dump_takes_content_and_prunes_like_restconf`.
+
 ## [2026.10.22] - 2026-10-22
 
 ### Fixed

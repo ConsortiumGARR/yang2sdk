@@ -1471,10 +1471,11 @@ def _digest(blobs: dict[str, str]) -> str:
 def _dump_config(model: Any) -> Any:
     """`model_dump` restricted to config content.
 
-    Only the RESTCONF base model takes `content=`; NETCONF models are plain
-    pydantic-xml and its `to_xml_payload()` already carries only config leaves
-    (that is what `nc_operation` rides on). Passing `content=` to a NETCONF
-    model raises TypeError, so the keyword is added only where it exists.
+    The RESTCONF base takes `content=` and prunes in the model layer; NETCONF
+    models take it too since their base gained the same content-aware
+    `model_dump`/`model_dump_json` override (protocol parity, mirroring the XML
+    layer prune). The keyword is passed only where the model accepts it, so a
+    plain transport-marker type still falls through.
     """
     kwargs = {
         "mode": "json",

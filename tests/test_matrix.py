@@ -5516,6 +5516,71 @@ def test_netconf_nonconfig_renders_an_emptied_container_as_none(tmp_path):
     assert not model.only_config, "None must stay falsy for `if node:` checks"
 
 
+def test_netconf_model_dump_takes_content_and_prunes_like_restconf(tmp_path):
+    """`NetconfBaseModel.model_dump(content=...)` mirrors the RESTCONF base.
+
+    Parity regression: NETCONF models were plain pydantic-xml, so a caller had
+    to know the transport -- `model_dump(content="config")` raised TypeError
+    and `model_dump_json()` serialised the whole schema, every absent node as
+    `null` and every YANG default materialised. Both dump verbs now apply the
+    same `is_config` rule the XML layer already applies, so a read dump holds
+    the content the caller asked for and nothing else.
+    """
+    import json
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    model = models.Top.model_validate(
+        {
+            "name": "cfg-leaf",
+            "counter": "42",
+            "only_state": {"reads": "7"},
+            "mixed": {"cfg": "C", "obs": "O"},
+            "only_config": {"a": "A", "b": "B"},
+        }
+    )
+
+    config = model.model_dump(content="config")
+    assert "counter" not in config, f"state leaf leaked: {config}"
+    # `only_state` is a config-true container (RFC 7950 Sec 7.21.6 inherits the
+    # flag), so it matches the filter and is RETAINED even once emptied -- the
+    # same rule the RESTCONF base documents and the XML layer implements.
+    assert config["only_state"] == {}, f"emptied matching container: {config}"
+    assert config["mixed"] == {"cfg": "C"}, (
+        f"shell must survive with its state child pruned: {config['mixed']}"
+    )
+    assert config["only_config"] == {"a": "A", "b": "B"}
+    assert "nc_operation" not in config, (
+        "nc:operation is an attribute, never resource contents"
+    )
+    assert all(
+        "nc_operation" not in v for v in config.values() if isinstance(v, dict)
+    ), f"nc:operation leaked into a nested dump: {config}"
+
+    nonconfig = model.model_dump(content="nonconfig")
+    assert "name" not in nonconfig, f"config leaf leaked: {nonconfig}"
+    assert nonconfig["counter"] == "42"
+    assert nonconfig["mixed"] == {"obs": "O"}, (
+        f"config child of a mixed container must be pruned: {nonconfig['mixed']}"
+    )
+
+    # content="all" is the plain pydantic dump: nothing pruned.
+    everything = model.model_dump(content="all")
+    assert everything["name"] == "cfg-leaf" and everything["counter"] == "42"
+
+    # pydantic's BaseModel.model_dump_json does NOT route through model_dump,
+    # so the JSON verb needs its own content handling or it silently serialises
+    # the unpruned tree.
+    assert json.loads(model.model_dump_json(content="config")) == config
+    assert json.loads(model.model_dump_json(content="nonconfig")) == nonconfig
+    # ensure_ascii is the JSON encoder's, not model_dump's: it must not be
+    # forwarded to the dict dump (which would raise TypeError).
+    assert (
+        json.loads(model.model_dump_json(content="config", ensure_ascii=True)) == config
+    )
+
+
 def _surviving_paths_netconf(tmp_path, content):
     """Field paths a NETCONF caller can see after `content=` filtering."""
     from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
