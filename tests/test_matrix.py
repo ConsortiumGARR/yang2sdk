@@ -6591,6 +6591,41 @@ def test_consumers_resolve_container_project_and_package(tmp_path):
     assert "exactly one" in str(exc.value), str(exc.value)
 
 
+def test_both_protocols_import_as_distinct_modules(tmp_path, monkeypatch):
+    """The lab fixture's two imports must not collapse into one module.
+
+    Both protocols generate `<device>_<version>` -- each is its own
+    installable project -- so the RESTCONF and NETCONF trees in
+    `temp/notconf_clients` carry the SAME import name. A plain
+    `importlib.import_module(package.name)` returns the first one out of
+    `sys.modules` for the second protocol too, and every NETCONF test then
+    holds the RESTCONF client: measured as five red smoke shards, all dying
+    on `AttributeError: module '...' has no attribute 'NetconfClient'`.
+    `_import_pkg` therefore imports under a unique per-protocol name, the same
+    rule `sdk_verify._import_client` follows for `--protocol both`.
+    """
+    from tests import conftest
+
+    for fmt, attr in (("restconf", "RestconfClient"), ("netconf", "NetconfClient")):
+        package = tmp_path / f"tdevice_{fmt}" / "tdevice_1_0" / "src" / "tdevice_1_0"
+        package.mkdir(parents=True)
+        (package.parent.parent / "pyproject.toml").write_text(
+            '[project]\nname = "tdevice_1_0"\n'
+        )
+        (package / "__init__.py").write_text(f"{attr} = object\n")
+    monkeypatch.setattr(conftest, "TEMP_CLIENTS", tmp_path)
+
+    try:
+        rest = conftest._import_pkg("tdevice", "restconf")
+        netc = conftest._import_pkg("tdevice", "netconf")
+        assert rest is not netc
+        assert rest.RestconfClient is not None
+        assert netc.NetconfClient is not None
+    finally:
+        for fmt in ("restconf", "netconf"):
+            sys.modules.pop(f"_sdktest_{fmt}_tdevice_1_0", None)
+
+
 # --- yang2sdk CLI: root picking ---------------------------------------------
 #
 # Picking root modules was the last hand-fed step in the pipeline, and it is

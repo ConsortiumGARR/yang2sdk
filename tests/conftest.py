@@ -391,9 +391,25 @@ def _compile_all(yang_files, roots, image):
 
 def _import_pkg(slug, fmt):
     package = layout.resolve_package(TEMP_CLIENTS / f"{slug}_{fmt}")
-    if str(package.parent) not in sys.path:
-        sys.path.insert(0, str(package.parent))
-    return importlib.import_module(package.name)
+    # Both protocols generate a package with the SAME import name
+    # (`<device>_<version>`), because each is its own installable project. A
+    # plain `importlib.import_module(package.name)` hands the second protocol
+    # the *first* module out of `sys.modules`, so every NETCONF test would get
+    # the RESTCONF client and die on `NetconfClient` -- five red smoke shards,
+    # with the generator itself innocent. Import under a unique per-protocol
+    # name instead, the same rule `sdk_verify._import_client` follows for
+    # `--protocol both`.
+    name = f"_sdktest_{fmt}_{package.name}"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        package / "__init__.py",
+        submodule_search_locations=[str(package)],
+    )
+    assert spec is not None and spec.loader is not None, package
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="function")
