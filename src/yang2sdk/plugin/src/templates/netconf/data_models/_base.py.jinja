@@ -366,7 +366,10 @@ def _strip_nonconfig_tree(element: etree._Element, model_cls: type | None) -> No
 class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
     model_config = ConfigDict(extra="forbid", validate_assignment=True, defer_build=True, populate_by_name=True)
     # ns="nc" (prefix alias, not the URI): pydantic-xml resolves attr namespaces
-    # through the model nsmap, which every generated subclass re-declares.
+    # through the model nsmap, and a subclass inherits this one -- pydantic-xml
+    # merges rather than replaces (`__init_subclass__`: `dict(parent_nsmap,
+    # **nsmap)`), so the per-module `_ModuleBase` in models.py only has to add
+    # the default namespace and the import prefixes.
     nc_operation: str | None = attr(name="operation", ns="nc", default=None)
 
     @model_validator(mode="before")

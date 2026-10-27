@@ -18,6 +18,7 @@ from typing import Any, ClassVar, cast, get_args
 import pytest
 
 from yang2sdk import layout
+from yang2sdk.cli import model_gaps
 from yang2sdk.cli.compiler import resolve_features
 from yang2sdk.cli.features import (
     parse_capability_features,
@@ -534,6 +535,38 @@ def _gen_restconf(yang_text: str, name: str, tmp_path):
     assert pkg_root.is_dir(), f"expected package at {pkg_root}"
     sys.path.insert(0, str(pkg_root.parent))
     return str(pkg_root.parent), pkg_root.name
+
+
+def _gen_netconf(yang_text: str, name: str, tmp_path) -> Path:
+    """Generate a NETCONF client into ``tmp_path/<name>_netconf``; return it."""
+    yang = tmp_path / f"{name}.yang"
+    yang.write_text(yang_text)
+    out = tmp_path / f"{name}_netconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(yang),
+            "--device",
+            name,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    return out
 
 
 def test_restconf_unwraps_a_reply_nested_under_the_ancestor(tmp_path):
@@ -1522,6 +1555,103 @@ def test_netconf_identityref_binding_and_normalization(tmp_path):
     assert b"tbase:base-id" in (
         payload if isinstance(payload, bytes) else payload.encode()
     )
+
+
+NSMAP_YANG = """module tnsmap {
+  prefix tn;
+  namespace "urn:test:tnsmap";
+  import ietf-netconf {
+    prefix nc;
+  }
+  revision 2026-01-01;
+  container top {
+    leaf name {
+      type string;
+    }
+  }
+  rpc do-thing {
+    input {
+      leaf arg {
+        type string;
+      }
+    }
+    output {
+      leaf result {
+        type string;
+      }
+    }
+  }
+}
+"""
+
+
+def test_netconf_declares_the_module_nsmap_once_and_models_inherit_it(tmp_path):
+    """The per-module nsmap is emitted once, on an intermediate base class.
+
+    It used to be re-declared on every model class -- identical for all of them,
+    because `namespace` and `imports_nsmap` are per-module (measured on the G30
+    tree: the same 25-entry map on 1358 classes, 1.9 MiB of `data_models/`).
+    pydantic-xml merges a subclass nsmap into the parent's
+    (`BaseXmlModel.__init_subclass__`: `dict(parent_nsmap, **nsmap)`), so one
+    declaration is enough -- but the emitter must keep emitting it, or the
+    models lose `nc` / the default namespace.
+
+    Two things this pins that the earlier template got wrong:
+    * a module that imports ietf-netconf (prefix `nc`) emitted `"nc"` twice in
+      the same dict literal;
+    * the RPC envelopes derive from `NetconfXmlModel`, not `NetconfBaseModel`,
+      so they need their own base and cannot share the data-model one.
+    """
+    out = _gen_netconf(NSMAP_YANG, "tnsmap", tmp_path)
+    source = (_package(out) / "data_models" / "tnsmap.py").read_text()
+
+    declarations = [
+        line
+        for line in source.splitlines()
+        if line.startswith("class ") and "nsmap={" in line
+    ]
+    assert [line.split("(")[0] for line in declarations] == [
+        "class _ModuleBase",
+        "class _ModuleRpcBase",
+    ], declarations
+    for line in declarations:
+        assert line.count('"nc":') == 1, f"duplicate nc entry: {line}"
+        assert '"nc": "urn:ietf:params:xml:ns:netconf:base:1.0"' in line
+        assert '"": "urn:test:tnsmap"' in line
+        assert '"tn": "urn:test:tnsmap"' in line
+    assert "nsmap={" not in "".join(
+        line
+        for line in source.splitlines()
+        if line.startswith("class ") and not line.startswith("class _")
+    ), "a model class re-declares the nsmap"
+
+    models = _import(out, "data_models.tnsmap")
+    top = models.Top
+    assert top.__xml_nsmap__ == {
+        "nc": "urn:ietf:params:xml:ns:netconf:base:1.0",
+        "": "urn:test:tnsmap",
+        "tn": "urn:test:tnsmap",
+    }, top.__xml_nsmap__
+    # The inherited map has to reach the serializer, not just the class:
+    # `nc_operation` is an attribute resolved through the model nsmap
+    # (RFC 6241 Sec 7.1), and the element carries the module's default ns.
+    inst = top(name="x")
+    inst.nc_operation = "merge"
+    xml = inst.to_xml()
+    xml = xml if isinstance(xml, bytes) else xml.encode()
+    assert b'nc:operation="merge"' in xml, xml
+    assert b'xmlns="urn:test:tnsmap"' in xml, xml
+    # The RPC envelope comes from the other base and still gets the same map.
+    assert models.DoThing.__xml_nsmap__ == top.__xml_nsmap__
+    assert "nc_operation" not in models.DoThing.model_fields
+
+    # model_gaps inventories model classes by walking module attributes; the
+    # nsmap bases are plumbing and must not be counted as models.
+    surface = model_gaps.introspect(out, max_depth=8, max_paths=5000)
+    assert "tnsmap.Top" in surface.model_classes, surface.model_classes
+    assert not [
+        name for name in surface.model_classes if name.split(".", 1)[1].startswith("_")
+    ], surface.model_classes
 
 
 def test_no_nonexistent_rfc_sections_cited():

@@ -7,6 +7,26 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Changed
+
+- **A NETCONF module's namespace map is declared once per file instead of on
+  every model class.** Every class used to carry an identical `nsmap=`, because
+  the template believed pydantic-xml *replaces* a parent's map; it merges
+  (`BaseXmlModel.__init_subclass__`: `dict(parent_nsmap, **nsmap)`, unchanged
+  between the 2.21.0 floor and 2.22.0), so one intermediate `_ModuleBase` (and
+  `_ModuleRpcBase` for RPC envelopes, which derive from `NetconfXmlModel`) now
+  carries it for the whole file. Measured on the G30 client: 7.50 MB → 5.67 MB
+  for `ne.py` alone, 1.9 MiB across `data_models/`, with `__xml_nsmap__`, the
+  wire element QName and `to_xml()` bytes unchanged for all 1358 classes.
+  `--check-model-gaps` no longer counts the new base classes as models. A module
+  that imports `ietf-netconf` also stopped emitting `"nc"` twice in one literal.
+  Pinned by
+  `tests/test_matrix.py::test_netconf_declares_the_module_nsmap_once_and_models_inherit_it`.
+  Writing this entry also exposed a date-dependent release rehearsal: on the day
+  a release is cut, `test_the_real_changelog_becomes_releasable_once_the_version_is_promoted`
+  derived that release's own version and `promote` refused the duplicate. It now
+  freezes the clock and treats every documented version as taken.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Changed
