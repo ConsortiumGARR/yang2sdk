@@ -7,6 +7,8 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.10.27] - 2026-10-27
+
 ### Changed
 
 - **Finite-depth NETCONF reads no longer ask the device for a whole subtree.**
