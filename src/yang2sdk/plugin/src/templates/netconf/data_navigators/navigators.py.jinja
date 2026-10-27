@@ -206,6 +206,11 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
 
 {% elif node.node_type == 'rpc' %}
 class {{ node.class_name }}Node(Node):
+    # RFC 7950 Sec 9.13: an instance-identifier addresses data nodes; rpc/action
+    # input/output nodes only exist during invocation (Sec 7.15), so the base
+    # class refuses to render one for these navigators.
+    _yang_node_kind = "rpc"
+
     def __call__(self{% if node.has_input %}, input_data: {{ node.pydantic_module }}.{{ node.class_name }}Input | dict | str | None = None, **kwargs: Any{% endif %}){% if node.has_output %} -> {{ node.pydantic_module }}.{{ node.class_name }}Output | None{% else %} -> None{% endif %}:
         {% if node.has_input or node.has_output %}
         from ..data_models.{{ node.pydantic_module }} import {{ [(node.class_name ~ "Input") if node.has_input, (node.class_name ~ "Output") if node.has_output] | select | join(", ") }}

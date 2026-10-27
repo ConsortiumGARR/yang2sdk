@@ -7,6 +7,32 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Added
+
+- **NETCONF navigators can render their own instance-identifier.**
+  `nav.instance_identifier()` returns the node as RFC 7950 §9.13 defines it,
+  encoded with the module-name qualification of RFC 7951 §6.11: the leftmost
+  node is always qualified, a later node only when its defining module differs
+  from its parent's, and a list entry carries one predicate per key in key
+  order. For example
+  `client.data.ietf_interfaces_interfaces.interface("ge-0/0/0").ipv4.address("10.0.0.1").instance_identifier()`
+  is `/ietf-interfaces:interfaces/interface[name='ge-0/0/0']/ietf-ip:ipv4/address[ip='10.0.0.1']`
+  (the RFC 7951 §6.11 example shape, verified on a fresh compile of the IETF
+  modules). Key values are rendered in their YANG lexical form — a boolean key
+  is `true`/`false` (§9.7.2), an enumeration key is its assigned name (§9.6.4) —
+  and quoted with single quotes, or double quotes when the value contains a
+  single quote; a value containing both cannot be represented, because
+  §14's `quoted-string` has no escape mechanism, so it raises instead of
+  emitting a string that parses as a different path. A datastore root, a list
+  *collection* and an rpc/action node raise: none of them is an instance node
+  (§9.13, §7.15). The module map comes from the compile-time
+  `MODULE_NAMESPACES` (hoisted to module scope in `session_manager`), not from
+  `client.module_namespaces`, because which module a compiled node belongs to
+  is a schema fact while the client's map is overlaid with the peer's `<hello>`.
+  NETCONF-only on purpose: RESTCONF addresses nodes by a resource URI
+  (RFC 8040 §3.5.3), which is not an instance-identifier. Pinned by
+  `tests/test_matrix.py::test_instance_identifier_names_each_node_by_its_defining_module`.
+
 ### Changed
 
 - **A NETCONF module's namespace map is declared once per file instead of on

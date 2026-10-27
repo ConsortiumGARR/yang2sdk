@@ -24,6 +24,16 @@ _CAP_CONFIRMED_COMMIT = "urn:ietf:params:netconf:capability:confirmed-commit:1.1
 _CAP_ROLLBACK_ON_ERROR = "urn:ietf:params:netconf:capability:rollback-on-error:1.0"
 _CAP_VALIDATE = "urn:ietf:params:netconf:capability:validate:1.0"
 
+# Every module pyang loaded for this client: module name -> namespace, merged
+# across the compiled roots. This is a COMPILE-TIME fact, not a device one, and
+# two consumers need it for different reasons:
+#   * identityref values are XML QNames, so a prefix MUST be declared on the
+#     wire (RFC 7950 Sec 9.10.3) -- see `module_namespaces` in __init__;
+#   * an instance-identifier names each node by its DEFINING module
+#     (RFC 7951 Sec 6.11), which is a schema property, so the navigators invert
+#     this map rather than asking the peer's <hello>.
+MODULE_NAMESPACES: dict[str, str] = {{ module_namespaces_literal }}
+
 # SSH public-key authentication. `DEVICE_SSH_KEY` points at the private key
 # (or at its OpenSSH certificate, which paramiko resolves to the adjacent
 # private key -- see _resolve_key_files); `DEVICE_SSH_KEY_PASSPHRASE` unlocks
@@ -562,7 +572,7 @@ class NetconfClient:
         # module capability -- or a value for a module the device never
         # advertised -- would put an undeclared prefix on the wire. The server
         # still wins on conflicts: it is authoritative about what it speaks.
-        self.module_namespaces: dict[str, str] = dict({{ module_namespaces_literal }})
+        self.module_namespaces: dict[str, str] = dict(MODULE_NAMESPACES)
         for cap in self.server_capabilities:
             if "?" not in cap:
                 continue

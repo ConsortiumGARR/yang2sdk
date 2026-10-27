@@ -537,10 +537,24 @@ def _gen_restconf(yang_text: str, name: str, tmp_path):
     return str(pkg_root.parent), pkg_root.name
 
 
-def _gen_netconf(yang_text: str, name: str, tmp_path) -> Path:
-    """Generate a NETCONF client into ``tmp_path/<name>_netconf``; return it."""
+def _gen_netconf(
+    yang_text: str,
+    name: str,
+    tmp_path,
+    extra: dict[str, str] | None = None,
+) -> Path:
+    """Generate a NETCONF client into ``tmp_path/<name>_netconf``; return it.
+
+    ``extra`` writes additional modules beside the root and passes them as
+    further roots, which is how a cross-module `augment` gets compiled in.
+    """
     yang = tmp_path / f"{name}.yang"
     yang.write_text(yang_text)
+    roots = [str(yang)]
+    for filename, text in (extra or {}).items():
+        path = tmp_path / filename
+        path.write_text(text)
+        roots.append(str(path))
     out = tmp_path / f"{name}_netconf"
     code = (
         "import sys; from yang2sdk.cli.compiler import run_compiler; "
@@ -551,7 +565,7 @@ def _gen_netconf(yang_text: str, name: str, tmp_path) -> Path:
             sys.executable,
             "-c",
             code,
-            str(yang),
+            *roots,
             "--device",
             name,
             "--yang-dir",
@@ -1652,6 +1666,174 @@ def test_netconf_declares_the_module_nsmap_once_and_models_inherit_it(tmp_path):
     assert not [
         name for name in surface.model_classes if name.split(".", 1)[1].startswith("_")
     ], surface.model_classes
+
+
+INSTANCE_ID_YANG = """module tid {
+  yang-version 1.1;
+  prefix ti;
+  namespace "urn:test:tid";
+  revision 2026-01-01;
+
+  container system {
+    list user {
+      key "name";
+      leaf name {
+        type string;
+      }
+      leaf enabled {
+        type boolean;
+      }
+    }
+    list server {
+      key "ip port";
+      leaf ip {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+    }
+    list flag {
+      key "on";
+      leaf on {
+        type boolean;
+      }
+    }
+    list marker {
+      key "tag";
+      leaf tag {
+        type empty;
+      }
+    }
+  }
+
+  rpc do-thing {
+    input {
+      leaf arg {
+        type string;
+      }
+    }
+  }
+}
+"""
+
+INSTANCE_ID_AUGMENT_YANG = """module tidadd {
+  yang-version 1.1;
+  prefix ta;
+  namespace "urn:test:tidadd";
+  import tid { prefix ti; }
+  revision 2026-01-01;
+
+  augment "/ti:system/ti:user" {
+    container prefs {
+      list addr {
+        key "ip";
+        leaf ip {
+          type string;
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def test_instance_identifier_names_each_node_by_its_defining_module(tmp_path):
+    """`instance_identifier()` renders RFC 7950 Sec 9.13 / RFC 7951 Sec 6.11.
+
+    RFC 7951 Sec 6.11 gives the exact shape:
+
+        /ietf-interfaces:interfaces/interface[name='eth0']/ietf-ip:ipv4/ip
+
+    -- the leftmost node always qualified, a later node qualified only when its
+    module differs from its parent's, and the same rule for key names. RFC 7950
+    Sec 9.13 adds that every key of a list entry needs a predicate, and Sec 14
+    defines `quoted-string` with no escape mechanism.
+
+    The qualification is a SCHEMA fact, so it must come from the compile-time
+    module map, not from `client.namespace_modules` (which the device's <hello>
+    overlays). The navigators are built with `client=None` here precisely to
+    pin that no transport is needed to name a path.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    nav = _import(out, "data_navigators")
+    base = _import(out, "data_navigators._base")
+    session = _import(out, "session_manager")
+
+    # One literal, inverted once: the navigator map is derived from the
+    # session manager's compile-time map rather than re-declared.
+    assert session.MODULE_NAMESPACES == {
+        "tid": "urn:test:tid",
+        "tidadd": "urn:test:tidadd",
+    }
+    assert base.NAMESPACE_MODULES == {
+        "urn:test:tid": "tid",
+        "urn:test:tidadd": "tidadd",
+    }
+
+    data = nav.Data(None, [])
+    system = data.tid_system
+
+    # Same module all the way down: only the top-level node is qualified.
+    assert system.instance_identifier() == "/tid:system"
+    assert (
+        system.user("alice").instance_identifier() == "/tid:system/user[name='alice']"
+    )
+
+    # RFC 7950 Sec 9.13: one predicate per key, in key order.
+    assert (
+        system.server("192.0.2.1", 80).instance_identifier()
+        == "/tid:system/server[ip='192.0.2.1'][port='80']"
+    )
+
+    # RFC 7950 Sec 9.7.2: a boolean key's lexical form is true/false, not
+    # Python's True/False.
+    assert system.flag(True).instance_identifier() == "/tid:system/flag[on='true']"
+
+    # RFC 7950 Sec 9.13: a key of type empty has no value and is a zero-length
+    # string; None is refused rather than rendered as "None".
+    assert system.marker("").instance_identifier() == "/tid:system/marker[tag='']"
+    with pytest.raises(ValueError, match="cannot be None"):
+        system.user(None).instance_identifier()
+
+    # RFC 7950 Sec 7.17: an augmented node keeps its own module, so the path
+    # qualifies at the module boundary and drops the prefix again after it.
+    assert (
+        system.user("alice").prefs.instance_identifier()
+        == "/tid:system/user[name='alice']/tidadd:prefs"
+    )
+    assert (
+        system.user("alice").prefs.addr("10.0.0.1").instance_identifier()
+        == "/tid:system/user[name='alice']/tidadd:prefs/addr[ip='10.0.0.1']"
+    )
+
+    # RFC 7950 Sec 14: either quote style, whichever the value allows.
+    assert (
+        system.user("o'brien").instance_identifier()
+        == '/tid:system/user[name="o\'brien"]'
+    )
+
+    # A value holding both quote characters has no representable form.
+    with pytest.raises(ValueError, match="both quote characters"):
+        system.user("both'\"quotes").instance_identifier()
+
+    # Not instance nodes: the datastore root, a list collection, an rpc.
+    with pytest.raises(ValueError, match="datastore root"):
+        data.instance_identifier()
+    with pytest.raises(ValueError, match="list collection"):
+        system.user.instance_identifier()
+    with pytest.raises(ValueError, match="not in the data tree"):
+        nav.Operations(None, []).tid_do_thing.instance_identifier()
+
+    # An unknown namespace must fail closed: a bare name would silently mean
+    # "same module as the parent" (RFC 7951 Sec 6.11), i.e. a different path.
+    with pytest.raises(ValueError, match="no module name is known"):
+        base.Node(None, [("urn:test:unknown", "x", {})]).instance_identifier()
 
 
 def test_no_nonexistent_rfc_sections_cited():

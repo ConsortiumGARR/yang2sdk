@@ -1,11 +1,21 @@
 import logging
+from enum import Enum
 from typing import Annotated, Any, Generic, TypeVar, get_args, get_origin, Union
 import types
 from lxml import etree
 from pydantic import BaseModel, ValidationError
-from ..session_manager import NetconfClient, validate_depth
+from ..session_manager import NetconfClient, validate_depth, MODULE_NAMESPACES
 
 log = logging.getLogger(__name__)
+
+# Inverted once at import: an instance-identifier names each node by its
+# DEFINING module (RFC 7951 Sec 6.11), and the path tuples carry namespaces.
+# The compile-time map is the authority here -- the device's <hello> describes
+# what the peer speaks, not which module a compiled node came from, and
+# `client.module_namespaces` is overlaid with it after construction.
+NAMESPACE_MODULES: dict[str, str] = {
+    ns: name for name, ns in MODULE_NAMESPACES.items()
+}
 
 
 def _child_model_and_kind(annotation: Any) -> tuple[type | None, bool]:
@@ -683,10 +693,93 @@ def wrap_list_in_parent_hierarchy(elements: list[etree._Element], path_tuples: l
     return [current]
 
 
+def _predicate_value(value: Any) -> str:
+    """Render a key value as an RFC 7950 Sec 14 ``quoted-string``.
+
+    The value must be the key leaf's LEXICAL form, not Python's repr: a boolean
+    key is ``true``/``false`` (Sec 9.7.2) and an enumeration key is its assigned
+    name (Sec 9.6.4), whereas ``str()`` yields ``True`` and ``Color.RED`` -- both
+    silently name a different value.
+    """
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, Enum):
+        text = value.name
+    elif value is None:
+        raise ValueError(
+            "a key value cannot be None: RFC 7950 Sec 7.8.2 requires every key "
+            "leaf to have a value in an instance-identifier predicate (an "
+            "`empty` key has none -- pass an empty string, Sec 9.13)"
+        )
+    else:
+        text = str(value)
+    # `quoted-string` has no escape mechanism (Sec 14), so a value holding both
+    # quote characters cannot be represented at all. Emitting it anyway would
+    # produce a string that parses as a different path.
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    raise ValueError(
+        f"key value {value!r} contains both quote characters, and RFC 7950 "
+        "Sec 14 `quoted-string` has no escape form, so it cannot appear in an "
+        "instance-identifier"
+    )
+
+
 class Node:
+    # Generated RPC/action navigators override this: an instance-identifier
+    # addresses nodes in the DATA tree (RFC 7950 Sec 9.13), and rpc/action
+    # input/output nodes are not data nodes (Sec 7.15).
+    _yang_node_kind = "data"
+
     def __init__(self, client: NetconfClient, path: list[tuple[str, str, dict]] = None):
         self._client = client
         self._path = path or []
+
+    def instance_identifier(self) -> str:
+        """This node as an RFC 7950 Sec 9.13 instance-identifier.
+
+        Encoded per RFC 7951 Sec 6.11: the leftmost node is always
+        module-qualified, and a later node is qualified only when its module
+        differs from its parent's. One predicate per key, in key order, because
+        Sec 9.13 requires every key to have one.
+        """
+        if not self._path:
+            raise ValueError(
+                "the datastore root is not an instance node, so it has no "
+                "instance-identifier (RFC 7950 Sec 9.13)"
+            )
+        if self._yang_node_kind != "data":
+            raise ValueError(
+                "rpc/action nodes are not in the data tree (RFC 7950 Sec 7.15); "
+                "an instance-identifier addresses data nodes only (Sec 9.13)"
+            )
+        rendered: list[str] = []
+        previous: str | None = None
+        for ns, tag, keys in self._path:
+            module = NAMESPACE_MODULES.get(ns)
+            if module is None:
+                # A bare name would silently mean "same module as the parent"
+                # (RFC 7951 Sec 6.11), i.e. a different identifier.
+                raise ValueError(
+                    f"no module name is known for namespace {ns!r} ({tag!r}); "
+                    "cannot build a module-qualified instance-identifier"
+                )
+            segment = f"{module}:{tag}" if module != previous else tag
+            if keys:
+                # A key leaf is a child leaf of the list (RFC 7950 Sec 7.8.2)
+                # bound to the list's module namespace (a grouping's nodes bind
+                # to the module that uses them, Sec 7.13), so its predicate name
+                # stays simple -- RFC 7951 Sec 6.11.
+                segment += "".join(
+                    f"[{key_name}={_predicate_value(value)}]"
+                    for key_name, value in keys.items()
+                )
+            rendered.append(segment)
+            previous = module
+        return "/" + "/".join(rendered)
+
 
 class ItemNode(Node): pass
 TNode = TypeVar("TNode", bound=ItemNode)
@@ -695,5 +788,11 @@ class ListNode(Node, Generic[TNode]):
     def __init__(self, client: NetconfClient, item_cls: type[TNode], path: list = None):
         super().__init__(client, path)
         self._item_cls = item_cls
+
+    def instance_identifier(self) -> str:
+        raise ValueError(
+            "a list collection is not an instance node; call the navigator with "
+            "its keys first (RFC 7950 Sec 9.13 requires one predicate per key)"
+        )
 
     def __call__(self, *keys: Any) -> TNode: raise NotImplementedError("Implemented by generated subclasses")
