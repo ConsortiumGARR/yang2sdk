@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, cast, get_args
 
 import pytest
 
@@ -4309,6 +4309,134 @@ def test_undeclared_xml_attributes_are_dropped_but_elements_are_not(tmp_path):
     assert base_src.count("def from_xml_tree(cls") == 1, base_src.count(
         "def from_xml_tree(cls"
     )
+
+
+# --- a read builds only the models its payload reaches ----------------------
+
+LAZY_YANG = """module tlazy {
+  prefix tl;
+  namespace "urn:test:tlazy";
+  revision 2026-01-01;
+
+  container top {
+    container mid {
+      container deep {
+        container deeper {
+          leaf value { type string; }
+        }
+      }
+      leaf name { type string; }
+    }
+    container sibling {
+      leaf value { type string; }
+    }
+  }
+
+  rpc ping {
+    input {
+      container target {
+        leaf address { type string; }
+      }
+    }
+  }
+}
+"""
+
+LAZY_SHALLOW = b'<top xmlns="urn:test:tlazy"><mid><name>a</name></mid></top>'
+LAZY_DEEP = (
+    b'<top xmlns="urn:test:tlazy"><mid><deep><deeper><value>7</value>'
+    b"</deeper></deep><name>a</name></mid></top>"
+)
+LAZY_RPC = (
+    b'<ping xmlns="urn:test:tlazy"><input><target><address>1.1.1.1</address>'
+    b"</target></input></ping>"
+)
+
+
+def _annotated_model(annotation: Any) -> Any:
+    """The single model class an Optional[X] field annotation binds to."""
+    for arg in get_args(annotation):
+        if isinstance(arg, type) and hasattr(arg, "model_fields"):
+            return arg
+    raise AssertionError(f"no model class in annotation {annotation!r}")
+
+
+def test_from_xml_builds_only_the_models_the_payload_instantiates(tmp_path):
+    """A read must not pay for the whole model graph.
+
+    pydantic-xml asserts that a field's model has a serializer before it walks
+    a parent's fields (`serializers/factories/model.py:450`), even when the
+    element is absent, so the target model's direct children are mandatory.
+    Anything deeper is only reachable through a present element, so it must
+    stay unbuilt.
+
+    Regression: `from_xml` called `rebuild_model_and_dependencies` first, which
+    builds every reachable class. Measured on the G30 tree that is 1355 model
+    classes / ~30k fields / 34s cold -- while the reply holding two leaves
+    arrived from the device in 0.1s.
+    """
+    out, _ = _gen(tmp_path, "netconf", LAZY_YANG, "lazy")
+    models = _import(out, "data_models.tlazy")
+
+    top = models.Top
+    mid = _annotated_model(top.model_fields["mid"].annotation)
+    deep = _annotated_model(mid.model_fields["deep"].annotation)
+    deeper = _annotated_model(deep.model_fields["deeper"].annotation)
+    sibling = _annotated_model(top.model_fields["sibling"].annotation)
+
+    # `defer_build=True` keeps import cheap; nothing is built yet.
+    assert top.__xml_serializer__ is None
+    assert deeper.__xml_serializer__ is None
+
+    parsed = top.from_xml(LAZY_SHALLOW)
+    assert parsed.mid.name == "a"
+
+    assert top.__xml_serializer__ is not None
+    # Direct children are required by pydantic-xml even when absent: `sibling`
+    # is not in the payload, `deep` is a child of the present `mid`.
+    assert sibling.__xml_serializer__ is not None
+    assert deep.__xml_serializer__ is not None
+    # But `deeper` sits below an absent element, so nothing can reach it.
+    assert deeper.__xml_serializer__ is None, (
+        "a model absent from the payload was built; the read path is walking "
+        "the whole graph again"
+    )
+
+    # A payload that does carry it builds it on demand and parses it.
+    parsed = top.from_xml(LAZY_DEEP)
+    assert parsed.mid.deep.deeper.value == "7"
+    assert deeper.__xml_serializer__ is not None
+
+    # An RPC envelope field is emitted as `element(tag="input")` with no
+    # `json_schema_extra`, so the payload walk cannot key off it. Missing that
+    # case left the input model unbuilt and every RPC reply failed with
+    # "model ... is partially initialized".
+    ping = models.Ping
+    ping_input = _annotated_model(ping.model_fields["input"].annotation)
+    target = _annotated_model(ping_input.model_fields["target"].annotation)
+    assert ping_input.__xml_serializer__ is None
+    parsed = ping.from_xml(LAZY_RPC)
+    assert parsed.input.target.address == "1.1.1.1"
+    assert ping_input.__xml_serializer__ is not None
+    assert target.__xml_serializer__ is not None
+
+    # Pruning is a pure metadata walk: it must never trigger a schema build.
+    nav_base = _pkg_file(out, "data_navigators", "_base.py").read_text()
+    assert "rebuild_model_and_dependencies(" not in nav_base
+
+
+def test_payload_driven_build_matches_the_whole_graph_build(tmp_path):
+    """The lazy build must be an optimisation, not a behaviour change."""
+    eager_out, _ = _gen(tmp_path / "eager", "netconf", LAZY_YANG, "lazyeager")
+    eager_models = _import(eager_out, "data_models.tlazy")
+    eager_base = _import(eager_out, "data_models._base")
+    eager_base.rebuild_model_and_dependencies(eager_models.Top)
+    expected = eager_models.Top.from_xml(LAZY_DEEP).model_dump()
+
+    lazy_out, _ = _gen(tmp_path / "lazy", "netconf", LAZY_YANG, "lazylazy")
+    lazy_models = _import(lazy_out, "data_models.tlazy")
+    assert lazy_models.Top.__xml_serializer__ is None
+    assert lazy_models.Top.from_xml(LAZY_DEEP).model_dump() == expected
 
 
 # --- the replace() guard must only count *config* nodes ---------------------

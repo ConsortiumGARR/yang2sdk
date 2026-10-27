@@ -298,9 +298,11 @@ def prune_xml_tree_to_depth(
     """
     if model_cls is None or max_depth is None:
         return
-    if hasattr(model_cls, "model_rebuild"):
-        from ..data_models._base import rebuild_model_and_dependencies
-        rebuild_model_and_dependencies(model_cls)
+    # Pure metadata walk: `model_fields` / `json_schema_extra` exist as soon as
+    # the class is created, so pruning must never trigger a pydantic schema
+    # build. It used to call `rebuild_model_and_dependencies` here, which built
+    # the whole model graph (1355 classes / 34s cold on G30) before the reply
+    # was even parsed -- once per recursion level.
     if not hasattr(model_cls, "model_fields"):
         return
 
@@ -371,9 +373,7 @@ def prune_xml_to_content(
         return
     if model_cls is None:
         return
-    if hasattr(model_cls, "model_rebuild"):
-        from ..data_models._base import rebuild_model_and_dependencies
-        rebuild_model_and_dependencies(model_cls)
+    # Pure metadata walk, for the same reason as `prune_xml_tree_to_depth`.
     if not hasattr(model_cls, "model_fields"):
         return
 

@@ -64,29 +64,38 @@ class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
 
     @classmethod
     def from_xml(cls, source: str | bytes, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
-        rebuild_model_and_dependencies(cls)
         # Always parse to a tree: attribute handling has to see the elements.
         # (Passing an lxml element straight to pydantic-xml's from_xml() raises
         # "memoryview: a bytes-like object is required".)
         root = etree.fromstring(source)
         if module_namespaces:
             normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+        root = cls._drop_unbound_attributes(root)
+        ensure_xml_models_built(root, cls)
+        return super().from_xml_tree(root, *args, **kwargs)
 
     @classmethod
     def from_xml_tree(cls, root: etree._Element, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
-        rebuild_model_and_dependencies(cls)
         if module_namespaces:
             normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+        root = cls._drop_unbound_attributes(root)
+        ensure_xml_models_built(root, cls)
+        return super().from_xml_tree(root, *args, **kwargs)
 
     def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
-        rebuild_model_and_dependencies(self.__class__)
+        ensure_instance_models_built(self)
         return super().to_xml(*args, **kwargs)
 
 
 def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] = None) -> None:
-    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers."""
+    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers.
+
+    This builds the WHOLE reachable graph and is therefore the expensive,
+    explicit path (used by the model-gap introspection tool). Reads and writes
+    use `ensure_xml_models_built` / `ensure_instance_models_built`, which build
+    only what the payload or instance actually reaches; see those docstrings
+    for the measured cost difference.
+    """
     if memo is None:
         memo = set()
     if cls in memo:
@@ -122,6 +131,146 @@ def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] =
 
     # Final seal: lock-in serializers once child dependencies are completely built
     cls.model_rebuild()
+
+
+def _nested_model_classes(annotation: Any) -> list[type]:
+    """Every NetconfXmlModel subclass an annotation can bind to.
+
+    Walks unions, Annotated and list/tuple/set/dict arguments, so a union of
+    models returns every member (pydantic-xml builds one serializer per
+    member).
+    """
+    found: list[type] = []
+
+    def walk(annot: Any) -> None:
+        if isinstance(annot, type):
+            if issubclass(annot, NetconfXmlModel) and annot not in found:
+                found.append(annot)
+            return
+        for arg in get_args(annot):
+            walk(arg)
+
+    walk(annotation)
+    return found
+
+
+#: (tag, ns) -> model classes per model class, computed once (`model_fields`
+#: never change after class creation). Without it every element of a list entry
+#: would re-walk the parent's annotations.
+_XML_CHILD_MODELS: dict[type, dict[tuple[str | None, str | None], tuple[type, ...]]] = {}
+
+
+def _xml_child_models(model_cls: type) -> dict[tuple[str | None, str | None], tuple[type, ...]]:
+    """Map (tag, ns) -> the model classes that element binds to, for one model.
+
+    Data nodes carry `tag`/`ns` in `json_schema_extra`, and there `ns` is
+    authoritative: an augment keeps the AUGMENTING module's namespace on the
+    wire (RFC 7950 Sec 7.17), which is *not* the child class's own default
+    nsmap (measured: 43 such fields on the G30 tree, e.g.
+    `SubcardPortSubportItem.partner_port`). RPC envelope fields
+    (`element(tag="input")`) carry no `json_schema_extra` at all, so they fall
+    back to the child class's own tag and default namespace -- which is what
+    pydantic-xml binds. Missing an untagged field here is not cosmetic: the
+    child would stay unbuilt and the RPC reply would fail with
+    "model ... is partially initialized".
+    """
+    cached = _XML_CHILD_MODELS.get(model_cls)
+    if cached is not None:
+        return cached
+    children: dict[tuple[str | None, str | None], list[type]] = {}
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        ns = extra.get("ns")
+        for child_cls in _nested_model_classes(field_info.annotation):
+            if child_cls is model_cls:
+                continue
+            child_tag, child_ns = tag, ns
+            if child_tag is None:
+                child_tag = child_cls.__xml_tag__
+                child_ns = (child_cls.__xml_nsmap__ or {}).get("")
+            bucket = children.setdefault((child_tag, child_ns), [])
+            if child_cls not in bucket:
+                bucket.append(child_cls)
+    cached = {key: tuple(value) for key, value in children.items()}
+    _XML_CHILD_MODELS[model_cls] = cached
+    return cached
+
+
+def _ensure_direct_children_built(model_cls: type, built: set[type]) -> None:
+    """Build one model plus every model class its own fields reference.
+
+    pydantic-xml asserts a field's model serializer exists before it walks a
+    parent's fields -- `ModelDeserializer.deserialize` for deserialization and
+    `ModelSerializer.serialize` for serialization (both in
+    `pydantic_xml/serializers/factories/model.py`; `:450` and `:417` in
+    pydantic-xml 2.22.0) -- and it does so even when the element or value is
+    absent. Those direct children are therefore mandatory; anything deeper is
+    only reachable through a present element/value, so it is built there
+    instead.
+    """
+    if model_cls not in built:
+        built.add(model_cls)
+        if model_cls.__xml_serializer__ is None:
+            model_cls.model_rebuild()
+    for classes in _xml_child_models(model_cls).values():
+        for child_cls in classes:
+            if child_cls in built:
+                continue
+            built.add(child_cls)
+            if child_cls.__xml_serializer__ is None:
+                child_cls.model_rebuild()
+
+
+def ensure_xml_models_built(
+    element: etree._Element,
+    model_cls: type,
+    built: set[type] | None = None,
+) -> None:
+    """Build exactly the model classes this payload instantiates.
+
+    The previous implementation rebuilt the whole reachable graph
+    (`rebuild_model_and_dependencies`) before parsing anything. Measured on the
+    G30 tree: 1355 model classes / ~30k fields, 34s cold -- while the reply
+    itself arrived in 0.1s. Cost is unavoidable per class (pydantic schema
+    generation), so the fix is to stop paying it for classes the reply cannot
+    reach: descend only into elements that are actually present.
+
+    Same payload on the same tree: 10 classes / ~4s for a container read, and
+    the full graph is only built by a full-tree read that actually carries it.
+    """
+    if built is None:
+        built = set()
+    _ensure_direct_children_built(model_cls, built)
+    children = _xml_child_models(model_cls)
+    for child_element in element:
+        qname = etree.QName(child_element)
+        for (tag, ns), classes in children.items():
+            if qname.localname != tag or (ns and qname.namespace != ns):
+                continue
+            for child_cls in classes:
+                ensure_xml_models_built(child_element, child_cls, built)
+
+
+def ensure_instance_models_built(model: Any, built: set[type] | None = None) -> None:
+    """Serialization twin of `ensure_xml_models_built`, driven by the instance.
+
+    `ModelSerializer.serialize` asserts the same direct-child invariant as the
+    deserializer, so a write payload needs the classes its populated fields
+    reach -- not the whole graph.
+    """
+    if built is None:
+        built = set()
+    model_cls = type(model)
+    _ensure_direct_children_built(model_cls, built)
+    for name, field_info in model_cls.model_fields.items():
+        value = getattr(model, name, None)
+        if value is None or not _nested_model_classes(field_info.annotation):
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            if isinstance(item, NetconfXmlModel):
+                ensure_instance_models_built(item, built)
 
 def _extract_child_model(annot: Any) -> type | None:
     """Unwrap Optional/list/Annotated aliases to the nested model class."""

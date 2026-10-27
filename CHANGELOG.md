@@ -61,6 +61,30 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Fixed
 
+- **A NETCONF read no longer builds the whole YANG model graph before it can
+  parse the reply.** `NetconfXmlModel.from_xml`/`from_xml_tree` called
+  `rebuild_model_and_dependencies`, which walks and builds *every* model class
+  reachable from the target, and `prune_xml_tree_to_depth`/`prune_xml_to_content`
+  called it again once per recursion level. Measured on the G30 tree: 1355 model
+  classes / ~30k fields, 34s cold, while the device's reply arrived in 0.1s.
+  Both paths are now payload-driven: pydantic-xml asserts that a field's model
+  has a serializer before it walks a parent's fields
+  (`ModelDeserializer.deserialize` / `ModelSerializer.serialize` in
+  `pydantic_xml/serializers/factories/model.py`) even when the element/value is
+  absent, so a model's *direct* children are still built — but nothing deeper
+  is built unless the payload actually carries that element. Same reply, same
+  tree: 10 classes / ~4s, and the full graph is only built by a full-tree read
+  that carries it. `to_xml`
+  gets the same treatment, driven by the instance's populated fields instead of
+  the class graph. The pruning helpers are now pure metadata walks and never
+  trigger a schema build. `rebuild_model_and_dependencies` is unchanged and
+  still available as the explicit whole-graph build (`--check-model-gaps` uses
+  it). Pinned by
+  `tests/test_matrix.py::test_from_xml_builds_only_the_models_the_payload_instantiates`
+  (an absent grandchild must stay unbuilt) and
+  `::test_payload_driven_build_matches_the_whole_graph_build` (the lazy path
+  produces an identical `model_dump`).
+
 - **An invalid XML-Schema `pattern` now explains itself, and a pattern Python
   cannot compile fails generation instead of the caller's first assignment.**
   `yang2sdk --protocol netconf --device g30` refused the entire client with
