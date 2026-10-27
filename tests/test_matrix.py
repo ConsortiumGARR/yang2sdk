@@ -2808,6 +2808,502 @@ def test_read_pruning_is_bounded_by_the_requested_depth(tmp_path):
     assert base._maybe_prune(full_entries, 2) == full_entries
 
 
+# --- NETCONF depth: filter, skeleton, and D pruner -------------------------
+
+DEPTH_YANG = """module tdepth {
+  prefix td;
+  namespace "urn:test:tdepth";
+  revision 2026-01-01;
+  container root {
+    leaf name { type string; }
+    leaf-list tags { type string; }
+    container child {
+      leaf value { type string; }
+      container grand { leaf deep { type string; } }
+    }
+    container wrapper {
+      container inner { leaf deep { type string; } }
+    }
+    container strict {
+      leaf must-have { type string; mandatory true; }
+    }
+    list items {
+      key "id";
+      leaf id { type string; }
+      leaf label { type string; }
+      container detail { leaf code { type string; } }
+    }
+    // YANG 1.1 permits a keyless list when config is false; pyang otherwise
+    // refuses the model with NEED_KEY. This is the shape the depth filter must
+    // treat as a boundary keyless list.
+    list keyless {
+      config false;
+      leaf value { type string; }
+    }
+  }
+}
+"""
+
+_DEPTH_XML = (
+    '<root xmlns="urn:test:tdepth">'
+    "<name>n</name><tags>t</tags>"
+    "<child><value>v</value><grand><deep>d</deep></grand></child>"
+    "<wrapper><inner><deep>d</deep></inner></wrapper>"
+    "<strict><must-have>m</must-have></strict>"
+    "<items><id>a</id><label>l</label><detail><code>c</code></detail></items>"
+    "<keyless><value>kv</value></keyless>"
+    "</root>"
+)
+
+
+def _depth_filter_tags(element):
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    return {_et.QName(child).localname for child in element}
+
+
+def _assert_filter_is_bounded(base, element, model_cls):
+    """Every complex element must retain a selection node (RFC 6241 Sec 6.2)."""
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    for info in model_cls.model_fields.values():
+        extra = info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if not tag:
+            continue
+        child_cls, _is_list = base._child_model_and_kind(info.annotation)
+        if child_cls is None:
+            continue
+        for child in element:
+            if _et.QName(child).localname != tag:
+                continue
+            if extra.get("ns") and _et.QName(child).namespace != extra.get("ns"):
+                continue
+            assert not base._is_whole_subtree_trigger(child), (
+                f"depth filter has a whole-subtree trigger at {tag}: "
+                f"{_et.tostring(child, encoding='unicode')}"
+            )
+            _assert_filter_is_bounded(base, child, child_cls)
+
+
+def test_netconf_depth_filter_never_selects_a_whole_subtree(tmp_path):
+    """RFC 6241 has no server-side depth, so the generated filter is the
+    ceiling. An empty complex element is a selection node and would fetch the
+    whole subtree; a content-match-only sibling set would too. The builder
+    must drop boundary containers/keyless lists, keep boundary keys, and
+    collapse to `None` (skeleton) when the target itself is a trigger.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tdepth")
+
+    root_path = [("urn:test:tdepth", "root", {})]
+    f2 = base.build_depth_filter(root_path, models.Root, 2)
+    assert f2 is not None
+    _assert_filter_is_bounded(base, f2, models.Root)
+    assert all("operation" not in _et.QName(node).localname for node in f2.iter()), (
+        "nc:operation is an attribute, not a data node in a read filter"
+    )
+    assert _depth_filter_tags(f2) == {"name", "tags", "items"}, (
+        f"depth 2 must drop boundary containers and the keyless list: "
+        f"{_et.tostring(f2, encoding='unicode')}"
+    )
+    items2 = next(c for c in f2 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items2) == {"id"}, (
+        "a keyed list on the boundary must keep keys only"
+    )
+
+    f3 = base.build_depth_filter(root_path, models.Root, 3)
+    assert f3 is not None
+    _assert_filter_is_bounded(base, f3, models.Root)
+    assert _depth_filter_tags(f3) == {
+        "name",
+        "tags",
+        "child",
+        "strict",
+        "items",
+        "keyless",
+    }, (
+        "wrapper's only child is on the boundary, so the emptied wrapper must "
+        f"be removed: {_et.tostring(f3, encoding='unicode')}"
+    )
+    child3 = next(c for c in f3 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child3) == {"value"}
+    items3 = next(c for c in f3 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items3) == {"id", "label"}
+
+    f4 = base.build_depth_filter(root_path, models.Root, 4)
+    assert f4 is not None
+    _assert_filter_is_bounded(base, f4, models.Root)
+    assert _depth_filter_tags(f4) == {
+        "name",
+        "tags",
+        "child",
+        "wrapper",
+        "strict",
+        "items",
+        "keyless",
+    }
+    child4 = next(c for c in f4 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child4) == {"value", "grand"}
+    wrapper4 = next(c for c in f4 if _et.QName(c).localname == "wrapper")
+    inner4 = next(c for c in wrapper4 if _et.QName(c).localname == "inner")
+    assert _depth_filter_tags(inner4) == {"deep"}
+    items4 = next(c for c in f4 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items4) == {"id", "label", "detail"}
+
+    # depth=1 on a container cannot be expressed without selecting its whole
+    # subtree: the caller must get a skeleton instead.
+    assert base.build_depth_filter(root_path, models.Root, 1) is None
+
+    # A keyed list collection at depth=1 is expressible as keys-only.
+    items_path = [("urn:test:tdepth", "root", {}), ("urn:test:tdepth", "items", {})]
+    f_items1 = base.build_depth_filter(items_path, models.ItemsItem, 1)
+    assert f_items1 is not None
+    _assert_filter_is_bounded(base, f_items1, models.Root)
+    items1 = f_items1[0]
+    assert _depth_filter_tags(items1) == {"id"}
+    assert all(child.text is None for child in items1), (
+        "collection keys must be selection nodes, not content matches"
+    )
+
+    # A keyless list at depth=1 has no addressable key and no kept child.
+    keyless_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "keyless", {}),
+    ]
+    assert base.build_depth_filter(keyless_path, models.KeylessItem, 1) is None
+
+    # A specific list item at depth=1 has only its path keys (content matches).
+    item_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "items", {"id": "a"}),
+    ]
+    assert base.build_depth_filter(item_path, models.ItemsItem, 1) is None
+    f_item2 = base.build_depth_filter(item_path, models.ItemsItem, 2)
+    assert f_item2 is not None
+    _assert_filter_is_bounded(base, f_item2, models.Root)
+    items2 = f_item2[0]
+    assert _depth_filter_tags(items2) == {"id", "label"}
+    assert items2[0].text == "a", "the path key must stay a content match"
+    assert items2[1].text is None, "the selected leaf must stay a selection node"
+
+    # A container target whose only child is on the boundary collapses.
+    wrapper_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "wrapper", {}),
+    ]
+    assert base.build_depth_filter(wrapper_path, models.Wrapper, 2) is None
+    f_wrapper3 = base.build_depth_filter(wrapper_path, models.Wrapper, 3)
+    assert f_wrapper3 is not None
+    _assert_filter_is_bounded(base, f_wrapper3, models.Root)
+
+    # `fields` may not smuggle a complex field in empty; a leaf is fine.
+    assert base.build_depth_filter(root_path, models.Root, 2, fields=["child"]) is None
+    f_field = base.build_depth_filter(root_path, models.Root, 2, fields=["name"])
+    assert f_field is not None
+    assert _depth_filter_tags(f_field) == {"name"}
+    f_field3 = base.build_depth_filter(root_path, models.Root, 3, fields=["child"])
+    assert f_field3 is not None
+    _assert_filter_is_bounded(base, f_field3, models.Root)
+    assert _depth_filter_tags(f_field3) == {"child"}
+    assert _depth_filter_tags(f_field3[0]) == {"value"}
+
+
+def test_netconf_depth_pruner_matches_restconf_boundary(tmp_path):
+    """The local safety net must use the same level convention as RESTCONF:
+    target level 1, boundary containers/keyless lists removed, boundary keys
+    kept. It must trim a server that ignores the filter.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tdepth")
+
+    root1 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root1, models.Root, 1)
+    assert _depth_filter_tags(root1) == set(), "depth 1 is the target alone"
+
+    root2 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root2, models.Root, 2)
+    assert _depth_filter_tags(root2) == {"name", "tags", "items"}
+    items2 = next(c for c in root2 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items2) == {"id"}
+
+    root3 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root3, models.Root, 3)
+    assert _depth_filter_tags(root3) == {
+        "name",
+        "tags",
+        "child",
+        "wrapper",
+        "strict",
+        "items",
+        "keyless",
+    }
+    child3 = next(c for c in root3 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child3) == {"value"}
+    wrapper3 = next(c for c in root3 if _et.QName(c).localname == "wrapper")
+    assert _depth_filter_tags(wrapper3) == set(), (
+        "a non-boundary container emptied by pruning stays as an empty shell "
+        "(RESTCONF _maybe_prune only drops empties exactly at the boundary)"
+    )
+    items3 = next(c for c in root3 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items3) == {"id", "label"}
+
+    entry1 = _et.fromstring(
+        '<items xmlns="urn:test:tdepth"><id>a</id><label>l</label>'
+        "<detail><code>c</code></detail></items>"
+    )
+    base.prune_xml_tree_to_depth(entry1, models.ItemsItem, 1)
+    assert _depth_filter_tags(entry1) == {"id"}
+
+
+def _netconf_depth_client(replies=None, forbid=False):
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    class _Client:
+        module_namespaces: ClassVar[dict[str, str]] = {}
+        has_nmda = False
+
+        def __init__(self):
+            self.calls = []
+            self.replies = list(replies or [])
+            self.forbid = forbid
+
+        def retrieve(self, **kwargs):
+            if self.forbid:
+                raise AssertionError("skeleton path must not hit the wire")
+            self.calls.append(kwargs)
+            return self.replies.pop(0) if self.replies else None
+
+    return _Client(), _et
+
+
+def test_netconf_depth_skeleton_does_not_hit_the_wire(tmp_path, caplog):
+    """A collapsed finite-depth filter is not sent. The caller gets the
+    RESTCONF-shaped skeleton (container empty model, keyed item with path
+    keys, keyless list []) and a warning; no RPC is issued.
+    """
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    nav = _import(out, "data_navigators")
+
+    client, _ = _netconf_depth_client(forbid=True)
+    data = nav.Data(client, [])
+
+    with caplog.at_level("WARNING"):
+        root = data.tdepth_root.retrieve(depth=1)
+    assert root is not None and client.calls == []
+    assert getattr(root, "_yang2sdk_skeleton", False) is True
+    assert "whole subtree" in caplog.text
+    assert "root" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        item = data.tdepth_root.items("a").retrieve(depth=1)
+    assert item is not None and item.id == "a"
+    assert getattr(item, "_yang2sdk_skeleton", False) is True
+    assert client.calls == []
+    assert "root/items" in caplog.text
+    assert "'a'" not in caplog.text, "the warning must not log instance key values"
+
+    keyless = data.tdepth_root.keyless.retrieve(depth=1)
+    assert keyless == [] and client.calls == []
+    assert getattr(keyless, "_yang2sdk_skeleton", False) is True
+
+    # Mandatory fields cannot validate an empty container; the skeleton path
+    # deliberately falls back to model_construct instead of raising.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        strict = data.tdepth_root.strict.retrieve(depth=1)
+    assert strict is not None and client.calls == []
+    assert getattr(strict, "_yang2sdk_skeleton", False) is True
+    assert "cannot satisfy mandatory fields" in caplog.text
+
+
+def test_netconf_skeleton_shape_matches_restconf_depth_one(tmp_path):
+    """The skeleton mirrors the RESTCONF visible shape for the expressible
+    depth-1 cases: empty container, empty keyless list, keyed item with keys.
+    """
+    rout, _ = _gen(tmp_path, "restconf", DEPTH_YANG, "tdepth")
+    rbase = _import(rout, "data_navigators._base")
+
+    assert rbase._maybe_prune({}, 1) == {}, "container depth 1 is empty"
+    assert rbase._maybe_prune([{}], 1) == [], "keyless list depth 1 is []"
+    assert rbase._maybe_prune([{"id": "a"}], 1) == [{"id": "a"}], (
+        "keyed list item depth 1 keeps its keys"
+    )
+    assert rbase._maybe_prune({"id": "a"}, 1) == {"id": "a"}
+
+
+def test_netconf_depth_uses_the_filter_and_prunes_a_lying_server(tmp_path):
+    """The wire path sends a bounded filter; a reply deeper than asked is
+    still trimmed locally (the client cannot undo received bytes, but the
+    model stays bounded).
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    nav = _import(out, "data_navigators")
+
+    # Keyed collection at depth 1: keys-only filter, keys-only entries.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<root xmlns="urn:test:tdepth">'
+        "<items><id>a</id></items><items><id>b</id></items>"
+        "</root></data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    items = data.tdepth_root.items.retrieve(depth=1)
+    assert [item.id for item in items] == ["a", "b"]
+    assert getattr(items, "_yang2sdk_skeleton", False) is False
+    sent = client.calls[0]["filter_xml"]
+    items_filter = next(c for c in sent if _et2.QName(c).localname == "items")
+    assert _depth_filter_tags(items_filter) == {"id"}
+    assert all(child.text is None for child in items_filter)
+
+    # Specific item at depth 2: path key stays a content match, label is a
+    # selection node, and the deeper detail container is trimmed.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<root xmlns="urn:test:tdepth"><items>'
+        "<id>a</id><label>l</label><detail><code>c</code></detail>"
+        "</items></root></data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    item = data.tdepth_root.items("a").retrieve(depth=2)
+    assert item.id == "a" and item.label == "l" and item.detail is None
+    sent = client.calls[0]["filter_xml"]
+    items_filter = next(c for c in sent if _et2.QName(c).localname == "items")
+    assert _depth_filter_tags(items_filter) == {"id", "label"}
+    assert items_filter[0].text == "a"
+    assert items_filter[1].text is None
+
+    # A server that ignores the filter and returns everything is trimmed.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        + _DEPTH_XML
+        + "</data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    model = data.tdepth_root.retrieve(depth=2)
+    assert model.name == "n"
+    assert model.child is None, "boundary container survived the pruner"
+    assert model.keyless is None, "boundary keyless list survived the pruner"
+    assert [entry.id for entry in model.items] == ["a"]
+    assert model.items[0].label is None, "boundary leaf survived the pruner"
+
+
+def test_depth_validation_rejects_only_inexpressible_values(tmp_path):
+    """`depth=1` is valid; reject bool/0/negative/non-numeric/>65535/None
+    before any transport work, on both protocols.
+    """
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    nav = _import(out, "data_navigators")
+
+    assert base.validate_depth(1) == 1
+    assert base.validate_depth("2") == 2
+    assert base.validate_depth(65535) == 65535
+    assert base.validate_depth("unbounded") is None
+    assert base.validate_depth("UNBOUNDED") is None
+    for bad in (0, -1, True, "foo", 70000, None, 1.5, "", " 2 "):
+        with pytest.raises(ValueError, match="depth must be"):
+            base.validate_depth(bad)
+
+    client, _et = _netconf_depth_client(forbid=True)
+    data = nav.Data(client, [])
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            data.tdepth_root.retrieve(depth=bad)
+    assert client.calls == []
+
+    # depth=1 is accepted (the skeleton path), not rejected.
+    assert data.tdepth_root.retrieve(depth=1) is not None
+
+    # RESTCONF uses the same validator before its HTTP request.
+    rout, _ = _gen(tmp_path / "rc", "restconf", DEPTH_YANG, "tdepth")
+    rsm = _import(rout, "session_manager")
+    rnav = _import(rout, "data_navigators")
+    assert rsm.validate_depth(1) == 1
+    assert rsm.validate_depth("unbounded") is None
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            rsm.validate_depth(bad)
+    rclient = _Recorder(reply={"tdepth:root": {}})
+    rdata = rnav.Data(rclient, "/data", "")
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            rdata.tdepth_root.retrieve(depth=bad)
+    assert rclient.calls == []
+
+
+KEYS_YANG = """module tkeys {
+  prefix tk;
+  namespace "urn:test:tkeys";
+  revision 2026-01-01;
+  container root {
+    list items {
+      key "id";
+      leaf id { type string; }
+      leaf cfg { type string; }
+      leaf state { type string; config false; }
+    }
+  }
+}
+"""
+
+
+def test_netconf_content_pruning_keeps_list_keys(tmp_path):
+    """A `content="nonconfig"` read of a config list keeps its state leaves
+    and its keys; dropping the keys made every entry unaddressable. The list
+    shell is still dropped when only keys remain and the list itself does not
+    match the requested content.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", KEYS_YANG, "tkeys")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tkeys")
+    nav = _import(out, "data_navigators")
+
+    xml = (
+        '<root xmlns="urn:test:tkeys"><items>'
+        "<id>a</id><cfg>C</cfg><state>S</state>"
+        "</items></root>"
+    )
+    root = _et.fromstring(xml)
+    base.prune_xml_to_content(root, models.Root, "nonconfig")
+    items = root[0]
+    assert _depth_filter_tags(items) == {"id", "state"}, (
+        f"keys must survive a nonconfig read: {_et.tostring(items)}"
+    )
+
+    root = _et.fromstring(xml)
+    base.prune_xml_to_content(root, models.Root, "config")
+    items = root[0]
+    assert _depth_filter_tags(items) == {"id", "cfg"}
+
+    # End-to-end through the navigator: a legacy <get> reply is unfiltered,
+    # and the navigator's prune is what makes content= mean the same thing.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">' + xml + "</data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    model = data.tkeys_root.retrieve(content="nonconfig", depth="unbounded")
+    assert model is not None
+    assert model.items[0].id == "a"
+    assert model.items[0].state == "S"
+    assert model.items[0].cfg is None
+
+
 def test_logging_redacts_passphrase_and_never_leaks_the_error_body(tmp_path):
     """Security: NTP/TACACS/RADIUS authenticator passphrases contain neither
     the substring "password" nor "passwd", so the redaction list let them
@@ -3199,6 +3695,52 @@ def test_augment_model_root_uses_augmenting_namespace(tmp_path):
         module_namespaces=namespaces,
     )
     assert parsed.mode == "strict"
+
+
+def test_depth_filter_and_pruner_keep_augmenting_namespaces(tmp_path):
+    """RFC 7950 Sec 7.17: augment adds nodes to the target tree, but each
+    node stays in the AUGMENTING module's namespace. The depth filter and the
+    pruner must use `json_schema_extra["ns"]`, not the parent's namespace, or
+    the device answers correctly and the client rejects it.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen_roots(
+        tmp_path,
+        "netconf",
+        {"taug": AUGMENT_BASE_YANG, "taugext": AUGMENT_EXT_YANG},
+        ["taug", "taugext"],
+        "augm",
+    )
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.taug")
+
+    path = [("urn:test:taug", "system", {})]
+    f2 = base.build_depth_filter(path, models.System, 2)
+    assert f2 is None, (
+        "system has only boundary containers, so the filter must collapse"
+    )
+    f3 = base.build_depth_filter(path, models.System, 3)
+    assert f3 is not None
+    aaa = next(c for c in f3 if etree.QName(c).localname == "aaa")
+    assert etree.QName(aaa).namespace == "urn:test:taugext"
+    mode = next(c for c in aaa if etree.QName(c).localname == "mode")
+    assert etree.QName(mode).namespace == "urn:test:taugext"
+
+    xml = (
+        '<system xmlns="urn:test:taug">'
+        "<name><host-name>h</host-name></name>"
+        '<aaa xmlns="urn:test:taugext"><mode>strict</mode></aaa>'
+        "</system>"
+    )
+    root2 = etree.fromstring(xml)
+    base.prune_xml_tree_to_depth(root2, models.System, 2)
+    assert _depth_filter_tags(root2) == set(), "both children are boundary containers"
+    root3 = etree.fromstring(xml)
+    base.prune_xml_tree_to_depth(root3, models.System, 3)
+    aaa3 = next(c for c in root3 if etree.QName(c).localname == "aaa")
+    assert etree.QName(aaa3).namespace == "urn:test:taugext"
+    assert _depth_filter_tags(aaa3) == {"mode"}
 
 
 def test_sdk_verify_parse_errors_are_never_device_skips():
@@ -5378,6 +5920,54 @@ def test_netconf_nmda_sends_config_filter(
     node = kwargs["rpc"].find(f"{{{_NMDA_NS}}}config-filter")
     got = None if node is None else node.text
     assert got == want_config_filter, f"{content}: config-filter={got!r}"
+
+
+def test_netconf_nmda_max_depth_is_normalized_and_validated(tmp_path):
+    """NMDA carries `max-depth` (RFC 8526), not the legacy depth filter.
+    `depth=1` is valid, `"2"` is normalized, and `"unbounded"` omits the
+    element. Invalid values fail before the RPC.
+    """
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    for depth, want in ((1, "1"), ("2", "2"), (65535, "65535")):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        client.retrieve(source="running", depth=depth)
+        _verb, kwargs = client._manager.calls[0]
+        node = kwargs["rpc"].find(f"{{{_NMDA_NS}}}max-depth")
+        assert node is not None and node.text == want
+
+    for depth in ("unbounded", "UNBOUNDED"):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        client.retrieve(source="running", depth=depth)
+        _verb, kwargs = client._manager.calls[0]
+        assert kwargs["rpc"].find(f"{{{_NMDA_NS}}}max-depth") is None
+
+    for bad in (0, -1, True, "foo", 70000, None):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        with pytest.raises(ValueError, match="depth must be"):
+            client.retrieve(source="running", depth=bad)
+        assert client._manager.calls == []
+
+
+def test_netconf_legacy_finite_depth_without_a_filter_is_refused(tmp_path):
+    """RFC 6241 has no server-side depth. A finite-depth legacy read with no
+    subtree filter would be a whole-datastore read; the session manager must
+    refuse it instead of silently ignoring the ceiling. `unbounded` remains
+    the explicit escape hatch.
+    """
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    client = _stub_netconf_session(sm, has_nmda=False)
+    with pytest.raises(ValueError, match="subtree filter"):
+        client.retrieve(source="running", depth=2)
+    assert client._manager.calls == []
+
+    # Unbounded is allowed without a filter.
+    client = _stub_netconf_session(sm, has_nmda=False)
+    client.retrieve(source="running", depth="unbounded")
+    assert len(client._manager.calls) == 1
 
 
 @pytest.mark.parametrize(

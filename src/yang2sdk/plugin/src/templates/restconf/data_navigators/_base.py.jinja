@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from urllib.parse import quote
 
+from ..session_manager import validate_depth
+
 if TYPE_CHECKING:
     from ..session_manager import RestconfClient
 
@@ -28,7 +30,7 @@ def _get_max_depth(data: Any, current_depth: int = 1) -> int:
     return current_depth
 
 
-def _maybe_prune(data: Any, depth: int | str) -> Any:
+def _maybe_prune(data: Any, depth: int | str | None) -> Any:
     """Drop empty boundary containers, but never deeper than the caller asked.
 
     RFC 8040 Sec 4.8.2: `depth` is the server-side subtree ceiling, so a
@@ -229,9 +231,10 @@ class Node:
         depth: int | str = "unbounded",
         fields: list[str] | None = None,
     ) -> Any:
+        requested = validate_depth(depth)
         params = {
             "content": content,
-            "depth": depth,
+            "depth": "unbounded" if requested is None else requested,
             "with-defaults": with_defaults,
         }
         if fields:
@@ -255,7 +258,7 @@ class Node:
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        payload = _maybe_prune(payload, depth)
+        payload = _maybe_prune(payload, requested)
 
         return payload
 
@@ -304,9 +307,10 @@ class ItemNode:
         depth: int | str = "unbounded",
         fields: list[str] | None = None,
     ) -> Any:
+        requested = validate_depth(depth)
         params = {
             "content": content,
-            "depth": depth,
+            "depth": "unbounded" if requested is None else requested,
             "with-defaults": with_defaults,
         }
         if fields:
@@ -358,7 +362,7 @@ class ItemNode:
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        payload = _maybe_prune(payload, depth)
+        payload = _maybe_prune(payload, requested)
 
         return payload
 
@@ -437,9 +441,10 @@ class ListNode(Generic[TNode]):
         depth: int | str = "unbounded",
         fields: list[str] | None = None,
     ) -> Any:
+        requested = validate_depth(depth)
         params = {
             "content": content,
-            "depth": depth,
+            "depth": "unbounded" if requested is None else requested,
             "with-defaults": with_defaults,
         }
         if fields:
@@ -489,7 +494,7 @@ class ListNode(Generic[TNode]):
         else:
             raise TypeError(f"Unexpected response type: {type(resp)}")
 
-        data_list = _maybe_prune(data_list, depth)
+        data_list = _maybe_prune(data_list, requested)
 
         return data_list
 

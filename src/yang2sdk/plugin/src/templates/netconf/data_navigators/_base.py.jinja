@@ -1,14 +1,302 @@
-from typing import Annotated, Any, Generic, TypeVar
+import logging
+from typing import Annotated, Any, Generic, TypeVar, get_args, get_origin, Union
+import types
 from lxml import etree
-from pydantic import BaseModel
-from ..session_manager import NetconfClient
+from pydantic import BaseModel, ValidationError
+from ..session_manager import NetconfClient, validate_depth
 
-def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max_depth: int, current_depth: int = 1):
-    """Recursively prunes the XML tree, completely removing complex nodes at the depth boundary.
-    
-    This is needed because in RFC 6241 NETCONF servers do not support depth filtering, so we have to filter here.
+log = logging.getLogger(__name__)
+
+
+def _child_model_and_kind(annotation: Any) -> tuple[type | None, bool]:
+    """Unwrap a field annotation to (nested model, is_yang_list).
+
+    `is_yang_list` is True only for a YANG `list` (a list of models). A
+    leaf-list is a list of primitives and is leaf-like, so it returns
+    (None, False); that distinction is what lets the depth filter keep a
+    leaf-list at the boundary while dropping a keyless list.
     """
-    if model_cls is None:
+    if annotation is None:
+        return None, False
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        for arg in get_args(annotation):
+            child, is_list = _child_model_and_kind(arg)
+            if child is not None or is_list:
+                return child, is_list
+        return None, False
+    if origin is Annotated:
+        for arg in get_args(annotation):
+            child, is_list = _child_model_and_kind(arg)
+            if child is not None or is_list:
+                return child, is_list
+        return None, False
+    if origin in (list, tuple, set):
+        for arg in get_args(annotation):
+            child, _ = _child_model_and_kind(arg)
+            if child is not None:
+                return child, True
+        return None, False
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation, False
+    return None, False
+
+
+def _field_key_info(model_cls: type) -> dict[str, tuple[str, str | None]]:
+    """Map wire key name -> (python field name, key namespace) for a list model."""
+    keys: dict[str, tuple[str, str | None]] = {}
+    for name, field_info in model_cls.model_fields.items():
+        extra = field_info.json_schema_extra or {}
+        if extra.get("is_key"):
+            keys[extra.get("tag", name)] = (name, extra.get("ns"))
+    return keys
+
+
+def _matches(element: etree._Element, tag: str, ns: str | None) -> bool:
+    qname = etree.QName(element)
+    return qname.localname == tag and (not ns or qname.namespace == ns)
+
+
+def _new_element(ns: str | None, tag: str) -> etree._Element:
+    return etree.Element(
+        "{" + ns + "}" + tag if ns else tag,
+        nsmap={None: ns} if ns else None,
+    )
+
+
+def _append_key_children(
+    parent: etree._Element, model_cls: type, fallback_ns: str | None
+) -> None:
+    """Append empty key leaves: selection nodes, never content matches.
+
+    An empty key leaf selects the key without narrowing the sibling set, so a
+    keyed list remains addressable at the depth boundary without selecting the
+    list's whole subtree (RFC 6241 Sec 6.2.5).
+    """
+    for key_tag, (_field_name, key_ns) in _field_key_info(model_cls).items():
+        parent.append(_new_element(key_ns or fallback_ns, key_tag))
+
+
+def _is_key_element(element: etree._Element, model_cls: type) -> bool:
+    for name, field_info in model_cls.model_fields.items():
+        extra = field_info.json_schema_extra or {}
+        if extra.get("is_key") and _matches(
+            element, extra.get("tag", name), extra.get("ns")
+        ):
+            return True
+    return False
+
+
+def _is_whole_subtree_trigger(element: etree._Element) -> bool:
+    """True when an empty filter element would select the whole subtree.
+
+    RFC 6241 Sec 6.2.1/6.2.4: an empty element is a selection node and selects
+    that node's entire subtree. Sec 6.2.5: a sibling set holding only content
+    match nodes (text, no selection node) returns the matched node with all of
+    its siblings. Both shapes are triggers; a complex element must retain at
+    least one empty child (a selection node) to stay bounded.
+    """
+    if len(element) == 0:
+        return True
+    return all(
+        child.text is not None and len(child) == 0 for child in element
+    )
+
+
+def _build_path(
+    path_tuples: list[tuple[str, str, dict[str, Any]]],
+) -> tuple[etree._Element | None, etree._Element | None]:
+    """Build the address path, returning (root, target)."""
+    root = current = None
+    for ns, tag, keys in path_tuples:
+        elem = _new_element(ns, tag)
+        for key_name, value in keys.items():
+            key_elem = _new_element(ns, key_name)
+            key_elem.text = str(value)
+            elem.append(key_elem)
+        if root is None:
+            root = current = elem
+        else:
+            current.append(elem)
+            current = elem
+    return root, current
+
+
+def _populate_depth(
+    element: etree._Element,
+    model_cls: type,
+    level: int,
+    depth: int,
+    fields: list[str] | None = None,
+    is_list_entry_target: bool = False,
+) -> None:
+    """Add selection nodes for levels up to `depth`, never a whole subtree.
+
+    `level` is the level of `element` itself; the target is level 1. A list
+    node and its entries share a level, so an entry's fields sit at
+    `level + 1`. Keys are the addressability exception: they are always
+    emitted for a list collection or a nested list, even past the boundary.
+    A specific list-item target is different -- its path keys are already
+    content matches, and adding empty key children there would turn the
+    content match into a selection over every entry.
+    """
+    child_level = level + 1
+    key_info = _field_key_info(model_cls)
+    if key_info and not is_list_entry_target:
+        _append_key_children(
+            element, model_cls, etree.QName(element).namespace
+        )
+    if fields is None:
+        selected = list(model_cls.model_fields.items())
+    else:
+        selected = [
+            (name, model_cls.model_fields[name])
+            for name in fields
+            if name in model_cls.model_fields
+        ]
+    seen: set[str] = {field_name for field_name, _ns in key_info.values()}
+    for name, field_info in selected:
+        if name in seen or name == "nc_operation":
+            continue
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if not tag:
+            continue
+        seen.add(name)
+        if extra.get("is_key") is True:
+            # Keys were added above for a collection/nested list. For a
+            # specific item target the path key is already the content match.
+            continue
+        ns = extra.get("ns")
+        child_cls, is_list = _child_model_and_kind(field_info.annotation)
+        if child_cls is None:
+            if child_level <= depth:
+                element.append(_new_element(ns, tag))
+            continue
+        if child_level < depth:
+            child = _new_element(ns, tag)
+            element.append(child)
+            _populate_depth(child, child_cls, child_level, depth)
+        elif child_level == depth and is_list and _field_key_info(child_cls):
+            # Boundary keyed list: keys only, so entries stay addressable.
+            child = _new_element(ns, tag)
+            element.append(child)
+            _append_key_children(child, child_cls, ns)
+        # A boundary container or keyless list is not added: an empty one
+        # would select its whole subtree (RFC 6241 Sec 6.2.1).
+
+
+def _remove_whole_subtree_triggers(element: etree._Element, model_cls: type) -> None:
+    """Post-order removal of complex children that would fetch a whole subtree."""
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if not tag:
+            continue
+        child_cls, _is_list = _child_model_and_kind(field_info.annotation)
+        if child_cls is None:
+            continue
+        for child in list(element):
+            if not _matches(child, tag, extra.get("ns")):
+                continue
+            _remove_whole_subtree_triggers(child, child_cls)
+            if _is_whole_subtree_trigger(child):
+                element.remove(child)
+
+
+def build_depth_filter(
+    path_tuples: list[tuple[str, str, dict[str, Any]]],
+    model_cls: type,
+    depth: int,
+    fields: list[str] | None = None,
+) -> etree._Element | None:
+    """Build an RFC 6241 subtree filter that cannot select past `depth`.
+
+    Returns None when the target itself would have to be an empty element
+    (or a content-match-only sibling set). The caller must then not send the
+    filter and return a skeleton instead. This is the legacy-NETCONF guard:
+    RFC 6241 has no server-side depth, so the filter is the only ceiling.
+    """
+    root, target = _build_path(path_tuples)
+    if target is None:
+        return None
+    is_list_entry_target = bool(path_tuples and path_tuples[-1][2])
+    _populate_depth(
+        target,
+        model_cls,
+        1,
+        depth,
+        fields=fields,
+        is_list_entry_target=is_list_entry_target,
+    )
+    _remove_whole_subtree_triggers(target, model_cls)
+    if _is_whole_subtree_trigger(target):
+        return None
+    return root
+
+
+class _SkeletonList(list):
+    """The `[]` returned when a finite-depth list filter collapsed.
+
+    The marker lets `sdk-verify` report a skeleton as a skip rather than a
+    validated read: no request was issued, so nothing was proven about the
+    device.
+    """
+
+    _yang2sdk_skeleton = True
+
+
+def _skeleton_model(
+    model_cls: type, path_tuples: list[tuple[str, str, dict[str, Any]]]
+) -> Any:
+    """Build the RESTCONF-shaped empty value for a collapsed target.
+
+    A container is an empty model; a keyed list item carries the path keys.
+    `model_validate` is tried first so the skeleton has the same validation
+    semantics as a real read. A strict model with mandatory fields cannot
+    validate an empty container, and this path must never raise, so the
+    deliberate fallback is `model_construct` plus a warning.
+    """
+    key_info = _field_key_info(model_cls)
+    values: dict[str, Any] = {}
+    if path_tuples:
+        for wire_name, value in path_tuples[-1][2].items():
+            field_name, _ns = key_info.get(wire_name, (wire_name, None))
+            values[field_name] = value
+    try:
+        model = model_cls.model_validate(values)
+    except ValidationError:
+        log.warning(
+            "Skeleton for %s cannot satisfy mandatory fields; returning an "
+            "unvalidated model_construct() instance.",
+            model_cls.__name__,
+        )
+        model = model_cls.model_construct(**values)
+    object.__setattr__(model, "_yang2sdk_skeleton", True)
+    return model
+
+
+def prune_xml_tree_to_depth(
+    element: etree._Element,
+    model_cls: type | None,
+    max_depth: int,
+    current_depth: int = 1,
+):
+    """Prune a reply to RFC 8040/RFC 8526 depth semantics (safety net).
+
+    The target node is level 1; a list node and its entries share that level,
+    so an entry's children are one level deeper. Nodes through `max_depth`
+    survive, with two exceptions: list keys always survive for addressability
+    (even at max_depth + 1), and a keyed list sitting exactly on the boundary
+    keeps its keys while its other children are removed. Boundary containers
+    and keyless lists are removed entirely. `anydata`/`anyxml` are leaf-like,
+    so their internal content is not depth-counted.
+
+    This runs even when a server-side filter was used, because a server may
+    return more than asked. It cannot undo bytes already received; it only
+    keeps the caller's model bounded.
+    """
+    if model_cls is None or max_depth is None:
         return
     if hasattr(model_cls, "model_rebuild"):
         from ..data_models._base import rebuild_model_and_dependencies
@@ -16,45 +304,41 @@ def prune_xml_tree_to_depth(element: etree._Element, model_cls: type | None, max
     if not hasattr(model_cls, "model_fields"):
         return
 
-    from typing import get_args, get_origin, Union, Annotated
-    import types
-    from pydantic import BaseModel
-
-    def extract_base_model(annot):
-        if annot is None: return None
-        origin = get_origin(annot)
-        if origin in (Union, types.UnionType):
-            for arg in get_args(annot):
-                if res := extract_base_model(arg): return res
-        elif origin is list or origin is Annotated:
-            for arg in get_args(annot):
-                if res := extract_base_model(arg): return res
-        elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
-        return None
-
-    for field_name, field_info in list(model_cls.model_fields.items()):
+    for field_info in model_cls.model_fields.values():
         extra = field_info.json_schema_extra or {}
-        tag = extra.get("tag", field_name)
-        ns = extra.get("ns")
-
-        child_cls = extract_base_model(field_info.annotation)
-        is_complex = child_cls is not None and child_cls != model_cls
-
-        child_nodes = []
+        tag = extra.get("tag")
+        if not tag:
+            continue
+        is_key = extra.get("is_key") is True
+        child_cls, is_list = _child_model_and_kind(field_info.annotation)
         for child in list(element):
-            localname = etree.QName(child).localname
-            namespace = etree.QName(child).namespace
-            if localname == tag and (not ns or namespace == ns):
-                child_nodes.append(child)
+            if not _matches(child, tag, extra.get("ns")):
+                continue
+            if child_cls is None:
+                if is_key or current_depth + 1 <= max_depth:
+                    continue
+                element.remove(child)
+                continue
+            child_level = current_depth + 1
+            if child_level < max_depth:
+                prune_xml_tree_to_depth(child, child_cls, max_depth, child_level)
+            elif child_level == max_depth:
+                if is_list and _field_key_info(child_cls):
+                    for grandchild in list(child):
+                        if not _is_key_element(grandchild, child_cls):
+                            child.remove(grandchild)
+                else:
+                    element.remove(child)
+            else:
+                element.remove(child)
 
-        for child_node in child_nodes:
-            if is_complex and current_depth >= max_depth:
-                # Completely remove complex nodes at boundary so they deserialize as None
-                element.remove(child_node)
-            elif is_complex:
-                prune_xml_tree_to_depth(child_node, child_cls, max_depth, current_depth + 1)
 
-def prune_xml_to_content(element: etree._Element, model_cls: type | None, content: str):
+def prune_xml_to_content(
+    element: etree._Element,
+    model_cls: type | None,
+    content: str,
+    preserve_keys: bool = False,
+):
     """Keep only the nodes matching `content` (RFC 7950 Sec 7.21).
 
     This mirrors the RESTCONF `YangBaseModel._prune_content` rule exactly, so
@@ -74,6 +358,12 @@ def prune_xml_to_content(element: etree._Element, model_cls: type | None, conten
     Sec 7.7 defines as state AND running configuration, with no state-only
     read. Pruning here is what makes the caller's view match the others.
 
+    Keys are addressability metadata. A `content="nonconfig"` read of a config
+    list keeps the state children but must also keep the list's keys, or the
+    entries cannot be addressed. `preserve_keys` is therefore propagated into
+    a list entry and the list is dropped only when nothing but keys remains
+    and the list itself does not match `content`.
+
     Idempotent where the server already filtered, so it is safe to apply
     unconditionally rather than branching on capability a second time.
     """
@@ -87,48 +377,42 @@ def prune_xml_to_content(element: etree._Element, model_cls: type | None, conten
     if not hasattr(model_cls, "model_fields"):
         return
 
-    from typing import get_args, get_origin, Union, Annotated
-    import types
-    from pydantic import BaseModel
-
-    def extract_base_model(annot):
-        if annot is None: return None
-        origin = get_origin(annot)
-        if origin in (Union, types.UnionType):
-            for arg in get_args(annot):
-                if res := extract_base_model(arg): return res
-        elif origin is list or origin is Annotated:
-            for arg in get_args(annot):
-                if res := extract_base_model(arg): return res
-        elif isinstance(annot, type) and issubclass(annot, BaseModel): return annot
-        return None
-
     keep_config = content == "config"
 
     for field_name, field_info in list(model_cls.model_fields.items()):
         extra = field_info.json_schema_extra or {}
         tag = extra.get("tag", field_name)
+        if not extra.get("tag"):
+            continue
         ns = extra.get("ns")
         # A missing is_config means config-ness is not defined for this node
         # (rpc/action/notification subtrees). RESTCONF treats that as config,
         # because treating it as state pruned real parameters out of a
         # content="config" read. Match that, so the transports agree.
         is_config = extra.get("is_config") is not False
+        is_key = extra.get("is_key") is True
         match = keep_config == is_config
+        sub, is_list = _child_model_and_kind(field_info.annotation)
 
-        sub = extract_base_model(field_info.annotation)
-
-        child_nodes = []
-        for child in list(element):
-            localname = etree.QName(child).localname
-            namespace = etree.QName(child).namespace
-            if localname == tag and (not ns or namespace == ns):
-                child_nodes.append(child)
-
-        for child_node in child_nodes:
+        for child_node in list(element):
+            if not _matches(child_node, tag, ns):
+                continue
             if sub is not None:
-                prune_xml_to_content(child_node, sub, content)
-            keep_shell = sub is not None and len(list(child_node)) > 0
+                prune_xml_to_content(
+                    child_node, sub, content, preserve_keys=is_list
+                )
+            if is_key and preserve_keys:
+                continue
+            if is_list and sub is not None:
+                # A list shell survives only when a non-key descendant
+                # survived; otherwise its preserved keys alone must not keep
+                # a state list in a config-only read.
+                keep_shell = any(
+                    not _is_key_element(grandchild, sub)
+                    for grandchild in child_node
+                )
+            else:
+                keep_shell = sub is not None and len(list(child_node)) > 0
             if not match and not keep_shell:
                 element.remove(child_node)
 
@@ -265,6 +549,100 @@ def find_xml_nodes(root_element: etree._Element | None, path_tuples: list[tuple[
             if match:
                 results.append(child)
     return results
+
+
+def retrieve_bounded(
+    client: NetconfClient,
+    path: list[tuple[str, str, dict[str, Any]]],
+    model_cls: type,
+    *,
+    is_list_collection: bool = False,
+    source: str | None = None,
+    content: str = "all",
+    with_defaults: str = "report-all",
+    depth: int | str = 2,
+    fields: list[str] | None = None,
+) -> Any:
+    """Retrieve one navigator target under a depth ceiling.
+
+    Legacy NETCONF (no NMDA) has no server-side depth, so the generated
+    subtree filter is the ceiling. When the filter would collapse to an
+    empty target -- a container at depth 1, a keyless list at depth 1, a
+    specific list item whose only remaining children are its path keys, or
+    any target whose kept children all sit on the boundary -- it is not sent
+    at all: an empty element selects the whole subtree (RFC 6241 Sec 6.2.1)
+    and the caller gets a skeleton instead, with a warning.
+
+    NMDA sends `max-depth` (RFC 8526 Sec 3.1.2) and keeps the simple target
+    filter, because the server enforces the ceiling. RESTCONF is not this
+    module; it uses `?depth=` (RFC 8040 Sec 4.8.2). In both cases the reply
+    is still pruned locally as a safety net.
+    """
+    requested = validate_depth(depth)
+    label = "/".join(tag for _ns, tag, _keys in path)
+    if requested is not None and not getattr(client, "has_nmda", False):
+        xml_filter = build_depth_filter(path, model_cls, requested, fields=fields)
+        if xml_filter is None:
+            log.warning(
+                "depth=%s on %s would select the whole subtree; returning a "
+                "skeleton without reading the device.",
+                requested,
+                label,
+            )
+            if is_list_collection:
+                return _SkeletonList()
+            return _skeleton_model(model_cls, path)
+    else:
+        # Unbounded is the only case allowed to leave the target empty, and
+        # NMDA is bounded by max-depth on the server.
+        xml_filter = build_filter_tree(path, model_cls, fields=fields)
+
+    if xml_filter is not None and log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "depth=%s on %s: sending a %d-element/%d-byte subtree filter",
+            depth,
+            label,
+            sum(1 for _node in xml_filter.iter()),
+            len(etree.tostring(xml_filter)),
+        )
+
+    xml_data = client.retrieve(
+        source=source,
+        filter_xml=xml_filter,
+        content=content,
+        with_defaults=with_defaults,
+        depth=depth,
+    )
+    if xml_data is None:
+        return [] if is_list_collection else None
+
+    module_namespaces = getattr(client, "module_namespaces", {})
+    if is_list_collection:
+        matched = find_xml_nodes(xml_data, path)
+        result = []
+        for node in matched:
+            if requested is not None:
+                prune_xml_tree_to_depth(node, model_cls, requested)
+            prune_xml_to_content(node, model_cls, content)
+            result.append(
+                model_cls.from_xml(
+                    etree.tostring(node),
+                    module_namespaces=module_namespaces,
+                )
+            )
+        return result
+
+    matched = find_xml_node(xml_data, path)
+    if matched is None:
+        return None
+    if requested is not None:
+        prune_xml_tree_to_depth(matched, model_cls, requested)
+    prune_xml_to_content(matched, model_cls, content)
+    return model_cls.from_xml(
+        etree.tostring(matched),
+        module_namespaces=module_namespaces,
+    )
+
 
 def wrap_in_parent_hierarchy(element: etree._Element, path_tuples: list[tuple[str, str, dict[str, Any]]]) -> etree._Element:
     current = element

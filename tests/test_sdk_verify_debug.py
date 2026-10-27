@@ -10,7 +10,7 @@ import io
 import json
 from contextlib import redirect_stderr
 
-from yang2sdk.cli.sdk_verify import FAIL, PASS, Report, Verifier, build_parser
+from yang2sdk.cli.sdk_verify import FAIL, PASS, SKIP, Report, Verifier, build_parser
 
 
 class _Client:
@@ -71,6 +71,35 @@ def test_debug_fail_outside_except_has_no_traceback() -> None:
         verifier._record("-", "crud", "verify-restore", FAIL, "RESTORE NOT PROVEN")
     lines = buf.getvalue().splitlines()
     assert len(lines) == 1 and "RESTORE NOT PROVEN" in lines[0]
+
+
+def test_skeleton_reads_are_skips_not_coverage() -> None:
+    """A finite-depth filter that collapses returns a skeleton without a
+    request. sdk-verify must report that as a skip, never as a validated read.
+    """
+
+    class Skeleton:
+        _yang2sdk_skeleton = True
+
+    class SkeletonNav:
+        def retrieve(self, **kwargs: object) -> object:
+            return Skeleton()
+
+    class SkeletonList(list):
+        _yang2sdk_skeleton = True
+
+    class SkeletonListNav:
+        def retrieve(self, **kwargs: object) -> object:
+            return SkeletonList()
+
+        def __call__(self, id: str) -> None:
+            return None
+
+    verifier, report = _verifier(debug=False)
+    verifier._check_retrieve(SkeletonNav(), "/skeleton")
+    verifier._check_list(SkeletonListNav(), "/skeleton-list", "things")
+    assert [result.status for result in report.results] == [SKIP, SKIP]
+    assert all("skeleton" in result.detail for result in report.results)
 
 
 def test_check_retrieve_times_both_outcomes_and_shows_request_shape() -> None:

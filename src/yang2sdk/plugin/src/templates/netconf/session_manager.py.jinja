@@ -113,6 +113,40 @@ def _has_capability(capabilities, uri: str) -> bool:
     return any(cap.split("?", 1)[0].strip().lower() == uri for cap in capabilities)
 
 
+def validate_depth(depth: int | str) -> int | None:
+    """Normalize a caller's `depth` to a positive int, or None for unbounded.
+
+    RFC 8040 Sec 4.8.2 and RFC 8526 define depth as a positive integer with
+    "unbounded" as the no-ceiling default. `depth=1` is valid (the target node
+    alone). Reject only values that are not expressible: bool (an int
+    subclass), zero, negatives, non-numeric strings, and values above the
+    RFC 6241 Sec 7.7 uint16 ceiling of 65535. Validation happens before any
+    transport work so a bad argument can never become an RPC.
+    """
+    if isinstance(depth, str) and depth.lower() == "unbounded":
+        return None
+    if isinstance(depth, bool) or not isinstance(depth, (int, str)):
+        raise ValueError(
+            "depth must be an integer in 1..65535 or 'unbounded', "
+            f"not {type(depth).__name__}"
+        )
+    if isinstance(depth, str):
+        if not depth.isdigit():
+            raise ValueError(
+                "depth must be an integer in 1..65535 or 'unbounded', "
+                f"not {depth!r}"
+            )
+        value = int(depth)
+    else:
+        value = depth
+    if value < 1 or value > 65535:
+        raise ValueError(
+            "depth must be an integer in 1..65535 or 'unbounded', "
+            f"not {value}"
+        )
+    return value
+
+
 def _rpcerror_attr(err, name: str) -> str:
     """Read an RPCError attribute without ever raising from the error path.
 
@@ -678,11 +712,23 @@ class NetconfClient:
 
     def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
         """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running."""
+        requested_depth = validate_depth(depth)
         if source is None:
             source = "running" if content == "config" else "operational"
 
         if isinstance(filter_xml, str):
             filter_xml = etree.fromstring(filter_xml)
+
+        if requested_depth is not None and not self.has_nmda and filter_xml is None:
+            # RFC 6241 has no depth parameter. A finite-depth legacy read
+            # without a filter is a whole-datastore read, which the generated
+            # navigators exist to prevent. Refuse before the RPC instead of
+            # silently ignoring the ceiling.
+            raise ValueError(
+                "finite depth on legacy NETCONF requires a subtree filter; use "
+                "a generated navigator (it builds a depth-bounded filter) or "
+                "pass depth='unbounded' explicitly."
+            )
 
         if self.has_nmda:
             # Construct NMDA <get-data> (RFC 8526)
@@ -705,9 +751,9 @@ class NetconfClient:
                 wd = etree.SubElement(rpc, "{" + NMDA_NS + "}with-defaults")
                 wd.text = with_defaults
 
-            if depth and str(depth).lower() != "unbounded":
+            if requested_depth is not None:
                 md = etree.SubElement(rpc, "{" + NMDA_NS + "}max-depth")
-                md.text = str(depth)
+                md.text = str(requested_depth)
                 
             reply = self._handle_rpc(self._mc.dispatch, rpc)
 

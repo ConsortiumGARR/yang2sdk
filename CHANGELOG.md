@@ -9,6 +9,35 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Changed
 
+- **Finite-depth NETCONF reads no longer ask the device for a whole subtree.**
+  Legacy NETCONF (no `:nmda:1.0`) has no server-side `depth`, so the generated
+  client now builds an RFC 6241 subtree filter that stops at the requested
+  level: leaves/leaf-lists at the boundary survive, keyed lists keep their keys
+  (the addressability exception), and boundary containers and keyless lists are
+  omitted because an empty element is a selection node and would fetch the
+  whole subtree (RFC 6241 §6.2.1/§6.2.4). A filter that would collapse to the
+  target itself is **not sent**: the caller gets a RESTCONF-shaped skeleton
+  (empty container model, `[]` for a keyless list, path keys for a keyed list
+  item) plus a warning, instead of a silent whole-subtree read. NMDA keeps
+  `max-depth` (RFC 8526 §3.1.2) and RESTCONF keeps `?depth=` (RFC 8040 §4.8.2);
+  both still prune the reply locally. `depth=1` is valid; only `bool`, zero,
+  negative, non-numeric, `None`, and values above 65535 are rejected, before any
+  transport work. `content="nonconfig"` now keeps the keys of a config list, so
+  state entries remain addressable. A server that ignores the filter can still
+  put extra bytes on the wire; the local pruner bounds the model but cannot undo
+  the transfer. A non-boundary container whose only kept child is on the
+  boundary is omitted rather than sent empty, so a full read pruned to the same
+  depth may retain it as an empty shell; the limited read is a subset, never a
+  superset. `sdk-verify` reports a skeleton as a skip, never as a validated
+  read, so zero-wire coverage cannot look green. A direct
+  `NetconfClient.retrieve(depth=N)` on legacy NETCONF with no subtree filter now
+  raises instead of silently issuing a whole-datastore read; generated
+  navigators always pass one, and `depth="unbounded"` remains the explicit
+  escape hatch. Pinned by
+  `tests/test_matrix.py` depth-filter, skeleton, pruner, validation, and
+  key-preservation tests plus
+  `tests/test_sdk_verify_debug.py::test_skeleton_reads_are_skips_not_coverage`.
+
 - **A generated client is now emitted once, as one installable project, instead
   of twice.** The tree is `<output-dir>/<device>_<os-version>/` (the project:
   `pyproject.toml`, `README.md`, `MANIFEST.yang-revisions.json`) with the

@@ -418,6 +418,19 @@ class Verifier:
                 extra=ctx,
                 seconds=elapsed,
             )
+        elif getattr(result, "_yang2sdk_skeleton", False):
+            # The generated legacy-NETCONF navigator returns a skeleton
+            # without touching the wire when a finite-depth filter would have
+            # selected the whole subtree. Nothing was read, so this is not a
+            # pass and must not be counted as coverage.
+            self._skip(
+                label,
+                "container",
+                "retrieve",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+                extra=ctx,
+                seconds=elapsed,
+            )
         elif isinstance(result, list):
             self._record(
                 label,
@@ -451,12 +464,11 @@ class Verifier:
         """
         start = time.perf_counter()
         try:
-            items = (
-                nav.retrieve(
-                    **({"source": self._read_source()} if self.is_netconf else {})
-                )
-                or []
+            items = nav.retrieve(
+                **({"source": self._read_source()} if self.is_netconf else {})
             )
+            if items is None:
+                items = []
         except Exception as e:  # noqa: BLE001
             elapsed = time.perf_counter() - start
             ctx = (
@@ -485,8 +497,17 @@ class Verifier:
                 )
             return
 
-        keys = self._item_keys(nav)
         elapsed = time.perf_counter() - start
+        if getattr(items, "_yang2sdk_skeleton", False):
+            self._skip(
+                label,
+                "list",
+                "retrieve",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+                seconds=elapsed,
+            )
+            return
+        keys = self._item_keys(nav)
         if not keys:
             self._skip(
                 label,
@@ -1570,6 +1591,16 @@ def _crud_containers(verifier: Verifier, protocol: str, target: str) -> None:
                 verifier._skip(label, kind, "crud", _device_fault_reason(e))
             else:
                 verifier._record(label, kind, "retrieve", FAIL, _short(e))
+            continue
+        if getattr(baseline, "_yang2sdk_skeleton", False):
+            # No read was issued, so there is no baseline to merge back. A
+            # write here would be a write of invented (empty) data.
+            verifier._skip(
+                label,
+                kind,
+                "crud",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+            )
             continue
 
         if baseline is None or (isinstance(baseline, list) and not baseline):
