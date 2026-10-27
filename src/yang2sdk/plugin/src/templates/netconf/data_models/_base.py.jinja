@@ -1,3 +1,4 @@
+import json
 from typing import Annotated, Any, ClassVar, Literal, Self, get_args, get_origin, Union
 import types
 from pydantic import ConfigDict, BaseModel, BeforeValidator, model_validator
@@ -63,29 +64,38 @@ class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
 
     @classmethod
     def from_xml(cls, source: str | bytes, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
-        rebuild_model_and_dependencies(cls)
         # Always parse to a tree: attribute handling has to see the elements.
         # (Passing an lxml element straight to pydantic-xml's from_xml() raises
         # "memoryview: a bytes-like object is required".)
         root = etree.fromstring(source)
         if module_namespaces:
             normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+        root = cls._drop_unbound_attributes(root)
+        ensure_xml_models_built(root, cls)
+        return super().from_xml_tree(root, *args, **kwargs)
 
     @classmethod
     def from_xml_tree(cls, root: etree._Element, *args: Any, module_namespaces: dict[str, str] | None = None, **kwargs: Any) -> Self:
-        rebuild_model_and_dependencies(cls)
         if module_namespaces:
             normalize_identityrefs(root, cls, module_namespaces)
-        return super().from_xml_tree(cls._drop_unbound_attributes(root), *args, **kwargs)
+        root = cls._drop_unbound_attributes(root)
+        ensure_xml_models_built(root, cls)
+        return super().from_xml_tree(root, *args, **kwargs)
 
     def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
-        rebuild_model_and_dependencies(self.__class__)
+        ensure_instance_models_built(self)
         return super().to_xml(*args, **kwargs)
 
 
 def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] = None) -> None:
-    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers."""
+    """Recursively and cycle-safely rebuilds deferred pydantic-xml serializers.
+
+    This builds the WHOLE reachable graph and is therefore the expensive,
+    explicit path (used by the model-gap introspection tool). Reads and writes
+    use `ensure_xml_models_built` / `ensure_instance_models_built`, which build
+    only what the payload or instance actually reaches; see those docstrings
+    for the measured cost difference.
+    """
     if memo is None:
         memo = set()
     if cls in memo:
@@ -122,6 +132,146 @@ def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] =
     # Final seal: lock-in serializers once child dependencies are completely built
     cls.model_rebuild()
 
+
+def _nested_model_classes(annotation: Any) -> list[type]:
+    """Every NetconfXmlModel subclass an annotation can bind to.
+
+    Walks unions, Annotated and list/tuple/set/dict arguments, so a union of
+    models returns every member (pydantic-xml builds one serializer per
+    member).
+    """
+    found: list[type] = []
+
+    def walk(annot: Any) -> None:
+        if isinstance(annot, type):
+            if issubclass(annot, NetconfXmlModel) and annot not in found:
+                found.append(annot)
+            return
+        for arg in get_args(annot):
+            walk(arg)
+
+    walk(annotation)
+    return found
+
+
+#: (tag, ns) -> model classes per model class, computed once (`model_fields`
+#: never change after class creation). Without it every element of a list entry
+#: would re-walk the parent's annotations.
+_XML_CHILD_MODELS: dict[type, dict[tuple[str | None, str | None], tuple[type, ...]]] = {}
+
+
+def _xml_child_models(model_cls: type) -> dict[tuple[str | None, str | None], tuple[type, ...]]:
+    """Map (tag, ns) -> the model classes that element binds to, for one model.
+
+    Data nodes carry `tag`/`ns` in `json_schema_extra`, and there `ns` is
+    authoritative: an augment keeps the AUGMENTING module's namespace on the
+    wire (RFC 7950 Sec 7.17), which is *not* the child class's own default
+    nsmap (measured: 43 such fields on the G30 tree, e.g.
+    `SubcardPortSubportItem.partner_port`). RPC envelope fields
+    (`element(tag="input")`) carry no `json_schema_extra` at all, so they fall
+    back to the child class's own tag and default namespace -- which is what
+    pydantic-xml binds. Missing an untagged field here is not cosmetic: the
+    child would stay unbuilt and the RPC reply would fail with
+    "model ... is partially initialized".
+    """
+    cached = _XML_CHILD_MODELS.get(model_cls)
+    if cached is not None:
+        return cached
+    children: dict[tuple[str | None, str | None], list[type]] = {}
+    for field_info in model_cls.model_fields.values():
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        ns = extra.get("ns")
+        for child_cls in _nested_model_classes(field_info.annotation):
+            if child_cls is model_cls:
+                continue
+            child_tag, child_ns = tag, ns
+            if child_tag is None:
+                child_tag = child_cls.__xml_tag__
+                child_ns = (child_cls.__xml_nsmap__ or {}).get("")
+            bucket = children.setdefault((child_tag, child_ns), [])
+            if child_cls not in bucket:
+                bucket.append(child_cls)
+    cached = {key: tuple(value) for key, value in children.items()}
+    _XML_CHILD_MODELS[model_cls] = cached
+    return cached
+
+
+def _ensure_direct_children_built(model_cls: type, built: set[type]) -> None:
+    """Build one model plus every model class its own fields reference.
+
+    pydantic-xml asserts a field's model serializer exists before it walks a
+    parent's fields -- `ModelDeserializer.deserialize` for deserialization and
+    `ModelSerializer.serialize` for serialization (both in
+    `pydantic_xml/serializers/factories/model.py`; `:450` and `:417` in
+    pydantic-xml 2.22.0) -- and it does so even when the element or value is
+    absent. Those direct children are therefore mandatory; anything deeper is
+    only reachable through a present element/value, so it is built there
+    instead.
+    """
+    if model_cls not in built:
+        built.add(model_cls)
+        if model_cls.__xml_serializer__ is None:
+            model_cls.model_rebuild()
+    for classes in _xml_child_models(model_cls).values():
+        for child_cls in classes:
+            if child_cls in built:
+                continue
+            built.add(child_cls)
+            if child_cls.__xml_serializer__ is None:
+                child_cls.model_rebuild()
+
+
+def ensure_xml_models_built(
+    element: etree._Element,
+    model_cls: type,
+    built: set[type] | None = None,
+) -> None:
+    """Build exactly the model classes this payload instantiates.
+
+    The previous implementation rebuilt the whole reachable graph
+    (`rebuild_model_and_dependencies`) before parsing anything. Measured on the
+    G30 tree: 1355 model classes / ~30k fields, 34s cold -- while the reply
+    itself arrived in 0.1s. Cost is unavoidable per class (pydantic schema
+    generation), so the fix is to stop paying it for classes the reply cannot
+    reach: descend only into elements that are actually present.
+
+    Same payload on the same tree: 10 classes / ~4s for a container read, and
+    the full graph is only built by a full-tree read that actually carries it.
+    """
+    if built is None:
+        built = set()
+    _ensure_direct_children_built(model_cls, built)
+    children = _xml_child_models(model_cls)
+    for child_element in element:
+        qname = etree.QName(child_element)
+        for (tag, ns), classes in children.items():
+            if qname.localname != tag or (ns and qname.namespace != ns):
+                continue
+            for child_cls in classes:
+                ensure_xml_models_built(child_element, child_cls, built)
+
+
+def ensure_instance_models_built(model: Any, built: set[type] | None = None) -> None:
+    """Serialization twin of `ensure_xml_models_built`, driven by the instance.
+
+    `ModelSerializer.serialize` asserts the same direct-child invariant as the
+    deserializer, so a write payload needs the classes its populated fields
+    reach -- not the whole graph.
+    """
+    if built is None:
+        built = set()
+    model_cls = type(model)
+    _ensure_direct_children_built(model_cls, built)
+    for name, field_info in model_cls.model_fields.items():
+        value = getattr(model, name, None)
+        if value is None or not _nested_model_classes(field_info.annotation):
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            if isinstance(item, NetconfXmlModel):
+                ensure_instance_models_built(item, built)
+
 def _extract_child_model(annot: Any) -> type | None:
     """Unwrap Optional/list/Annotated aliases to the nested model class."""
     if annot is None:
@@ -140,6 +290,15 @@ def _extract_child_model(annot: Any) -> type | None:
     elif isinstance(annot, type) and issubclass(annot, BaseModel):
         return annot
     return None
+
+def _has_content(value: Any) -> bool:
+    """True when a pruned subtree still holds at least one live value."""
+    if isinstance(value, dict):
+        return any(_has_content(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_content(v) for v in value)
+    return value is not None
+
 
 def normalize_identityrefs(element: etree._Element, model_cls: type | None, module_namespaces: dict[str, str]) -> None:
     """Rewrite identityref values from XML prefix form to RFC 7951 Sec 6.8
@@ -238,6 +397,81 @@ class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
             return data
         return {(by_wire.get(k) or k): v for k, v in data.items()}
 
+    def model_dump(self, *, content: Literal["config", "all", "nonconfig"] = "all", **kwargs: Any) -> dict[str, Any]:
+        """Content-aware dump, mirroring YangBaseModel.model_dump (protocol parity).
+
+        `content=` selects which datastore subtree the dump keeps -- `config`
+        keeps config leaves, `nonconfig` the state ones, `all` both -- exactly
+        like the RESTCONF base (RFC 8040 Sec 4.5.2 `content`, NMDA
+        config-filter per RFC 8526). The XML layer already prunes retrieved
+        trees (`prune_xml_to_content` in the navigator), so this is idempotent
+        for models that came out of a pruned read; the override exists so a
+        NETCONF caller writes the same `model_dump(content=...)` call as a
+        RESTCONF one instead of hitting a pydantic `TypeError: unexpected
+        keyword argument`.
+        """
+        kwargs.setdefault("mode", "json")
+        kwargs.setdefault("by_alias", True)
+        data = super().model_dump(**kwargs)
+        if content == "all":
+            return data
+        type(self)._prune_content(data, content, by_alias=kwargs.get("by_alias", True))
+        return data
+
+    def model_dump_json(self, *, indent: int | None = None, content: Literal["config", "all", "nonconfig"] = "all", **kwargs: Any) -> str:
+        """JSON mirror of model_dump. pydantic's BaseModel.model_dump_json does not route through model_dump, so the content pruning has to be applied here too."""
+        # ensure_ascii belongs to the JSON encoder, not to model_dump.
+        ensure_ascii = bool(kwargs.pop("ensure_ascii", False))
+        data = self.model_dump(content=content, **kwargs)
+        return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+
+    @classmethod
+    def _prune_content(cls, data: Any, content: str, by_alias: bool) -> None:
+        """Drop in place every subtree holding no node that matches content.
+
+        Bottom-up mirror of YangBaseModel._prune_content (RESTCONF): children
+        are pruned first, then a mismatching node is dropped only when nothing
+        matchable remains below it, so ancestor shells survive when a matchable
+        descendant exists (RFC 8040 Sec 4.5.2 hierarchy preservation; NMDA
+        config-filter per RFC 8526 Sec 3.1.2).
+        """
+        if not isinstance(data, dict):
+            return
+        for field_name, field_info in cls.model_fields.items():
+            alias = field_info.alias
+            key = alias if by_alias and alias and alias in data else field_name
+            if key not in data:
+                continue
+            # nc_operation is the nc:operation *attribute*, not a data node
+            # (RFC 6241 Sec 7.2 rides it on edit payloads): it is never part of
+            # the resource contents, at any depth, so a content-scoped dump
+            # must not surface it.
+            if field_name == "nc_operation":
+                data.pop(key, None)
+                continue
+            extra = field_info.json_schema_extra
+            # Only an explicit False means state data; a missing/None is_config
+            # means config-ness is not defined here (rpc/action/notification).
+            is_config = True
+            if isinstance(extra, dict) and extra.get("is_config") is False:
+                is_config = False
+            match = (content == "config") == bool(is_config)
+            value = data[key]
+            sub = _child_netconf_model(field_info.annotation)
+            if sub is not None:
+                if isinstance(value, dict):
+                    sub._prune_content(value, content, by_alias)
+                elif isinstance(value, list):
+                    for item in value:
+                        sub._prune_content(item, content, by_alias)
+            # A mismatching leaf/leaf-list always drops. A mismatching
+            # container/list keeps an ancestor shell only when a matchable
+            # descendant remains, so state under config (or vice versa) never
+            # leaks but hierarchy is preserved.
+            keep_shell = sub is not None and isinstance(value, (dict, list)) and _has_content(value)
+            if not match and not keep_shell:
+                del data[key]
+
     def to_xml_payload(self, **kwargs: Any) -> str | bytes:
         """Serializes config nodes only (RFC 6241 edit-config/edit-data).
 
@@ -272,6 +506,29 @@ class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
                 text_used.add(el.text.split(":", 1)[0])
         etree.cleanup_namespaces(root, keep_ns_prefixes=sorted(text_used & declared))
         return etree.tostring(root)
+
+def _child_netconf_model(annotation: Any) -> type[NetconfBaseModel] | None:
+    """Unwrap Annotated/Optional/Union/list to find a single NetconfBaseModel subclass.
+
+    Returns None when ambiguous (union of several models) or absent, in which
+    case the subtree is left unpruned rather than pruned wrongly.
+    """
+    from typing import get_args
+
+    found: set[type[NetconfBaseModel]] = set()
+
+    def walk(ann: Any) -> None:
+        if isinstance(ann, type):
+            if issubclass(ann, NetconfBaseModel):
+                found.add(ann)
+        for arg in get_args(ann):
+            walk(arg)
+
+    walk(annotation)
+    if len(found) == 1:
+        return found.pop()
+    return None
+
 
 Decimal64 = Decimal
 Uint64 = int

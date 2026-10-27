@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "yang2sdk"
-version = "2026.10.22"
+version = "2026.10.27"
 description = "Generate a Pydantic-based IDE-friendly SDK from YANG modules."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -76,8 +76,8 @@ sdk-verify = "yang2sdk.cli.sdk_verify:main"
 #
 # Bump with: uv lock --upgrade-package ty, then re-run the gates (docs/dev.md)
 dev = [
-    "ruff==0.17.1",
-    "ty==0.0.89",
+    "ruff==0.17.2",
+    "ty==0.0.91",
     "pyrefly==1.4.0",
     "pytest>=8.0.0",
     "pyyaml>=6.0.0",

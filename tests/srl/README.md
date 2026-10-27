@@ -36,6 +36,7 @@ mkdir -p temp/yang_tree
 mapfile -t F < <(uv run python -m yang2sdk.cli.closure \
   srl_nokia-system srl_nokia-interfaces --yang-dir temp/yang_modules/srl --format files)
 uv run yang2sdk --protocol netconf --roots srl_nokia-system,srl_nokia-interfaces --device srl \
+  --device-version 25.10.1 \
   --yang-dir temp/yang_modules/srl --output-dir temp/netconf_clients/srl
 NOTCONF_RUN_INTEGRATION=1 uv run pytest tests/test_srl_netconf.py -v
 sudo -E containerlab destroy -t srl.clab.yml --cleanup

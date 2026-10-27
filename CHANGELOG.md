@@ -7,6 +7,127 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.10.27] - 2026-10-27
+
+### Changed
+
+- **Finite-depth NETCONF reads no longer ask the device for a whole subtree.**
+  Legacy NETCONF (no `:nmda:1.0`) has no server-side `depth`, so the generated
+  client now builds an RFC 6241 subtree filter that stops at the requested
+  level: leaves/leaf-lists at the boundary survive, keyed lists keep their keys
+  (the addressability exception), and boundary containers and keyless lists are
+  omitted because an empty element is a selection node and would fetch the
+  whole subtree (RFC 6241 §6.2.1/§6.2.4). A filter that would collapse to the
+  target itself is **not sent**: the caller gets a RESTCONF-shaped skeleton
+  (empty container model, `[]` for a keyless list, path keys for a keyed list
+  item) plus a warning, instead of a silent whole-subtree read. NMDA keeps
+  `max-depth` (RFC 8526 §3.1.2) and RESTCONF keeps `?depth=` (RFC 8040 §4.8.2);
+  both still prune the reply locally. `depth=1` is valid; only `bool`, zero,
+  negative, non-numeric, `None`, and values above 65535 are rejected, before any
+  transport work. `content="nonconfig"` now keeps the keys of a config list, so
+  state entries remain addressable. A server that ignores the filter can still
+  put extra bytes on the wire; the local pruner bounds the model but cannot undo
+  the transfer. A non-boundary container whose only kept child is on the
+  boundary is omitted rather than sent empty, so a full read pruned to the same
+  depth may retain it as an empty shell; the limited read is a subset, never a
+  superset. `sdk-verify` reports a skeleton as a skip, never as a validated
+  read, so zero-wire coverage cannot look green. A direct
+  `NetconfClient.retrieve(depth=N)` on legacy NETCONF with no subtree filter now
+  raises instead of silently issuing a whole-datastore read; generated
+  navigators always pass one, and `depth="unbounded"` remains the explicit
+  escape hatch. Pinned by
+  `tests/test_matrix.py` depth-filter, skeleton, pruner, validation, and
+  key-preservation tests plus
+  `tests/test_sdk_verify_debug.py::test_skeleton_reads_are_skips_not_coverage`.
+
+- **A generated client is now emitted once, as one installable project, instead
+  of twice.** The tree is `<output-dir>/<device>_<os-version>/` (the project:
+  `pyproject.toml`, `README.md`, `MANIFEST.yang-revisions.json`) with the
+  importable package at `<project>/src/<device>_<os-version>/`. Before, the same
+  modules were written flat at `--output-dir` (so the lab harness could
+  `import temp.<proto>_clients.<device>`) and copied again into
+  `<output-dir>/<device>_<os-version>/` (so pip could install it): two trees
+  that could drift, an sdist that needed a hand-written exclude to ship one,
+  and a generated README whose install line `uv add path/to/<package_name>`
+  named a directory with no `pyproject.toml` — measured, `uv build` refused it
+  with "does not appear to be a Python project". Consumers that imported the
+  flat copy (`sdk-verify`, the lab fixtures, `--check-model-gaps`) now resolve
+  the package through `yang2sdk.layout`, which accepts the container, the
+  project or the package itself. Two consequences are deliberate:
+  `--output-dir` is a **container for exactly one** client, so a compile that
+  finds a different package (or a pre-`src/` flat copy) already there is
+  refused with a message naming it rather than deleted — and a recompile drops
+  a previous run's `data_models/`/`data_navigators/` module files, so an orphan
+  model cannot ship in the wheel. The generated README's install line is now
+  true as written.
+
+### Fixed
+
+- **A NETCONF read no longer builds the whole YANG model graph before it can
+  parse the reply.** `NetconfXmlModel.from_xml`/`from_xml_tree` called
+  `rebuild_model_and_dependencies`, which walks and builds *every* model class
+  reachable from the target, and `prune_xml_tree_to_depth`/`prune_xml_to_content`
+  called it again once per recursion level. Measured on the G30 tree: 1355 model
+  classes / ~30k fields, 34s cold, while the device's reply arrived in 0.1s.
+  Both paths are now payload-driven: pydantic-xml asserts that a field's model
+  has a serializer before it walks a parent's fields
+  (`ModelDeserializer.deserialize` / `ModelSerializer.serialize` in
+  `pydantic_xml/serializers/factories/model.py`) even when the element/value is
+  absent, so a model's *direct* children are still built — but nothing deeper
+  is built unless the payload actually carries that element. Same reply, same
+  tree: 10 classes / ~4s, and the full graph is only built by a full-tree read
+  that carries it. `to_xml`
+  gets the same treatment, driven by the instance's populated fields instead of
+  the class graph. The pruning helpers are now pure metadata walks and never
+  trigger a schema build. `rebuild_model_and_dependencies` is unchanged and
+  still available as the explicit whole-graph build (`--check-model-gaps` uses
+  it). Pinned by
+  `tests/test_matrix.py::test_from_xml_builds_only_the_models_the_payload_instantiates`
+  (an absent grandchild must stay unbuilt) and
+  `::test_payload_driven_build_matches_the_whole_graph_build` (the lazy path
+  produces an identical `model_dump`).
+
+- **An invalid XML-Schema `pattern` now explains itself, and a pattern Python
+  cannot compile fails generation instead of the caller's first assignment.**
+  `yang2sdk --protocol netconf --device g30` refused the entire client with
+  libxml2's `syntax error in pattern … line 6` and nothing else: G30's
+  `coriant-rpc@2021-01-20.yang:533` ships a negative lookahead, which XML Schema
+  regular expressions do not have (RFC 7950 §9.4.5), so pyang rejects the model
+  even though Python's `re` accepts the expression. The refusal now states the
+  cause and names the escape hatch, and `--ignore-error PATTERN_ERROR` keeps the
+  constraint rather than dropping it — the IR reads the `pattern` statement
+  itself, not pyang's aborted type spec. The same walk now compiles every
+  pattern before anything is written: `\p{IsBasicLatin}` / `\i` / `\c` are valid
+  XML Schema and invalid Python, and previously produced a client that
+  generated, installed and imported cleanly and then raised `re.error` on the
+  first value assigned to the leaf — in the consumer's project, from generated
+  code. Such a model is refused up front, naming the module:leaf and pointing at
+  a deviation module (RFC 7950 §7.20.3). Pinned by four tests: the refusal
+  cites the RFC and the flag, the opt-out keeps the emitted pattern (and it
+  compiles), both protocols refuse an untranslatable pattern, and the suggested
+  `deviate replace` actually generates the client.
+
+- **A NETCONF read dump now takes `content=` and no longer serialises the whole
+  YANG schema.** `NetconfBaseModel` had no content-aware dump, unlike the
+  RESTCONF base, so `model_dump(content="config")` raised
+  `TypeError: unexpected keyword argument` on every generated NETCONF model and
+  `model_dump_json(indent=4)` emitted the complete schema: every node the device
+  did not return as `null`, plus every YANG `default` materialised into a value
+  that was never on the wire. Measured on the G30 `ne` model, a reply carrying
+  two leaves dumped 16 `null`s out of 23 fields. Both `model_dump` and
+  `model_dump_json` now prune by the same `is_config` rule the RESTCONF base and
+  the NETCONF XML layer already use (RFC 8040 §4.5.2 / RFC 8526 §3.1.2), and a
+  content-scoped dump omits the `nc:operation` attribute (RFC 6241 §7.2), which
+  is metadata rather than resource contents. `content="all"` is unchanged — the
+  plain pydantic dump, byte-identical to before on a generated sample — and
+  `exclude_unset`/`exclude_none` still apply on top. Like the RESTCONF base,
+  `model_dump` now defaults to `mode="json"` and `by_alias=True`, so an
+  unqualified `model_dump()` yields JSON-encodable values (enum members as their
+  values) instead of Python objects.
+  `sdk-verify`'s `_dump_config` no longer needs a NETCONF `TypeError` fallback
+  for this. Pinned by
+  `tests/test_matrix.py::test_netconf_model_dump_takes_content_and_prunes_like_restconf`.
+
 ## [2026.10.22] - 2026-10-22
 
 ### Fixed

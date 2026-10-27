@@ -13,6 +13,40 @@ log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
 
+def validate_depth(depth: int | str) -> int | None:
+    """Normalize a caller's `depth` to a positive int, or None for unbounded.
+
+    RFC 8040 Sec 4.8.2 defines depth as a positive integer with "unbounded"
+    as the no-ceiling default. `depth=1` is valid (the target resource alone).
+    Reject only values that are not expressible: bool (an int subclass), zero,
+    negatives, non-numeric strings, and values above the RFC 6241 Sec 7.7
+    uint16 ceiling of 65535. Validation happens before the HTTP request so a
+    bad argument can never reach the device.
+    """
+    if isinstance(depth, str) and depth.lower() == "unbounded":
+        return None
+    if isinstance(depth, bool) or not isinstance(depth, (int, str)):
+        raise ValueError(
+            "depth must be an integer in 1..65535 or 'unbounded', "
+            f"not {type(depth).__name__}"
+        )
+    if isinstance(depth, str):
+        if not depth.isdigit():
+            raise ValueError(
+                "depth must be an integer in 1..65535 or 'unbounded', "
+                f"not {depth!r}"
+            )
+        value = int(depth)
+    else:
+        value = depth
+    if value < 1 or value > 65535:
+        raise ValueError(
+            "depth must be an integer in 1..65535 or 'unbounded', "
+            f"not {value}"
+        )
+    return value
+
+
 class TCPKeepAliveAdapter(HTTPAdapter):
     def __init__(self, idle=60, interval=60, count=6, **kwargs):
         self._idle = idle

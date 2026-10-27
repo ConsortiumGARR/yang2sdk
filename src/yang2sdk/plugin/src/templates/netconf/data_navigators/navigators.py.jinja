@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from lxml import etree
-from ._base import Node, ListNode, ItemNode, _require_complete_for_replace, build_filter_tree, find_xml_node, find_xml_nodes, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy, prune_xml_tree_to_depth, prune_xml_to_content
+from ._base import Node, ListNode, ItemNode, _require_complete_for_replace, retrieve_bounded, wrap_in_parent_hierarchy, wrap_list_in_parent_hierarchy
 
 if TYPE_CHECKING:
     from ..data_models import {{ module.py_name }}
@@ -11,18 +11,17 @@ if TYPE_CHECKING:
 class {{ node.class_name }}Node(ItemNode):
     def retrieve(self, *, source: str | None = None, content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> {{ node.pydantic_module }}.{{ node.class_name }} | None:
         from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
-        
-        xml_filter = build_filter_tree(self._path, {{ node.class_name }}, fields=fields)
-        
-        xml_data = self._client.retrieve(source=source, filter_xml=xml_filter, content=content, with_defaults=with_defaults, depth=depth)
-        
-        matched = find_xml_node(xml_data, self._path)
-        if matched is not None:
-            if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
-                prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
-            prune_xml_to_content(matched, {{ node.class_name }}, content)
-            return {{ node.class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
-        return None
+
+        return retrieve_bounded(
+            self._client,
+            self._path,
+            {{ node.class_name }},
+            source=source,
+            content=content,
+            with_defaults=with_defaults,
+            depth=depth,
+            fields=fields,
+        )
 
     def update(self, data: {{ node.pydantic_module }}.{{ node.class_name }} | dict | str | None = None, *, target: str | None = None, operation: str = 'merge', **kwargs: Any) -> bool:
         from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
@@ -79,18 +78,17 @@ class {{ node.class_name }}Node(ItemNode):
 class {{ node.item_class_name }}Node(ItemNode):
     def retrieve(self, *, source: str | None = None, content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> {{ node.pydantic_module }}.{{ node.class_name }} | None:
         from ..data_models.{{ node.pydantic_module }} import {{ node.class_name }}
-        
-        xml_filter = build_filter_tree(self._path, {{ node.class_name }}, fields=fields)
-        
-        xml_data = self._client.retrieve(source=source, filter_xml=xml_filter, content=content, with_defaults=with_defaults, depth=depth)
-        
-        matched = find_xml_node(xml_data, self._path)
-        if matched is not None:
-            if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()): 
-                prune_xml_tree_to_depth(matched, {{ node.class_name }}, int(depth))
-            prune_xml_to_content(matched, {{ node.class_name }}, content)
-            return {{ node.item_class_name }}.from_xml(etree.tostring(matched), module_namespaces=self._client.module_namespaces)
-        return None
+
+        return retrieve_bounded(
+            self._client,
+            self._path,
+            {{ node.class_name }},
+            source=source,
+            content=content,
+            with_defaults=with_defaults,
+            depth=depth,
+            fields=fields,
+        )
 
     def update(self, data: {{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str | None = None, *, target: str | None = None, operation: str = 'merge', **kwargs: Any) -> bool:
         from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
@@ -151,16 +149,18 @@ class {{ node.list_class_name }}Node(ListNode[{{ node.item_class_name }}Node]):
 
     def retrieve(self, *, source: str | None = None, content: str = 'all', with_defaults: str = 'report-all', depth: int | str = 2, fields: list[str] | None = None) -> list[{{ node.pydantic_module }}.{{ node.item_class_name }}]:
         from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}
-        
-        xml_filter = build_filter_tree(self._path, {{ node.item_class_name }}, fields=fields)
-        xml_data = self._client.retrieve(source=source, filter_xml=xml_filter, content=content, with_defaults=with_defaults, depth=depth)
-        
-        matched = find_xml_nodes(xml_data, self._path)
-        if isinstance(depth, int) or (isinstance(depth, str) and depth.isdigit()):
-            for m in matched: 
-                prune_xml_tree_to_depth(m, {{ node.item_class_name }}, int(depth))
-                prune_xml_to_content(m, {{ node.item_class_name }}, content)
-        return [{{ node.item_class_name }}.from_xml(etree.tostring(m), module_namespaces=self._client.module_namespaces) for m in matched]
+
+        return retrieve_bounded(
+            self._client,
+            self._path,
+            {{ node.item_class_name }},
+            is_list_collection=True,
+            source=source,
+            content=content,
+            with_defaults=with_defaults,
+            depth=depth,
+            fields=fields,
+        )
 
     def update(self, data: list[{{ node.pydantic_module }}.{{ node.item_class_name }} | dict | str], *, target: str | None = None) -> bool:
         from ..data_models.{{ node.pydantic_module }} import {{ node.item_class_name }}

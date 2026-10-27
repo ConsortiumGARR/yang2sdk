@@ -42,6 +42,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from yang2sdk import layout
+
 # NETCONF needs ncclient/lxml/pydantic-xml; both transports need `requests`.
 # These live in the `lab` extra, matching yang-downloader and the tester that
 # sdk-verify replaces. Probed rather than imported: the generated NETCONF client
@@ -416,6 +418,19 @@ class Verifier:
                 extra=ctx,
                 seconds=elapsed,
             )
+        elif getattr(result, "_yang2sdk_skeleton", False):
+            # The generated legacy-NETCONF navigator returns a skeleton
+            # without touching the wire when a finite-depth filter would have
+            # selected the whole subtree. Nothing was read, so this is not a
+            # pass and must not be counted as coverage.
+            self._skip(
+                label,
+                "container",
+                "retrieve",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+                extra=ctx,
+                seconds=elapsed,
+            )
         elif isinstance(result, list):
             self._record(
                 label,
@@ -449,12 +464,11 @@ class Verifier:
         """
         start = time.perf_counter()
         try:
-            items = (
-                nav.retrieve(
-                    **({"source": self._read_source()} if self.is_netconf else {})
-                )
-                or []
+            items = nav.retrieve(
+                **({"source": self._read_source()} if self.is_netconf else {})
             )
+            if items is None:
+                items = []
         except Exception as e:  # noqa: BLE001
             elapsed = time.perf_counter() - start
             ctx = (
@@ -483,8 +497,17 @@ class Verifier:
                 )
             return
 
-        keys = self._item_keys(nav)
         elapsed = time.perf_counter() - start
+        if getattr(items, "_yang2sdk_skeleton", False):
+            self._skip(
+                label,
+                "list",
+                "retrieve",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+                seconds=elapsed,
+            )
+            return
+        keys = self._item_keys(nav)
         if not keys:
             self._skip(
                 label,
@@ -943,12 +966,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_client_package(path: Path) -> Path:
+    """Locate the importable package for ``--client-dir``.
+
+    ``--client-dir`` (default ``temp/<proto>_clients/<device>``) may name the
+    container, the installable project, or the package itself; the layout
+    itself is defined once in `yang2sdk.layout`. Here we only translate its
+    refusal into this tool's exit style.
+    """
+    try:
+        return layout.resolve_package(path)
+    except LookupError as exc:
+        raise SystemExit(f"sdk-verify: {exc}") from exc
+
+
 def _import_client(client_dir: Path, protocol: str) -> tuple[Any, str]:
-    # --protocol both runs two clients in one process, and both are packages named
-    # after the device (temp/restconf_clients/g30 and temp/netconf_clients/g30).
-    # A plain importlib.import_module(client_dir.name) would hand the second
-    # protocol the *first* module from sys.modules, silently validating the
-    # RESTCONF client twice. Import under a unique per-protocol name instead.
+    # --protocol both runs two clients in one process, and both are packages
+    # generated for the same device (temp/restconf_clients/g30 and
+    # temp/netconf_clients/g30). A plain importlib.import_module(client_dir.name)
+    # would hand the second protocol the *first* module from sys.modules,
+    # silently validating the RESTCONF client twice. Import under a unique
+    # per-protocol name instead.
     # The name is also returned so --debug can find the client's loggers: every
     # generated module logs under this dotted prefix.
     name = f"_sdkverify_{protocol}_{client_dir.name}"
@@ -1095,17 +1133,15 @@ def run_protocol(
     passphrase: str | None = None,
 ) -> Report:
     client_dir = Path(args.client_dir or f"temp/{protocol}_clients/{args.device}")
-    if not (client_dir / "__init__.py").exists():
-        raise SystemExit(
-            f"sdk-verify: no generated {protocol} client at {client_dir}. "
-            f"Run 'uv run yang2{protocol} <root.yang> ...' first."
-        )
-    module, stub = _import_client(client_dir, protocol)
+    package_dir = _resolve_client_package(client_dir)
+    module, stub = _import_client(package_dir, protocol)
     cls = getattr(
         module, "RestconfClient" if protocol == "restconf" else "NetconfClient", None
     )
     if cls is None:
-        raise SystemExit(f"sdk-verify: {client_dir} exposes no {protocol} client class")
+        raise SystemExit(
+            f"sdk-verify: {package_dir} exposes no {protocol} client class"
+        )
 
     host = os.environ.get("DEVICE_IP")
     if not host:
@@ -1178,7 +1214,7 @@ def run_protocol(
         # Connection context without secrets: which client, where it points,
         # and what will run. Never log username or password here (AGENTS.md:
         # no creds in output).
-        where = f"client={client_dir}"
+        where = f"client={package_dir}"
         if protocol == "restconf":
             where += f" base={args.restconf_scheme}://{host}:{port}/restconf"
         else:
@@ -1456,10 +1492,11 @@ def _digest(blobs: dict[str, str]) -> str:
 def _dump_config(model: Any) -> Any:
     """`model_dump` restricted to config content.
 
-    Only the RESTCONF base model takes `content=`; NETCONF models are plain
-    pydantic-xml and its `to_xml_payload()` already carries only config leaves
-    (that is what `nc_operation` rides on). Passing `content=` to a NETCONF
-    model raises TypeError, so the keyword is added only where it exists.
+    The RESTCONF base takes `content=` and prunes in the model layer; NETCONF
+    models take it too since their base gained the same content-aware
+    `model_dump`/`model_dump_json` override (protocol parity, mirroring the XML
+    layer prune). The keyword is passed only where the model accepts it, so a
+    plain transport-marker type still falls through.
     """
     kwargs = {
         "mode": "json",
@@ -1554,6 +1591,16 @@ def _crud_containers(verifier: Verifier, protocol: str, target: str) -> None:
                 verifier._skip(label, kind, "crud", _device_fault_reason(e))
             else:
                 verifier._record(label, kind, "retrieve", FAIL, _short(e))
+            continue
+        if getattr(baseline, "_yang2sdk_skeleton", False):
+            # No read was issued, so there is no baseline to merge back. A
+            # write here would be a write of invented (empty) data.
+            verifier._skip(
+                label,
+                kind,
+                "crud",
+                "depth-bounded filter collapsed; no read was issued (skeleton)",
+            )
             continue
 
         if baseline is None or (isinstance(baseline, list) and not baseline):

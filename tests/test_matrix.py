@@ -1,7 +1,9 @@
 """Offline checks: matrix completeness + template contract. No docker needed."""
 
+import ast
 import compileall
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -11,10 +13,11 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, cast, get_args
 
 import pytest
 
+from yang2sdk import layout
 from yang2sdk.cli.compiler import resolve_features
 from yang2sdk.cli.features import (
     parse_capability_features,
@@ -486,12 +489,11 @@ def test_generate_rpc_free_module_compiles_and_imports(fmt, tmp_path):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
     assert compileall.compile_dir(str(out), quiet=1), f"{fmt} output has syntax errors"
-    sys.path.insert(0, str(tmp_path))
-    try:
-        pkg = __import__(f"tmod_{fmt}")
-        assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Import the package the README names, from `src/` -- not the container,
+    # which is not a package (it would import as an empty namespace package and
+    # fail with a confusing AttributeError).
+    pkg = _import(out, "")
+    assert pkg.RestconfClient if fmt == "restconf" else pkg.NetconfClient
 
 
 def _gen_restconf(yang_text: str, name: str, tmp_path):
@@ -526,8 +528,9 @@ def _gen_restconf(yang_text: str, name: str, tmp_path):
     # Don't hardcode the version directory: the default device_version differs
     # between the console script and run_compiler(). The manifest is the
     # authoritative statement of what was emitted.
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
-    pkg_root = out / manifest["package_name"]
+    project = _project(out)
+    manifest = json.loads((project / "MANIFEST.yang-revisions.json").read_text())
+    pkg_root = project / "src" / manifest["package_name"]
     assert pkg_root.is_dir(), f"expected package at {pkg_root}"
     sys.path.insert(0, str(pkg_root.parent))
     return str(pkg_root.parent), pkg_root.name
@@ -779,8 +782,8 @@ def test_cli_applies_augment_closure_end_to_end(tmp_path, no_closure):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
 
-    models = next(out.glob("*/data_models/tbase.py"), None)
-    assert models is not None, f"no generated model for tbase under {out}"
+    models = _pkg_file(out, "data_models", "tbase.py")
+    assert models.is_file(), f"no generated model for tbase under {out}"
     text = models.read_text()
     has_augmented_field = "load" in text
     # Default: the augment IS resolved into the model.
@@ -814,13 +817,13 @@ def test_generated_package_name_matches_the_matrix_slug():
     pins, by actually compiling.
     """
     from tests.conftest import _slug, load_matrix
-    from yang2sdk.plugin.src.core import _sanitize_pkg
+    from yang2sdk.layout import sanitize_package_name
 
     images = load_matrix()["images"]
     assert images, "matrix declares no images"
     for image in images:
         want = _slug(image)
-        got = _sanitize_pkg(f"{image['package']}_{image['tag']}")
+        got = sanitize_package_name(f"{image['package']}_{image['tag']}")
         assert got == want, (
             f"{image['package']}:{image['tag']}: package name {got!r} != "
             f"directory slug {want!r}; the installable copy and the imported "
@@ -859,17 +862,19 @@ def test_compile_all_names_the_installable_package_from_the_matrix_slug(
 
     slug = conftest._slug(image)
     out = tmp_path / "clients" / f"{slug}_restconf"
-    assert (out / "__init__.py").exists(), "flat importable copy missing"
-    # The installable copy is named from --device/--device-version, NOT from
-    # the slug passed as --device. This is the assertion that catches the bug.
-    assert (out / slug).is_dir(), (
-        f"installable copy is not named {slug}; found "
+    # One copy of the code, in an installable project the generated README can
+    # name: `uv add <container>/<package>`.
+    project = _project(out)
+    package = _package(out)
+    assert package.name == slug, (
+        f"installable package is not named {slug}; found "
         f"{sorted(p.name for p in out.iterdir())}"
     )
+    assert package.parent.name == "src", package
     assert not (out / f"{slug}_0_0_0").exists(), "device version double-encoded"
-    pyproject = (out / "pyproject.toml").read_text()
+    pyproject = (project / "pyproject.toml").read_text()
     assert f'name = "{slug}"' in pyproject, pyproject[:400]
-    assert f'packages = ["{slug}"]' in pyproject, pyproject[:400]
+    assert f'packages = ["src/{slug}"]' in pyproject, pyproject[:400]
     # PEP 440: 10.4-4 -> 10.4.4
     assert 'version = "10.4.4"' in pyproject, pyproject[:400]
 
@@ -992,11 +997,12 @@ def test_cli_does_not_stamp_a_foreign_device_version(tmp_path):
         env=env,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    pyproject = (out / "pyproject.toml").read_text()
+    project = _project(out)
+    pyproject = (project / "pyproject.toml").read_text()
     assert "9.9.9" not in pyproject, (
         f"foreign DEVICE_VERSION leaked into the package metadata:\n{pyproject}"
     )
-    readme = (out / "README.md").read_text()
+    readme = (project / "README.md").read_text()
     assert "9.9.9" not in readme, (
         f"foreign DEVICE_VERSION leaked into the generated README:\n{readme[:600]}"
     )
@@ -1204,7 +1210,7 @@ def test_case_differing_siblings_are_not_merged_into_one_model(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    model = next(out.glob("*/data_models/tcollide.py"))
+    model = _pkg_file(out, "data_models", "tcollide.py")
     text = model.read_text()
 
     classes = re.findall(r"^class (\w+)\(.*?tag=\"([^\"]+)\"", text, re.MULTILINE)
@@ -1249,12 +1255,8 @@ def test_content_filter_prunes_nested_state(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    sys.path.insert(0, str(tmp_path))
-    try:
-        models = __import__("tcontent_restconf.data_models.tcontent", fromlist=["*"])
-        data_cls = models.TcontentData
-    finally:
-        sys.path.remove(str(tmp_path))
+    models = _import(out, "data_models.tcontent")
+    data_cls = models.TcontentData
 
     m = data_cls.model_validate(
         {
@@ -1350,71 +1352,65 @@ def test_restconf_write_bodies_are_module_qualified(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    sys.path.insert(0, str(tmp_path))
-    try:
-        nav_mod = importlib.import_module("env_restconf.data_navigators")
-        models = importlib.import_module("env_restconf.data_models.env")
+    nav_mod = _import(out, "data_navigators")
+    models = _import(out, "data_models.env")
 
-        client = _RecordingClient()
-        data = nav_mod.Data(client, "/data", "")
-        list_nav = data.env_parent.things
+    client = _RecordingClient()
+    data = nav_mod.Data(client, "/data", "")
+    list_nav = data.env_parent.things
 
-        thing = models.ThingsItem.model_validate(
-            {"id": "a", "val": "x", "some_leaf": "s"}
-        )
-        full = {"id": "a", "val": "x", "some-leaf": "s"}
+    thing = models.ThingsItem.model_validate({"id": "a", "val": "x", "some_leaf": "s"})
+    full = {"id": "a", "val": "x", "some-leaf": "s"}
 
-        list_nav.create([thing])
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.4.1 + App. B.2.1: POST to the parent with a
-        # single-element array, one POST per entry (Sec 4.4.1 MUST exactly
-        # one instance). See _base.py.jinja _create.
-        assert method == "POST" and path == "/data/env:parent"
-        assert body == {"env:things": [full]}, (
-            f"create body must be a qualified single-element array: {body}"
-        )
+    list_nav.create([thing])
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.4.1 + App. B.2.1: POST to the parent with a
+    # single-element array, one POST per entry (Sec 4.4.1 MUST exactly
+    # one instance). See _base.py.jinja _create.
+    assert method == "POST" and path == "/data/env:parent"
+    assert body == {"env:things": [full]}, (
+        f"create body must be a qualified single-element array: {body}"
+    )
 
-        list_nav.replace([thing])
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4: whole-list PUT targets the
-        # list resource itself with name/array encoding.
-        assert method == "PUT" and path == "/data/env:parent/things"
-        assert body == {"env:things": [full]}, (
-            f"list replace body must be a qualified array: {body}"
-        )
+    list_nav.replace([thing])
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.5 + RFC 7951 Sec 5.4: whole-list PUT targets the
+    # list resource itself with name/array encoding.
+    assert method == "PUT" and path == "/data/env:parent/things"
+    assert body == {"env:things": [full]}, (
+        f"list replace body must be a qualified array: {body}"
+    )
 
-        list_nav("a").update(thing)
-        method, path, body = client.calls[-1]
-        # RFC 8040 Sec 4.5 jukebox PUT array + RFC 7951 Sec 5.4 list/array;
-        # PATCH list-instance follows the same JSON encoding (no JSON PATCH
-        # list-instance example in RFC 8040; XML bare <album> differs by
-        # design). Matches rousette tests/restconf-plain-patch.cpp (204).
-        assert body == {"env:things": [full]}, (
-            f"item PATCH body must be a qualified array: {body}"
-        )
+    list_nav("a").update(thing)
+    method, path, body = client.calls[-1]
+    # RFC 8040 Sec 4.5 jukebox PUT array + RFC 7951 Sec 5.4 list/array;
+    # PATCH list-instance follows the same JSON encoding (no JSON PATCH
+    # list-instance example in RFC 8040; XML bare <album> differs by
+    # design). Matches rousette tests/restconf-plain-patch.cpp (204).
+    assert body == {"env:things": [full]}, (
+        f"item PATCH body must be a qualified array: {body}"
+    )
 
-        list_nav("a").replace(thing)
-        method, path, body = client.calls[-1]
-        assert method == "PUT" and path == "/data/env:parent/things=a"
-        assert body == {"env:things": [full]}, (
-            f"item PUT body must be a qualified array: {body}"
-        )
+    list_nav("a").replace(thing)
+    method, path, body = client.calls[-1]
+    assert method == "PUT" and path == "/data/env:parent/things=a"
+    assert body == {"env:things": [full]}, (
+        f"item PUT body must be a qualified array: {body}"
+    )
 
-        parent = models.Parent.model_validate({"things": [full]})
-        data.env_parent.update(parent)
-        method, path, body = client.calls[-1]
-        assert method == "PATCH" and path == "/data/env:parent"
-        assert body == {"env:parent": {"things": [full]}}, (
-            f"container envelope must be qualified: {body}"
-        )
+    parent = models.Parent.model_validate({"things": [full]})
+    data.env_parent.update(parent)
+    method, path, body = client.calls[-1]
+    assert method == "PATCH" and path == "/data/env:parent"
+    assert body == {"env:parent": {"things": [full]}}, (
+        f"container envelope must be qualified: {body}"
+    )
 
-        # Response keys stay simple for same-module nodes: retrieve must
-        # still match the unqualified key.
-        client.responses.append({"things": [full]})
-        items = list_nav.retrieve(content="all", depth=2)
-        assert [i.id for i in items] == ["a"]
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Response keys stay simple for same-module nodes: retrieve must
+    # still match the unqualified key.
+    client.responses.append({"things": [full]})
+    items = list_nav.retrieve(content="all", depth=2)
+    assert [i.id for i in items] == ["a"]
 
 
 TB_BASE_YANG = """module tbase {
@@ -1488,53 +1484,44 @@ def test_netconf_identityref_binding_and_normalization(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
     assert compileall.compile_dir(str(out), quiet=1), "netconf output has syntax errors"
-    sys.path.insert(0, str(tmp_path))
-    try:
-        models = importlib.import_module("tmain_netconf.data_models.tmain")
-        from lxml import etree  # ty: ignore[unresolved-import] - lxml stubs (cf. src/)
+    models = _import(out, "data_models.tmain")
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml stubs (cf. src/)
 
-        # Generated by this test at runtime; import dynamically so the
-        # type checkers do not try to resolve a nonexistent source module.
-        bind_module_prefixes = importlib.import_module(
-            "tmain_netconf.session_manager"
-        ).bind_module_prefixes
+    # Generated by this test at runtime; import dynamically so the
+    # type checkers do not try to resolve a nonexistent source module.
+    bind_module_prefixes = _import(out, "session_manager").bind_module_prefixes
 
-        item_cls = models.ItemsItem
-        assert (
-            item_cls.model_fields["kind"].json_schema_extra.get("is_identityref")
-            is True
-        )
+    item_cls = models.ItemsItem
+    assert item_cls.model_fields["kind"].json_schema_extra.get("is_identityref") is True
 
-        # Write side: module-name prefix gets its xmlns declaration.
-        cfg = etree.fromstring(
-            '<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
-            '<stuff xmlns="urn:test:tmain"><items>'
-            "<id>a</id><kind>tbase:base-id</kind></items></stuff></config>"
-        )
-        bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
-        assert 'xmlns:tbase="urn:test:tbase"' in etree.tostring(cfg).decode()
-        # Idempotent, and never rebinds a prefix already in scope.
-        bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
-        assert etree.tostring(cfg).count(b"xmlns:tbase") == 1
-        cfg2 = etree.fromstring('<a xmlns:tbase="urn:other"><t>tbase:x</t></a>')
-        bind_module_prefixes(cfg2, {"tbase": "urn:test:tbase"})
-        assert 'xmlns:tbase="urn:other"' in etree.tostring(cfg2).decode()
+    # Write side: module-name prefix gets its xmlns declaration.
+    cfg = etree.fromstring(
+        '<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<stuff xmlns="urn:test:tmain"><items>'
+        "<id>a</id><kind>tbase:base-id</kind></items></stuff></config>"
+    )
+    bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
+    assert 'xmlns:tbase="urn:test:tbase"' in etree.tostring(cfg).decode()
+    # Idempotent, and never rebinds a prefix already in scope.
+    bind_module_prefixes(cfg, {"tbase": "urn:test:tbase"})
+    assert etree.tostring(cfg).count(b"xmlns:tbase") == 1
+    cfg2 = etree.fromstring('<a xmlns:tbase="urn:other"><t>tbase:x</t></a>')
+    bind_module_prefixes(cfg2, {"tbase": "urn:test:tbase"})
+    assert 'xmlns:tbase="urn:other"' in etree.tostring(cfg2).decode()
 
-        # Read side: server prefix form normalizes to the module name.
-        xml = (
-            '<items xmlns="urn:test:tmain"><id>a</id>'
-            '<kind xmlns:xx="urn:test:tbase">xx:base-id</kind></items>'
-        )
-        m = item_cls.from_xml(xml, module_namespaces={"tbase": "urn:test:tbase"})
-        assert m.kind == "tbase:base-id"
+    # Read side: server prefix form normalizes to the module name.
+    xml = (
+        '<items xmlns="urn:test:tmain"><id>a</id>'
+        '<kind xmlns:xx="urn:test:tbase">xx:base-id</kind></items>'
+    )
+    m = item_cls.from_xml(xml, module_namespaces={"tbase": "urn:test:tbase"})
+    assert m.kind == "tbase:base-id"
 
-        # Round trip: module-name form serializes unchanged.
-        payload = item_cls(id="a", kind="tbase:base-id").to_xml_payload()
-        assert b"tbase:base-id" in (
-            payload if isinstance(payload, bytes) else payload.encode()
-        )
-    finally:
-        sys.path.remove(str(tmp_path))
+    # Round trip: module-name form serializes unchanged.
+    payload = item_cls(id="a", kind="tbase:base-id").to_xml_payload()
+    assert b"tbase:base-id" in (
+        payload if isinstance(payload, bytes) else payload.encode()
+    )
 
 
 def test_no_nonexistent_rfc_sections_cited():
@@ -1601,8 +1588,8 @@ def test_generated_package_is_registry_ready(tmp_path):
     """Generated SDK is a securely publishable package (AGENTS.md packaging).
 
     Asserts pyproject.toml + README.md + MANIFEST + py.typed exist, manifest
-    carries module revisions, no secrets/lab paths, and the namespaced copy
-    imports (import <package_name>).
+    carries module revisions, no secrets/lab paths, and the package imports as
+    `<package_name>` with nothing but the project on `sys.path`.
     """
     yang = tmp_path / "tmod.yang"
     yang.write_text(MINIMAL_YANG)
@@ -1614,31 +1601,38 @@ def test_generated_package_is_registry_ready(tmp_path):
         out,
         ["--device-version", "1.2.3", "--package-version", "1.2.3"],
     )
-    assert (out / "pyproject.toml").exists()
-    assert (out / "README.md").exists()
-    assert (out / "MANIFEST.yang-revisions.json").exists()
-    assert (out / "py.typed").exists()
+    project = _project(out)
+    package = _package(out)
+    assert (project / "pyproject.toml").exists()
+    assert (project / "README.md").exists()
+    assert (project / "MANIFEST.yang-revisions.json").exists()
+    assert (package / "py.typed").exists()
     import tomllib
 
-    pyproj = tomllib.loads((out / "pyproject.toml").read_text())
+    pyproj = tomllib.loads((project / "pyproject.toml").read_text())
     assert pyproj["project"]["name"] == "tmod_1_2_3"
     assert pyproj["project"]["version"] == "1.2.3"
     assert "data_models" not in pyproj["project"]["name"]
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    assert pyproj["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "src/tmod_1_2_3"
+    ]
+    manifest = json.loads((project / "MANIFEST.yang-revisions.json").read_text())
     assert manifest["device"] == "tmod"
     assert manifest["device_version"] == "1.2.3"
     assert manifest["protocol"] == "restconf"
     assert any(m["name"] == "tmod" for m in manifest["modules"])
-    hay = (out / "pyproject.toml").read_text() + (out / "README.md").read_text()
+    hay = (project / "pyproject.toml").read_text() + (project / "README.md").read_text()
     for secret in ("DEVICE_PASS", "DEVICE_USER", "192.168", "BEGIN PRIVATE"):
         assert secret not in hay
-    # Namespaced installable copy imports without temp/lab paths.
-    sys.path.insert(0, str(out))
+    # The installable package imports with only `src/` on the path: no temp/,
+    # no lab path, no second copy.
+    assert package.parent.name == "src"
+    sys.path.insert(0, str(package.parent))
     try:
         pkg = importlib.import_module("tmod_1_2_3")
         assert pkg.RestconfClient is not None
     finally:
-        sys.path.remove(str(out))
+        sys.path.remove(str(package.parent))
 
 
 def test_package_manifest_records_deviations_and_features(tmp_path):
@@ -1678,7 +1672,7 @@ def test_package_manifest_records_deviations_and_features(tmp_path):
             "tmod:myfeat",
         ],
     )
-    manifest = json.loads((out / "MANIFEST.yang-revisions.json").read_text())
+    manifest = json.loads((_project(out) / "MANIFEST.yang-revisions.json").read_text())
     assert any("my-dev.yang" in d for d in manifest["deviations"])
     assert "tmod:myfeat" in manifest["features"]
     assert manifest["features_source"] == "manual"
@@ -1722,44 +1716,40 @@ def test_logging_hygiene_generated_client(tmp_path):
     yang.write_text(MINIMAL_YANG)
     out = tmp_path / "tmod_log"
     _run_compiler("restconf", yang, tmp_path, out)
-    sys.path.insert(0, str(tmp_path))
-    try:
-        sm_mod = importlib.import_module("tmod_log.session_manager")
+    sm_mod = _import(out, "session_manager")
 
-        class FakeResp:
-            status_code = 200
-            text = '{"tmod:top": {"name": "x", "password": "s3cret"}}'
+    class FakeResp:
+        status_code = 200
+        text = '{"tmod:top": {"name": "x", "password": "s3cret"}}'
 
-            def raise_for_status(self):
-                return None
+        def raise_for_status(self):
+            return None
 
-            def json(self):
-                return {"tmod:top": {"name": "x"}}
+        def json(self):
+            return {"tmod:top": {"name": "x"}}
 
-        class FakeSession:
-            verify = True
-            trust_env = True
-            auth = ("u", "p")
+    class FakeSession:
+        verify = True
+        trust_env = True
+        auth = ("u", "p")
 
-            def __init__(self):
-                self.headers: dict = {}
+        def __init__(self):
+            self.headers: dict = {}
 
-            def mount(self, *a, **k):
-                return None
+        def mount(self, *a, **k):
+            return None
 
-            def request(self, method, url, timeout=None, **kwargs):
-                return FakeResp()
+        def request(self, method, url, timeout=None, **kwargs):
+            return FakeResp()
 
-        from unittest import mock
+    from unittest import mock
 
-        with mock.patch.object(sm_mod.requests, "Session", return_value=FakeSession()):
-            client = sm_mod.RestconfClient(
-                management_ip="127.0.0.1", username="u", password="p", verify=False
-            )
-            # Default: bodies hidden from INFO.
-            assert client.log_bodies is False
-    finally:
-        sys.path.remove(str(tmp_path))
+    with mock.patch.object(sm_mod.requests, "Session", return_value=FakeSession()):
+        client = sm_mod.RestconfClient(
+            management_ip="127.0.0.1", username="u", password="p", verify=False
+        )
+        # Default: bodies hidden from INFO.
+        assert client.log_bodies is False
 
 
 # --- device feature set (RFC 7950 if-feature -> pyang --features) -------------
@@ -1942,19 +1932,25 @@ def test_auto_device_features_reach_pyang(tmp_path):
 
     auto = tmp_path / "auto"
     _run_compiler("restconf", yang, tmp_path, auto)
-    auto_manifest = json.loads((auto / "MANIFEST.yang-revisions.json").read_text())
+    auto_manifest = json.loads(
+        (_project(auto) / "MANIFEST.yang-revisions.json").read_text()
+    )
     assert auto_manifest["features_source"] == "device"
     assert auto_manifest["features"] == ["tfeat:other"]
     # `g` is `if-feature "not f"` and f is unsupported, so the auto-detected
     # device set must keep it in the model.
-    assert "G" in (auto / "data_models" / "tfeat.py").read_text()
+    assert "G" in (_package(auto) / "data_models" / "tfeat.py").read_text()
 
     opted_out = tmp_path / "opted_out"
     _run_compiler("restconf", yang, tmp_path, opted_out, ["--no-device-features"])
-    out_manifest = json.loads((opted_out / "MANIFEST.yang-revisions.json").read_text())
+    out_manifest = json.loads(
+        (_project(opted_out) / "MANIFEST.yang-revisions.json").read_text()
+    )
     assert out_manifest["features_source"] == "none"
     assert out_manifest["features"] == []
-    assert "class G(" not in (opted_out / "data_models" / "tfeat.py").read_text()
+    assert (
+        "class G(" not in (_package(opted_out) / "data_models" / "tfeat.py").read_text()
+    )
 
 
 # --- RPC / action wire encoding (offline: no device needed) -------------------
@@ -2054,12 +2050,80 @@ def _gen(tmp_path, fmt, yang_text, name):
     return out, compileall.compile_dir(str(out), quiet=1)
 
 
-def _import(pkg_dir, dotted):
-    """Import `<pkg_dir.name>.dotted`, i.e. the flat lab layout under temp/."""
-    parent = str(pkg_dir.parent)
+def _project(out) -> Path:
+    """The single installable project inside an ``--output-dir`` container.
+
+    The layout is defined in `yang2sdk.layout`; the assert makes a container
+    holding two projects (a stale compile for another device version) loud
+    here rather than in whichever consumer globbed first.
+    """
+    projects = [
+        p for p in sorted(Path(out).iterdir()) if (p / "pyproject.toml").is_file()
+    ]
+    assert len(projects) == 1, (
+        f"expected one project in {out}: {[p.name for p in projects]}"
+    )
+    return projects[0]
+
+
+def _package(out) -> Path:
+    """The importable package inside a container/project: ``<project>/src/<pkg>``."""
+    return layout.resolve_package(Path(out))
+
+
+def _pkg_file(out, *parts) -> Path:
+    """A path inside the generated package: ``<project>/src/<pkg>/<parts...>``."""
+    return _package(out).joinpath(*parts)
+
+
+_IMPORTED_FROM: dict[str, str] = {}
+
+
+def _purge_package(name: str) -> None:
+    """Drop a package and its submodules from `sys.modules`."""
+    prefix = f"{name}."
+    for stale in [n for n in sys.modules if n == name or n.startswith(prefix)]:
+        del sys.modules[stale]
+
+
+def _import(out, dotted, alias=None):
+    """Import ``<package>.<dotted>`` from a generated container or project.
+
+    The generated package is named after the *device*, so several tests here
+    compile the same device name from different YANG into different tmp dirs.
+    Python caches the first one, and a later test then silently asserts against
+    an earlier test's model -- tests that pass alone and fail in a full run.
+    Purge only when the package is being imported from a *different* directory,
+    so two imports inside one test still see the same module objects (a
+    navigator's lazy `from .x import Y` must resolve to the same classes the
+    test holds).
+
+    ``alias`` loads the package under a private top-level name instead, which
+    is what a caller needs when two *protocols* for one device are alive in the
+    same process: they share one distribution name (`<device>_<version>`, no
+    protocol in it), so they cannot both answer to it -- and they could not be
+    installed side by side either. `sdk-verify --protocol both` loads them the
+    same way for the same reason.
+    """
+    package = _package(out)
+    parent = str(package.parent)
+    if alias:
+        spec = importlib.util.spec_from_file_location(
+            alias, package / "__init__.py", submodule_search_locations=[str(package)]
+        )
+        assert spec is not None and spec.loader is not None, package
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = module
+        spec.loader.exec_module(module)
+        target = alias if not dotted else f"{alias}.{dotted}"
+        return importlib.import_module(target)
+    if _IMPORTED_FROM.get(package.name, parent) != parent:
+        _purge_package(package.name)
+    _IMPORTED_FROM[package.name] = parent
     sys.path.insert(0, parent)
     try:
-        return importlib.import_module(f"{pkg_dir.name}.{dotted}")
+        target = package.name if not dotted else f"{package.name}.{dotted}"
+        return importlib.import_module(target)
     finally:
         sys.path.remove(parent)
 
@@ -2744,6 +2808,502 @@ def test_read_pruning_is_bounded_by_the_requested_depth(tmp_path):
     assert base._maybe_prune(full_entries, 2) == full_entries
 
 
+# --- NETCONF depth: filter, skeleton, and D pruner -------------------------
+
+DEPTH_YANG = """module tdepth {
+  prefix td;
+  namespace "urn:test:tdepth";
+  revision 2026-01-01;
+  container root {
+    leaf name { type string; }
+    leaf-list tags { type string; }
+    container child {
+      leaf value { type string; }
+      container grand { leaf deep { type string; } }
+    }
+    container wrapper {
+      container inner { leaf deep { type string; } }
+    }
+    container strict {
+      leaf must-have { type string; mandatory true; }
+    }
+    list items {
+      key "id";
+      leaf id { type string; }
+      leaf label { type string; }
+      container detail { leaf code { type string; } }
+    }
+    // YANG 1.1 permits a keyless list when config is false; pyang otherwise
+    // refuses the model with NEED_KEY. This is the shape the depth filter must
+    // treat as a boundary keyless list.
+    list keyless {
+      config false;
+      leaf value { type string; }
+    }
+  }
+}
+"""
+
+_DEPTH_XML = (
+    '<root xmlns="urn:test:tdepth">'
+    "<name>n</name><tags>t</tags>"
+    "<child><value>v</value><grand><deep>d</deep></grand></child>"
+    "<wrapper><inner><deep>d</deep></inner></wrapper>"
+    "<strict><must-have>m</must-have></strict>"
+    "<items><id>a</id><label>l</label><detail><code>c</code></detail></items>"
+    "<keyless><value>kv</value></keyless>"
+    "</root>"
+)
+
+
+def _depth_filter_tags(element):
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    return {_et.QName(child).localname for child in element}
+
+
+def _assert_filter_is_bounded(base, element, model_cls):
+    """Every complex element must retain a selection node (RFC 6241 Sec 6.2)."""
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    for info in model_cls.model_fields.values():
+        extra = info.json_schema_extra or {}
+        tag = extra.get("tag")
+        if not tag:
+            continue
+        child_cls, _is_list = base._child_model_and_kind(info.annotation)
+        if child_cls is None:
+            continue
+        for child in element:
+            if _et.QName(child).localname != tag:
+                continue
+            if extra.get("ns") and _et.QName(child).namespace != extra.get("ns"):
+                continue
+            assert not base._is_whole_subtree_trigger(child), (
+                f"depth filter has a whole-subtree trigger at {tag}: "
+                f"{_et.tostring(child, encoding='unicode')}"
+            )
+            _assert_filter_is_bounded(base, child, child_cls)
+
+
+def test_netconf_depth_filter_never_selects_a_whole_subtree(tmp_path):
+    """RFC 6241 has no server-side depth, so the generated filter is the
+    ceiling. An empty complex element is a selection node and would fetch the
+    whole subtree; a content-match-only sibling set would too. The builder
+    must drop boundary containers/keyless lists, keep boundary keys, and
+    collapse to `None` (skeleton) when the target itself is a trigger.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tdepth")
+
+    root_path = [("urn:test:tdepth", "root", {})]
+    f2 = base.build_depth_filter(root_path, models.Root, 2)
+    assert f2 is not None
+    _assert_filter_is_bounded(base, f2, models.Root)
+    assert all("operation" not in _et.QName(node).localname for node in f2.iter()), (
+        "nc:operation is an attribute, not a data node in a read filter"
+    )
+    assert _depth_filter_tags(f2) == {"name", "tags", "items"}, (
+        f"depth 2 must drop boundary containers and the keyless list: "
+        f"{_et.tostring(f2, encoding='unicode')}"
+    )
+    items2 = next(c for c in f2 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items2) == {"id"}, (
+        "a keyed list on the boundary must keep keys only"
+    )
+
+    f3 = base.build_depth_filter(root_path, models.Root, 3)
+    assert f3 is not None
+    _assert_filter_is_bounded(base, f3, models.Root)
+    assert _depth_filter_tags(f3) == {
+        "name",
+        "tags",
+        "child",
+        "strict",
+        "items",
+        "keyless",
+    }, (
+        "wrapper's only child is on the boundary, so the emptied wrapper must "
+        f"be removed: {_et.tostring(f3, encoding='unicode')}"
+    )
+    child3 = next(c for c in f3 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child3) == {"value"}
+    items3 = next(c for c in f3 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items3) == {"id", "label"}
+
+    f4 = base.build_depth_filter(root_path, models.Root, 4)
+    assert f4 is not None
+    _assert_filter_is_bounded(base, f4, models.Root)
+    assert _depth_filter_tags(f4) == {
+        "name",
+        "tags",
+        "child",
+        "wrapper",
+        "strict",
+        "items",
+        "keyless",
+    }
+    child4 = next(c for c in f4 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child4) == {"value", "grand"}
+    wrapper4 = next(c for c in f4 if _et.QName(c).localname == "wrapper")
+    inner4 = next(c for c in wrapper4 if _et.QName(c).localname == "inner")
+    assert _depth_filter_tags(inner4) == {"deep"}
+    items4 = next(c for c in f4 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items4) == {"id", "label", "detail"}
+
+    # depth=1 on a container cannot be expressed without selecting its whole
+    # subtree: the caller must get a skeleton instead.
+    assert base.build_depth_filter(root_path, models.Root, 1) is None
+
+    # A keyed list collection at depth=1 is expressible as keys-only.
+    items_path = [("urn:test:tdepth", "root", {}), ("urn:test:tdepth", "items", {})]
+    f_items1 = base.build_depth_filter(items_path, models.ItemsItem, 1)
+    assert f_items1 is not None
+    _assert_filter_is_bounded(base, f_items1, models.Root)
+    items1 = f_items1[0]
+    assert _depth_filter_tags(items1) == {"id"}
+    assert all(child.text is None for child in items1), (
+        "collection keys must be selection nodes, not content matches"
+    )
+
+    # A keyless list at depth=1 has no addressable key and no kept child.
+    keyless_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "keyless", {}),
+    ]
+    assert base.build_depth_filter(keyless_path, models.KeylessItem, 1) is None
+
+    # A specific list item at depth=1 has only its path keys (content matches).
+    item_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "items", {"id": "a"}),
+    ]
+    assert base.build_depth_filter(item_path, models.ItemsItem, 1) is None
+    f_item2 = base.build_depth_filter(item_path, models.ItemsItem, 2)
+    assert f_item2 is not None
+    _assert_filter_is_bounded(base, f_item2, models.Root)
+    items2 = f_item2[0]
+    assert _depth_filter_tags(items2) == {"id", "label"}
+    assert items2[0].text == "a", "the path key must stay a content match"
+    assert items2[1].text is None, "the selected leaf must stay a selection node"
+
+    # A container target whose only child is on the boundary collapses.
+    wrapper_path = [
+        ("urn:test:tdepth", "root", {}),
+        ("urn:test:tdepth", "wrapper", {}),
+    ]
+    assert base.build_depth_filter(wrapper_path, models.Wrapper, 2) is None
+    f_wrapper3 = base.build_depth_filter(wrapper_path, models.Wrapper, 3)
+    assert f_wrapper3 is not None
+    _assert_filter_is_bounded(base, f_wrapper3, models.Root)
+
+    # `fields` may not smuggle a complex field in empty; a leaf is fine.
+    assert base.build_depth_filter(root_path, models.Root, 2, fields=["child"]) is None
+    f_field = base.build_depth_filter(root_path, models.Root, 2, fields=["name"])
+    assert f_field is not None
+    assert _depth_filter_tags(f_field) == {"name"}
+    f_field3 = base.build_depth_filter(root_path, models.Root, 3, fields=["child"])
+    assert f_field3 is not None
+    _assert_filter_is_bounded(base, f_field3, models.Root)
+    assert _depth_filter_tags(f_field3) == {"child"}
+    assert _depth_filter_tags(f_field3[0]) == {"value"}
+
+
+def test_netconf_depth_pruner_matches_restconf_boundary(tmp_path):
+    """The local safety net must use the same level convention as RESTCONF:
+    target level 1, boundary containers/keyless lists removed, boundary keys
+    kept. It must trim a server that ignores the filter.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tdepth")
+
+    root1 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root1, models.Root, 1)
+    assert _depth_filter_tags(root1) == set(), "depth 1 is the target alone"
+
+    root2 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root2, models.Root, 2)
+    assert _depth_filter_tags(root2) == {"name", "tags", "items"}
+    items2 = next(c for c in root2 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items2) == {"id"}
+
+    root3 = _et.fromstring(_DEPTH_XML)
+    base.prune_xml_tree_to_depth(root3, models.Root, 3)
+    assert _depth_filter_tags(root3) == {
+        "name",
+        "tags",
+        "child",
+        "wrapper",
+        "strict",
+        "items",
+        "keyless",
+    }
+    child3 = next(c for c in root3 if _et.QName(c).localname == "child")
+    assert _depth_filter_tags(child3) == {"value"}
+    wrapper3 = next(c for c in root3 if _et.QName(c).localname == "wrapper")
+    assert _depth_filter_tags(wrapper3) == set(), (
+        "a non-boundary container emptied by pruning stays as an empty shell "
+        "(RESTCONF _maybe_prune only drops empties exactly at the boundary)"
+    )
+    items3 = next(c for c in root3 if _et.QName(c).localname == "items")
+    assert _depth_filter_tags(items3) == {"id", "label"}
+
+    entry1 = _et.fromstring(
+        '<items xmlns="urn:test:tdepth"><id>a</id><label>l</label>'
+        "<detail><code>c</code></detail></items>"
+    )
+    base.prune_xml_tree_to_depth(entry1, models.ItemsItem, 1)
+    assert _depth_filter_tags(entry1) == {"id"}
+
+
+def _netconf_depth_client(replies=None, forbid=False):
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    class _Client:
+        module_namespaces: ClassVar[dict[str, str]] = {}
+        has_nmda = False
+
+        def __init__(self):
+            self.calls = []
+            self.replies = list(replies or [])
+            self.forbid = forbid
+
+        def retrieve(self, **kwargs):
+            if self.forbid:
+                raise AssertionError("skeleton path must not hit the wire")
+            self.calls.append(kwargs)
+            return self.replies.pop(0) if self.replies else None
+
+    return _Client(), _et
+
+
+def test_netconf_depth_skeleton_does_not_hit_the_wire(tmp_path, caplog):
+    """A collapsed finite-depth filter is not sent. The caller gets the
+    RESTCONF-shaped skeleton (container empty model, keyed item with path
+    keys, keyless list []) and a warning; no RPC is issued.
+    """
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    nav = _import(out, "data_navigators")
+
+    client, _ = _netconf_depth_client(forbid=True)
+    data = nav.Data(client, [])
+
+    with caplog.at_level("WARNING"):
+        root = data.tdepth_root.retrieve(depth=1)
+    assert root is not None and client.calls == []
+    assert getattr(root, "_yang2sdk_skeleton", False) is True
+    assert "whole subtree" in caplog.text
+    assert "root" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        item = data.tdepth_root.items("a").retrieve(depth=1)
+    assert item is not None and item.id == "a"
+    assert getattr(item, "_yang2sdk_skeleton", False) is True
+    assert client.calls == []
+    assert "root/items" in caplog.text
+    assert "'a'" not in caplog.text, "the warning must not log instance key values"
+
+    keyless = data.tdepth_root.keyless.retrieve(depth=1)
+    assert keyless == [] and client.calls == []
+    assert getattr(keyless, "_yang2sdk_skeleton", False) is True
+
+    # Mandatory fields cannot validate an empty container; the skeleton path
+    # deliberately falls back to model_construct instead of raising.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        strict = data.tdepth_root.strict.retrieve(depth=1)
+    assert strict is not None and client.calls == []
+    assert getattr(strict, "_yang2sdk_skeleton", False) is True
+    assert "cannot satisfy mandatory fields" in caplog.text
+
+
+def test_netconf_skeleton_shape_matches_restconf_depth_one(tmp_path):
+    """The skeleton mirrors the RESTCONF visible shape for the expressible
+    depth-1 cases: empty container, empty keyless list, keyed item with keys.
+    """
+    rout, _ = _gen(tmp_path, "restconf", DEPTH_YANG, "tdepth")
+    rbase = _import(rout, "data_navigators._base")
+
+    assert rbase._maybe_prune({}, 1) == {}, "container depth 1 is empty"
+    assert rbase._maybe_prune([{}], 1) == [], "keyless list depth 1 is []"
+    assert rbase._maybe_prune([{"id": "a"}], 1) == [{"id": "a"}], (
+        "keyed list item depth 1 keeps its keys"
+    )
+    assert rbase._maybe_prune({"id": "a"}, 1) == {"id": "a"}
+
+
+def test_netconf_depth_uses_the_filter_and_prunes_a_lying_server(tmp_path):
+    """The wire path sends a bounded filter; a reply deeper than asked is
+    still trimmed locally (the client cannot undo received bytes, but the
+    model stays bounded).
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    nav = _import(out, "data_navigators")
+
+    # Keyed collection at depth 1: keys-only filter, keys-only entries.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<root xmlns="urn:test:tdepth">'
+        "<items><id>a</id></items><items><id>b</id></items>"
+        "</root></data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    items = data.tdepth_root.items.retrieve(depth=1)
+    assert [item.id for item in items] == ["a", "b"]
+    assert getattr(items, "_yang2sdk_skeleton", False) is False
+    sent = client.calls[0]["filter_xml"]
+    items_filter = next(c for c in sent if _et2.QName(c).localname == "items")
+    assert _depth_filter_tags(items_filter) == {"id"}
+    assert all(child.text is None for child in items_filter)
+
+    # Specific item at depth 2: path key stays a content match, label is a
+    # selection node, and the deeper detail container is trimmed.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<root xmlns="urn:test:tdepth"><items>'
+        "<id>a</id><label>l</label><detail><code>c</code></detail>"
+        "</items></root></data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    item = data.tdepth_root.items("a").retrieve(depth=2)
+    assert item.id == "a" and item.label == "l" and item.detail is None
+    sent = client.calls[0]["filter_xml"]
+    items_filter = next(c for c in sent if _et2.QName(c).localname == "items")
+    assert _depth_filter_tags(items_filter) == {"id", "label"}
+    assert items_filter[0].text == "a"
+    assert items_filter[1].text is None
+
+    # A server that ignores the filter and returns everything is trimmed.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        + _DEPTH_XML
+        + "</data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    model = data.tdepth_root.retrieve(depth=2)
+    assert model.name == "n"
+    assert model.child is None, "boundary container survived the pruner"
+    assert model.keyless is None, "boundary keyless list survived the pruner"
+    assert [entry.id for entry in model.items] == ["a"]
+    assert model.items[0].label is None, "boundary leaf survived the pruner"
+
+
+def test_depth_validation_rejects_only_inexpressible_values(tmp_path):
+    """`depth=1` is valid; reject bool/0/negative/non-numeric/>65535/None
+    before any transport work, on both protocols.
+    """
+    out, _ = _gen(tmp_path, "netconf", DEPTH_YANG, "tdepth")
+    base = _import(out, "data_navigators._base")
+    nav = _import(out, "data_navigators")
+
+    assert base.validate_depth(1) == 1
+    assert base.validate_depth("2") == 2
+    assert base.validate_depth(65535) == 65535
+    assert base.validate_depth("unbounded") is None
+    assert base.validate_depth("UNBOUNDED") is None
+    for bad in (0, -1, True, "foo", 70000, None, 1.5, "", " 2 "):
+        with pytest.raises(ValueError, match="depth must be"):
+            base.validate_depth(bad)
+
+    client, _et = _netconf_depth_client(forbid=True)
+    data = nav.Data(client, [])
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            data.tdepth_root.retrieve(depth=bad)
+    assert client.calls == []
+
+    # depth=1 is accepted (the skeleton path), not rejected.
+    assert data.tdepth_root.retrieve(depth=1) is not None
+
+    # RESTCONF uses the same validator before its HTTP request.
+    rout, _ = _gen(tmp_path / "rc", "restconf", DEPTH_YANG, "tdepth")
+    rsm = _import(rout, "session_manager")
+    rnav = _import(rout, "data_navigators")
+    assert rsm.validate_depth(1) == 1
+    assert rsm.validate_depth("unbounded") is None
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            rsm.validate_depth(bad)
+    rclient = _Recorder(reply={"tdepth:root": {}})
+    rdata = rnav.Data(rclient, "/data", "")
+    for bad in (0, -1, True, "foo", 70000, None):
+        with pytest.raises(ValueError, match="depth must be"):
+            rdata.tdepth_root.retrieve(depth=bad)
+    assert rclient.calls == []
+
+
+KEYS_YANG = """module tkeys {
+  prefix tk;
+  namespace "urn:test:tkeys";
+  revision 2026-01-01;
+  container root {
+    list items {
+      key "id";
+      leaf id { type string; }
+      leaf cfg { type string; }
+      leaf state { type string; config false; }
+    }
+  }
+}
+"""
+
+
+def test_netconf_content_pruning_keeps_list_keys(tmp_path):
+    """A `content="nonconfig"` read of a config list keeps its state leaves
+    and its keys; dropping the keys made every entry unaddressable. The list
+    shell is still dropped when only keys remain and the list itself does not
+    match the requested content.
+    """
+    from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", KEYS_YANG, "tkeys")
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tkeys")
+    nav = _import(out, "data_navigators")
+
+    xml = (
+        '<root xmlns="urn:test:tkeys"><items>'
+        "<id>a</id><cfg>C</cfg><state>S</state>"
+        "</items></root>"
+    )
+    root = _et.fromstring(xml)
+    base.prune_xml_to_content(root, models.Root, "nonconfig")
+    items = root[0]
+    assert _depth_filter_tags(items) == {"id", "state"}, (
+        f"keys must survive a nonconfig read: {_et.tostring(items)}"
+    )
+
+    root = _et.fromstring(xml)
+    base.prune_xml_to_content(root, models.Root, "config")
+    items = root[0]
+    assert _depth_filter_tags(items) == {"id", "cfg"}
+
+    # End-to-end through the navigator: a legacy <get> reply is unfiltered,
+    # and the navigator's prune is what makes content= mean the same thing.
+    reply = _et.fromstring(
+        '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">' + xml + "</data>"
+    )
+    client, _et2 = _netconf_depth_client(replies=[reply])
+    data = nav.Data(client, [])
+    model = data.tkeys_root.retrieve(content="nonconfig", depth="unbounded")
+    assert model is not None
+    assert model.items[0].id == "a"
+    assert model.items[0].state == "S"
+    assert model.items[0].cfg is None
+
+
 def test_logging_redacts_passphrase_and_never_leaks_the_error_body(tmp_path):
     """Security: NTP/TACACS/RADIUS authenticator passphrases contain neither
     the substring "password" nor "passwd", so the redaction list let them
@@ -3137,6 +3697,52 @@ def test_augment_model_root_uses_augmenting_namespace(tmp_path):
     assert parsed.mode == "strict"
 
 
+def test_depth_filter_and_pruner_keep_augmenting_namespaces(tmp_path):
+    """RFC 7950 Sec 7.17: augment adds nodes to the target tree, but each
+    node stays in the AUGMENTING module's namespace. The depth filter and the
+    pruner must use `json_schema_extra["ns"]`, not the parent's namespace, or
+    the device answers correctly and the client rejects it.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen_roots(
+        tmp_path,
+        "netconf",
+        {"taug": AUGMENT_BASE_YANG, "taugext": AUGMENT_EXT_YANG},
+        ["taug", "taugext"],
+        "augm",
+    )
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.taug")
+
+    path = [("urn:test:taug", "system", {})]
+    f2 = base.build_depth_filter(path, models.System, 2)
+    assert f2 is None, (
+        "system has only boundary containers, so the filter must collapse"
+    )
+    f3 = base.build_depth_filter(path, models.System, 3)
+    assert f3 is not None
+    aaa = next(c for c in f3 if etree.QName(c).localname == "aaa")
+    assert etree.QName(aaa).namespace == "urn:test:taugext"
+    mode = next(c for c in aaa if etree.QName(c).localname == "mode")
+    assert etree.QName(mode).namespace == "urn:test:taugext"
+
+    xml = (
+        '<system xmlns="urn:test:taug">'
+        "<name><host-name>h</host-name></name>"
+        '<aaa xmlns="urn:test:taugext"><mode>strict</mode></aaa>'
+        "</system>"
+    )
+    root2 = etree.fromstring(xml)
+    base.prune_xml_tree_to_depth(root2, models.System, 2)
+    assert _depth_filter_tags(root2) == set(), "both children are boundary containers"
+    root3 = etree.fromstring(xml)
+    base.prune_xml_tree_to_depth(root3, models.System, 3)
+    aaa3 = next(c for c in root3 if etree.QName(c).localname == "aaa")
+    assert etree.QName(aaa3).namespace == "urn:test:taugext"
+    assert _depth_filter_tags(aaa3) == {"mode"}
+
+
 def test_sdk_verify_parse_errors_are_never_device_skips():
     """sdk-verify must not file a model failure under "device rejected".
 
@@ -3421,10 +4027,10 @@ def test_module_names_colliding_with_runtime_names_still_import(
     assert not any(name.startswith("_m_") for name in dir(navigators.Data)), [
         name for name in dir(navigators.Data) if name.startswith("_m_")
     ]
-    assert (out / "data_models" / f"{module_name}.py").is_file()
-    assert (out / "data_navigators" / f"{module_name}.py").is_file()
-    assert not (out / "data_models" / f"_m_{module_name}.py").exists()
-    assert not (out / "data_navigators" / f"_m_{module_name}.py").exists()
+    assert _pkg_file(out, "data_models", f"{module_name}.py").is_file()
+    assert _pkg_file(out, "data_navigators", f"{module_name}.py").is_file()
+    assert not _pkg_file(out, "data_models", f"_m_{module_name}.py").exists()
+    assert not _pkg_file(out, "data_navigators", f"_m_{module_name}.py").exists()
 
 
 @pytest.mark.parametrize(
@@ -3698,11 +4304,139 @@ def test_undeclared_xml_attributes_are_dropped_but_elements_are_not(tmp_path):
 
     # And exactly one definition of each survives in the generated base, so a
     # future edit cannot silently reintroduce the shadowing.
-    base_src = (out / "data_models" / "_base.py").read_text()
+    base_src = _pkg_file(out, "data_models", "_base.py").read_text()
     assert base_src.count("def from_xml(cls") == 1, base_src.count("def from_xml(cls")
     assert base_src.count("def from_xml_tree(cls") == 1, base_src.count(
         "def from_xml_tree(cls"
     )
+
+
+# --- a read builds only the models its payload reaches ----------------------
+
+LAZY_YANG = """module tlazy {
+  prefix tl;
+  namespace "urn:test:tlazy";
+  revision 2026-01-01;
+
+  container top {
+    container mid {
+      container deep {
+        container deeper {
+          leaf value { type string; }
+        }
+      }
+      leaf name { type string; }
+    }
+    container sibling {
+      leaf value { type string; }
+    }
+  }
+
+  rpc ping {
+    input {
+      container target {
+        leaf address { type string; }
+      }
+    }
+  }
+}
+"""
+
+LAZY_SHALLOW = b'<top xmlns="urn:test:tlazy"><mid><name>a</name></mid></top>'
+LAZY_DEEP = (
+    b'<top xmlns="urn:test:tlazy"><mid><deep><deeper><value>7</value>'
+    b"</deeper></deep><name>a</name></mid></top>"
+)
+LAZY_RPC = (
+    b'<ping xmlns="urn:test:tlazy"><input><target><address>1.1.1.1</address>'
+    b"</target></input></ping>"
+)
+
+
+def _annotated_model(annotation: Any) -> Any:
+    """The single model class an Optional[X] field annotation binds to."""
+    for arg in get_args(annotation):
+        if isinstance(arg, type) and hasattr(arg, "model_fields"):
+            return arg
+    raise AssertionError(f"no model class in annotation {annotation!r}")
+
+
+def test_from_xml_builds_only_the_models_the_payload_instantiates(tmp_path):
+    """A read must not pay for the whole model graph.
+
+    pydantic-xml asserts that a field's model has a serializer before it walks
+    a parent's fields (`serializers/factories/model.py:450`), even when the
+    element is absent, so the target model's direct children are mandatory.
+    Anything deeper is only reachable through a present element, so it must
+    stay unbuilt.
+
+    Regression: `from_xml` called `rebuild_model_and_dependencies` first, which
+    builds every reachable class. Measured on the G30 tree that is 1355 model
+    classes / ~30k fields / 34s cold -- while the reply holding two leaves
+    arrived from the device in 0.1s.
+    """
+    out, _ = _gen(tmp_path, "netconf", LAZY_YANG, "lazy")
+    models = _import(out, "data_models.tlazy")
+
+    top = models.Top
+    mid = _annotated_model(top.model_fields["mid"].annotation)
+    deep = _annotated_model(mid.model_fields["deep"].annotation)
+    deeper = _annotated_model(deep.model_fields["deeper"].annotation)
+    sibling = _annotated_model(top.model_fields["sibling"].annotation)
+
+    # `defer_build=True` keeps import cheap; nothing is built yet.
+    assert top.__xml_serializer__ is None
+    assert deeper.__xml_serializer__ is None
+
+    parsed = top.from_xml(LAZY_SHALLOW)
+    assert parsed.mid.name == "a"
+
+    assert top.__xml_serializer__ is not None
+    # Direct children are required by pydantic-xml even when absent: `sibling`
+    # is not in the payload, `deep` is a child of the present `mid`.
+    assert sibling.__xml_serializer__ is not None
+    assert deep.__xml_serializer__ is not None
+    # But `deeper` sits below an absent element, so nothing can reach it.
+    assert deeper.__xml_serializer__ is None, (
+        "a model absent from the payload was built; the read path is walking "
+        "the whole graph again"
+    )
+
+    # A payload that does carry it builds it on demand and parses it.
+    parsed = top.from_xml(LAZY_DEEP)
+    assert parsed.mid.deep.deeper.value == "7"
+    assert deeper.__xml_serializer__ is not None
+
+    # An RPC envelope field is emitted as `element(tag="input")` with no
+    # `json_schema_extra`, so the payload walk cannot key off it. Missing that
+    # case left the input model unbuilt and every RPC reply failed with
+    # "model ... is partially initialized".
+    ping = models.Ping
+    ping_input = _annotated_model(ping.model_fields["input"].annotation)
+    target = _annotated_model(ping_input.model_fields["target"].annotation)
+    assert ping_input.__xml_serializer__ is None
+    parsed = ping.from_xml(LAZY_RPC)
+    assert parsed.input.target.address == "1.1.1.1"
+    assert ping_input.__xml_serializer__ is not None
+    assert target.__xml_serializer__ is not None
+
+    # Pruning is a pure metadata walk: it must never trigger a schema build.
+    nav_base = _pkg_file(out, "data_navigators", "_base.py").read_text()
+    assert "rebuild_model_and_dependencies(" not in nav_base
+
+
+def test_payload_driven_build_matches_the_whole_graph_build(tmp_path):
+    """The lazy build must be an optimisation, not a behaviour change."""
+    eager_out, _ = _gen(tmp_path / "eager", "netconf", LAZY_YANG, "lazyeager")
+    eager_models = _import(eager_out, "data_models.tlazy")
+    eager_base = _import(eager_out, "data_models._base")
+    eager_base.rebuild_model_and_dependencies(eager_models.Top)
+    expected = eager_models.Top.from_xml(LAZY_DEEP).model_dump()
+
+    lazy_out, _ = _gen(tmp_path / "lazy", "netconf", LAZY_YANG, "lazylazy")
+    lazy_models = _import(lazy_out, "data_models.tlazy")
+    assert lazy_models.Top.__xml_serializer__ is None
+    assert lazy_models.Top.from_xml(LAZY_DEEP).model_dump() == expected
 
 
 # --- the replace() guard must only count *config* nodes ---------------------
@@ -3786,11 +4520,10 @@ def test_list_key_named_like_python_keyword(tmp_path):
     """
     for proto in ("netconf", "restconf"):
         out, _ = _gen(tmp_path, proto, KEYWORD_KEY_YANG, "tkw")
-        src = (
-            (out / "data_navigators" / "tkw.py").read_text()
-            if (out / "data_navigators" / "tkw.py").exists()
-            else (out / "data_navigators" / "navigators.py").read_text()
-        )
+        nav_file = _pkg_file(out, "data_navigators", "tkw.py")
+        if not nav_file.exists():
+            nav_file = _pkg_file(out, "data_navigators", "navigators.py")
+        src = nav_file.read_text()
         if proto == "netconf":
             # NETCONF keys are Python parameters on the navigator's __call__,
             # so they must be keyword-safe...
@@ -3806,11 +4539,10 @@ def test_list_key_named_like_python_keyword(tmp_path):
                 "restconf: keyword-safe __call__ signature not emitted"
             )
         # the model attribute is also keyword-safe
-        models = (
-            (out / "data_models" / "tkw.py").read_text()
-            if (out / "data_models" / "tkw.py").exists()
-            else (out / "data_models" / "models.py").read_text()
-        )
+        model_file = _pkg_file(out, "data_models", "tkw.py")
+        if not model_file.exists():
+            model_file = _pkg_file(out, "data_models", "models.py")
+        models = model_file.read_text()
         assert "if_: str" in models or "if_: " in models, (
             f"{proto}: model field for key 'if' is not keyword-safe"
         )
@@ -4083,12 +4815,12 @@ def test_both_protocols_fail_closed_without_credentials(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
     rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tcred")
-    rest = _import(rout, "session_manager")
+    rest = _import(rout, "session_manager", alias="_tcred_restconf")
     with pytest.raises(ValueError, match="credentials"):
         rest.RestconfClient(management_ip="127.0.0.1", port=8181)
 
     nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tcred")
-    netc = _import(nout, "session_manager")
+    netc = _import(nout, "session_manager", alias="_tcred_netconf")
     with pytest.raises(ValueError, match="credentials"):
         netc.NetconfClient(management_ip="127.0.0.1")
 
@@ -4141,12 +4873,12 @@ def test_retired_long_form_credential_names_are_ignored(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVICE_PASSWORD", "retiredpass")
 
     rout, _ = _gen(tmp_path / "rc", "restconf", REPLACE_YANG, "tlong")
-    rest = _import(rout, "session_manager")
+    rest = _import(rout, "session_manager", alias="_tlong_restconf")
     with pytest.raises(ValueError, match="credentials"):
         rest.RestconfClient(management_ip="127.0.0.1", port=8181)
 
     nout, _ = _gen(tmp_path / "nc", "netconf", REPLACE_YANG, "tlong")
-    netc = _import(nout, "session_manager")
+    netc = _import(nout, "session_manager", alias="_tlong_netconf")
     with pytest.raises(ValueError, match="credentials"):
         netc.NetconfClient(management_ip="127.0.0.1")
 
@@ -5142,8 +5874,8 @@ def test_output_dir_is_created_on_demand(tmp_path):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert (out / "__init__.py").is_file()
-    assert (out / "session_manager.py").is_file()
+    assert _pkg_file(out, "__init__.py").is_file()
+    assert _pkg_file(out, "session_manager.py").is_file()
 
 
 def test_importing_downloader_creates_no_files(tmp_path):
@@ -5173,16 +5905,11 @@ def test_importing_downloader_creates_no_files(tmp_path):
 def _import_fresh(pkg_dir, dotted):
     """Import from a freshly compiled package, ignoring an earlier one.
 
-    Several tests here compile a module whose generated package has the same
-    name, and Python caches `tcontent_netconf.data_models.tcontent` from the
-    first of them. Without this purge a later test silently asserts against an
-    earlier test's model -- which showed up as tests that pass alone and fail
-    in a full run.
+    Same failure as `_import` guards against, forced: purge unconditionally.
     """
-    prefix = f"{pkg_dir.name}."
-    stale = [n for n in sys.modules if n == pkg_dir.name or n.startswith(prefix)]
-    for name in stale:
-        del sys.modules[name]
+    package = _package(pkg_dir)
+    _purge_package(package.name)
+    _IMPORTED_FROM.pop(package.name, None)
     return _import(pkg_dir, dotted)
 
 
@@ -5323,6 +6050,54 @@ def test_netconf_nmda_sends_config_filter(
     assert got == want_config_filter, f"{content}: config-filter={got!r}"
 
 
+def test_netconf_nmda_max_depth_is_normalized_and_validated(tmp_path):
+    """NMDA carries `max-depth` (RFC 8526), not the legacy depth filter.
+    `depth=1` is valid, `"2"` is normalized, and `"unbounded"` omits the
+    element. Invalid values fail before the RPC.
+    """
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    for depth, want in ((1, "1"), ("2", "2"), (65535, "65535")):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        client.retrieve(source="running", depth=depth)
+        _verb, kwargs = client._manager.calls[0]
+        node = kwargs["rpc"].find(f"{{{_NMDA_NS}}}max-depth")
+        assert node is not None and node.text == want
+
+    for depth in ("unbounded", "UNBOUNDED"):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        client.retrieve(source="running", depth=depth)
+        _verb, kwargs = client._manager.calls[0]
+        assert kwargs["rpc"].find(f"{{{_NMDA_NS}}}max-depth") is None
+
+    for bad in (0, -1, True, "foo", 70000, None):
+        client = _stub_netconf_session(sm, has_nmda=True)
+        with pytest.raises(ValueError, match="depth must be"):
+            client.retrieve(source="running", depth=bad)
+        assert client._manager.calls == []
+
+
+def test_netconf_legacy_finite_depth_without_a_filter_is_refused(tmp_path):
+    """RFC 6241 has no server-side depth. A finite-depth legacy read with no
+    subtree filter would be a whole-datastore read; the session manager must
+    refuse it instead of silently ignoring the ceiling. `unbounded` remains
+    the explicit escape hatch.
+    """
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    sm = _import_fresh(out, "session_manager")
+
+    client = _stub_netconf_session(sm, has_nmda=False)
+    with pytest.raises(ValueError, match="subtree filter"):
+        client.retrieve(source="running", depth=2)
+    assert client._manager.calls == []
+
+    # Unbounded is allowed without a filter.
+    client = _stub_netconf_session(sm, has_nmda=False)
+    client.retrieve(source="running", depth="unbounded")
+    assert len(client._manager.calls) == 1
+
+
 @pytest.mark.parametrize(
     ("content", "want_verb"),
     [("config", "<get-config>"), ("all", "<get>"), ("nonconfig", "<get>")],
@@ -5459,6 +6234,71 @@ def test_netconf_nonconfig_renders_an_emptied_container_as_none(tmp_path):
     assert not model.only_config, "None must stay falsy for `if node:` checks"
 
 
+def test_netconf_model_dump_takes_content_and_prunes_like_restconf(tmp_path):
+    """`NetconfBaseModel.model_dump(content=...)` mirrors the RESTCONF base.
+
+    Parity regression: NETCONF models were plain pydantic-xml, so a caller had
+    to know the transport -- `model_dump(content="config")` raised TypeError
+    and `model_dump_json()` serialised the whole schema, every absent node as
+    `null` and every YANG default materialised. Both dump verbs now apply the
+    same `is_config` rule the XML layer already applies, so a read dump holds
+    the content the caller asked for and nothing else.
+    """
+    import json
+
+    out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tcontent")
+    models = _import_fresh(out, "data_models.tcontent")
+
+    model = models.Top.model_validate(
+        {
+            "name": "cfg-leaf",
+            "counter": "42",
+            "only_state": {"reads": "7"},
+            "mixed": {"cfg": "C", "obs": "O"},
+            "only_config": {"a": "A", "b": "B"},
+        }
+    )
+
+    config = model.model_dump(content="config")
+    assert "counter" not in config, f"state leaf leaked: {config}"
+    # `only_state` is a config-true container (RFC 7950 Sec 7.21.6 inherits the
+    # flag), so it matches the filter and is RETAINED even once emptied -- the
+    # same rule the RESTCONF base documents and the XML layer implements.
+    assert config["only_state"] == {}, f"emptied matching container: {config}"
+    assert config["mixed"] == {"cfg": "C"}, (
+        f"shell must survive with its state child pruned: {config['mixed']}"
+    )
+    assert config["only_config"] == {"a": "A", "b": "B"}
+    assert "nc_operation" not in config, (
+        "nc:operation is an attribute, never resource contents"
+    )
+    assert all(
+        "nc_operation" not in v for v in config.values() if isinstance(v, dict)
+    ), f"nc:operation leaked into a nested dump: {config}"
+
+    nonconfig = model.model_dump(content="nonconfig")
+    assert "name" not in nonconfig, f"config leaf leaked: {nonconfig}"
+    assert nonconfig["counter"] == "42"
+    assert nonconfig["mixed"] == {"obs": "O"}, (
+        f"config child of a mixed container must be pruned: {nonconfig['mixed']}"
+    )
+
+    # content="all" is the plain pydantic dump: nothing pruned.
+    everything = model.model_dump(content="all")
+    assert everything["name"] == "cfg-leaf" and everything["counter"] == "42"
+
+    # pydantic's BaseModel.model_dump_json does NOT route through model_dump,
+    # so the JSON verb needs its own content handling or it silently serialises
+    # the unpruned tree.
+    assert json.loads(model.model_dump_json(content="config")) == config
+    assert json.loads(model.model_dump_json(content="nonconfig")) == nonconfig
+    # ensure_ascii is the JSON encoder's, not model_dump's: it must not be
+    # forwarded to the dict dump (which would raise TypeError).
+    assert (
+        json.loads(model.model_dump_json(content="config", ensure_ascii=True)) == config
+    )
+
+
 def _surviving_paths_netconf(tmp_path, content):
     """Field paths a NETCONF caller can see after `content=` filtering."""
     from lxml import etree as _et  # ty: ignore[unresolved-import] - lxml ships no stubs
@@ -5536,27 +6376,42 @@ def test_restconf_keeps_an_emptied_matching_container(tmp_path):
 
 
 def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
-    """A published sdist must not ship the package twice.
+    """One copy of the code, in an installable project the README can name.
 
-    The emitter writes the client twice on purpose: flat at the output dir so
-    the lab harness can `import temp.<proto>_clients.<device>`, and namespaced
-    so pip installs `import <package_name>`. The wheel already carried only the
-    namespaced copy, but hatchling puts the whole project tree in an sdist, so
-    the tarball shipped both -- measured on a 25-entry tarball with two
-    data_models/, two data_navigators/, two __init__.py, two
-    session_manager.py and two py.typed. Two identical-looking trees in one
-    artifact is also a trap for anyone hand-editing before publishing.
+    The emitter used to write the client twice: flat at the output dir so the
+    lab harness could `import temp.<proto>_clients.<device>`, and namespaced so
+    pip could install it. Two trees could drift, the sdist needed a hand-written
+    exclude to ship one (measured: a 25-entry tarball with two `data_models/`,
+    two `data_navigators/`, two `__init__.py`, two `session_manager.py`, two
+    `py.typed`), and the generated README's install line -- `uv add
+    path/to/<package_name>` -- pointed at a directory with no `pyproject.toml`,
+    so `uv build` refused it outright.
 
     Asserted on the artifact rather than on the generator's intent, and the
     wheel-from-sdist path is exercised too, because that is what `pip install
-    <sdist>` does and it is what an excluded path could silently break.
+    <sdist>` does.
     """
     import tarfile
 
     out, _ = _gen(tmp_path, "netconf", CONTENT_STATE_YANG, "tsdist")
+    project = _project(out)
+    package = _package(out)
+
+    # The directory the generated README tells you to `uv add` must be the
+    # project: it carries the packaging metadata itself.
+    readme = (project / "README.md").read_text()
+    assert f"uv add path/to/{package.name}" in readme, readme[:400]
+    for meta in ("pyproject.toml", "README.md", "MANIFEST.yang-revisions.json"):
+        assert (project / meta).is_file(), f"{meta} missing from {project}"
+    # ...and the code lives under src/, once.
+    assert package.parent.name == "src"
+    assert sorted(p.name for p in out.iterdir()) == [package.name], sorted(
+        p.name for p in out.iterdir()
+    )
+
     dist = tmp_path / "dist"
     build = subprocess.run(
-        ["uv", "build", "--out-dir", str(dist), str(out)],
+        ["uv", "build", "--out-dir", str(dist), str(project)],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -5570,27 +6425,26 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
     with tarfile.open(sdists[0]) as tar:
         names = ["/".join(n.split("/")[1:]) for n in tar.getnames()]
 
-    # The flat lab copy must be gone...
-    for flat in ("__init__.py", "data_models", "data_navigators", "session_manager.py"):
-        assert flat not in names, f"sdist still ships the flat {flat}: {sorted(names)}"
-
-    # ...and exactly one namespaced package must remain, holding one copy of
-    # each module. The directory is named after the device, so derive it from the
-    # artifact rather than assuming.
-    roots = {n.split("/")[0] for n in names if "/" in n}
-    assert len(roots) == 1, f"expected one package dir, got {sorted(roots)}"
-    root = roots.pop()
+    # Exactly one copy of the package, under src/, and nothing at the root but
+    # packaging metadata.
+    inits = [n for n in names if n.endswith("/__init__.py") or n == "__init__.py"]
+    top_level_inits = [n for n in inits if n.count("/") == 2 and n.startswith("src/")]
+    nested = [n for n in inits if n.count("/") > 2 and "/data_" not in n]
+    assert len(top_level_inits) == 1, sorted(inits)
+    assert not nested, f"package nested inside itself: {sorted(inits)}"
+    assert not any(n == "__init__.py" for n in names), (
+        f"a flat copy is still in the sdist: {sorted(names)}"
+    )
     for member in ("data_models", "data_navigators"):
         tops = [
-            n for n in names if n.startswith(f"{root}/{member}/") and n.count("/") == 2
+            n
+            for n in names
+            if n.startswith(f"src/{package.name}/{member}/") and n.count("/") == 3
         ]
-        assert tops, f"{root}/{member} missing from sdist: {sorted(names)}"
-    assert not any(n.startswith(f"{root}/{root}/") for n in names), (
-        "the package is nested inside itself: the flat copy was not excluded"
-    )
+        assert tops, f"src/{package.name}/{member} missing from sdist: {sorted(names)}"
 
     # `pip install <sdist>` builds a wheel from the extracted tree: prove the
-    # exclusion did not remove anything the wheel target needs.
+    # src layout survives that round trip.
     extracted = tmp_path / "extracted"
     extracted.mkdir()
     with tarfile.open(sdists[0]) as tar:
@@ -5606,7 +6460,170 @@ def test_generated_sdist_carries_one_copy_of_the_package(tmp_path):
         timeout=600,
     )
     assert again.returncode == 0, again.stderr[-2000:]
-    assert list(wheel_dir.glob("*.whl")), "no wheel built from the extracted sdist"
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert wheels, "no wheel built from the extracted sdist"
+    # The wheel must install `import <package_name>`, never bare `data_models`.
+    import zipfile
+
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        wheel_names = wheel.namelist()
+    assert f"{package.name}/__init__.py" in wheel_names, wheel_names
+    assert not any(
+        n.startswith(("data_models/", "session_manager.py")) for n in wheel_names
+    ), f"wheel puts package modules at site-packages root: {wheel_names}"
+
+
+def test_the_container_holds_exactly_one_project(tmp_path):
+    """`--output-dir` is a container, so a second compile must not mix in.
+
+    The generated package name embeds the device *and* OS version, so
+    recompiling the same device after an upgrade would leave
+    `srl_0_0_0/` next to `srl_25_10_1/`. Every consumer then has to pick one,
+    and a stale tree on `sys.path` is the wrong device's models. Refusing is
+    the documented behaviour (the tree is in gitignored `temp/`, where a
+    previous compile is not automatically garbage).
+    """
+    yang = tmp_path / "tstale.yang"
+    yang.write_text(MINIMAL_YANG)
+
+    out, _ = _gen(tmp_path, "netconf", MINIMAL_YANG, "tstale")
+    assert (out / "tstale_0_0_0").is_dir(), sorted(p.name for p in out.iterdir())
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tstale",
+            "--device-version",
+            "9.9",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode != 0, "a second project in one container was accepted"
+    assert "refusing to generate" in proc.stderr, proc.stderr[-800:]
+    assert "tstale_0_0_0/" in proc.stderr, proc.stderr[-800:]
+    # Nothing was written for the refused run.
+    assert not (out / "tstale_9_9").exists()
+    assert sorted(p.name for p in out.iterdir()) == ["tstale_0_0_0"]
+
+
+def test_a_legacy_flat_output_dir_is_refused(tmp_path):
+    """The pre-`src/` layout must be refused, not silently mixed with.
+
+    A container that still holds `__init__.py`/`data_models/` at its root is a
+    compile from before the layout change. Writing the new project next to it
+    would leave two importable trees again -- the duplication this change
+    removed -- and `import <container>` would resolve as an empty namespace
+    package, which is worse than an error.
+    """
+    yang = tmp_path / "tlegacy.yang"
+    yang.write_text(MINIMAL_YANG)
+    out = tmp_path / "legacy"
+    (out / "data_models").mkdir(parents=True)
+    (out / "__init__.py").write_text("")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler('netconf', sys.argv[1:])"
+            ),
+            str(yang),
+            "--device",
+            "tlegacy",
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode != 0, "a legacy flat output dir was accepted"
+    assert "legacy flat copy: __init__.py" in proc.stderr, proc.stderr[-800:]
+    assert not (out / "tlegacy_0_0_0").exists()
+
+
+def test_consumers_resolve_container_project_and_package(tmp_path):
+    """Every shape an operator has to hand resolves to the one package.
+
+    `sdk-verify --client-dir` and the lab fixtures accept the container (the
+    default), the project (what `uv add` takes) and the package itself. Two
+    projects in one container is ambiguous, and guessing would verify the wrong
+    device.
+    """
+    out, _ = _gen(tmp_path, "netconf", MINIMAL_YANG, "tresolve")
+    project = _project(out)
+    package = _package(out)
+
+    for candidate in (out, project, package):
+        assert layout.resolve_package(candidate) == package, candidate
+
+    with pytest.raises(LookupError):
+        layout.resolve_package(tmp_path / "does-not-exist")
+
+    # A second *package* makes the container ambiguous.
+    other = out / "tresolve_9_9"
+    (other / "src" / "tresolve_9_9").mkdir(parents=True)
+    (other / "src" / "tresolve_9_9" / "__init__.py").write_text("")
+    (other / "pyproject.toml").write_text('[project]\nname = "tresolve_9_9"\n')
+    with pytest.raises(LookupError) as exc:
+        layout.resolve_package(out)
+    assert "exactly one" in str(exc.value), str(exc.value)
+
+
+def test_both_protocols_import_as_distinct_modules(tmp_path, monkeypatch):
+    """The lab fixture's two imports must not collapse into one module.
+
+    Both protocols generate `<device>_<version>` -- each is its own
+    installable project -- so the RESTCONF and NETCONF trees in
+    `temp/notconf_clients` carry the SAME import name. A plain
+    `importlib.import_module(package.name)` returns the first one out of
+    `sys.modules` for the second protocol too, and every NETCONF test then
+    holds the RESTCONF client: measured as five red smoke shards, all dying
+    on `AttributeError: module '...' has no attribute 'NetconfClient'`.
+    `_import_pkg` therefore imports under a unique per-protocol name, the same
+    rule `sdk_verify._import_client` follows for `--protocol both`.
+    """
+    from tests import conftest
+
+    for fmt, attr in (("restconf", "RestconfClient"), ("netconf", "NetconfClient")):
+        package = tmp_path / f"tdevice_{fmt}" / "tdevice_1_0" / "src" / "tdevice_1_0"
+        package.mkdir(parents=True)
+        (package.parent.parent / "pyproject.toml").write_text(
+            '[project]\nname = "tdevice_1_0"\n'
+        )
+        (package / "__init__.py").write_text(f"{attr} = object\n")
+    monkeypatch.setattr(conftest, "TEMP_CLIENTS", tmp_path)
+
+    try:
+        rest = conftest._import_pkg("tdevice", "restconf")
+        netc = conftest._import_pkg("tdevice", "netconf")
+        assert rest is not netc
+        assert rest.RestconfClient is not None
+        assert netc.NetconfClient is not None
+    finally:
+        for fmt in ("restconf", "netconf"):
+            sys.modules.pop(f"_sdktest_{fmt}_tdevice_1_0", None)
 
 
 # --- yang2sdk CLI: root picking ---------------------------------------------
@@ -5850,8 +6867,11 @@ def test_yang2sdk_roots_resolves_names_to_files(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert (tmp_path / "out" / "__init__.py").is_file()
-    assert (tmp_path / "out" / "data_models").is_dir()
+    out = tmp_path / "out"
+    assert (out / "pickerok_1_0" / "pyproject.toml").is_file(), sorted(
+        p.name for p in out.iterdir()
+    )
+    assert (out / "pickerok_1_0" / "src" / "pickerok_1_0" / "data_models").is_dir()
 
 
 def test_yang2sdk_rejects_an_unknown_root_name(tmp_path):
@@ -5958,5 +6978,210 @@ def test_ignore_error_re_enables_generation(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr[-1000:]
-    assert (out / "__init__.py").is_file()
-    assert (out / "data_models").is_dir()
+    assert _pkg_file(out, "__init__.py").is_file()
+    assert _pkg_file(out, "data_models").is_dir()
+
+
+# G30's `coriant-rpc` carries this construct verbatim on the `san` leaf of
+# `cert-gen/input`: a negative lookahead. `pattern` is an XML Schema regular
+# expression (RFC 7950 Sec 9.4.5), and the XSD grammar has no lookaround, so
+# pyang's libxml2 engine rejects the whole model. Python's `re` accepts it, which
+# is why the generated client can still carry the constraint -- but only if the
+# operator opts in with `--ignore-error PATTERN_ERROR`.
+LOOKAHEAD_PATTERN_YANG = """module tpat {
+  prefix tp;
+  namespace "urn:test:tpat";
+  revision 2026-01-01;
+  container top {
+    leaf san {
+      type string {
+        // Single quotes: a double-quoted YANG string would additionally earn an
+        // ILLEGAL_ESCAPE_WARN for "\\-" and "\\." (RFC 7950 Sec 6.1.3).
+        pattern '(IP:|DNS:)(?!x)[A-Za-z0-9\\-\\.:]+';
+      }
+    }
+  }
+}
+"""
+
+# `\\p{IsBasicLatin}` is valid XML Schema and invalid Python: `re` has no
+# `\\p{..}` class, and `_convert_yang_regex` maps only the general categories
+# (\\p{L}, \\p{N}, ...). pyang/libxml2 accept this model.
+XML_SCHEMA_ONLY_PATTERN_YANG = """module txpat {
+  prefix tx;
+  namespace "urn:test:txpat";
+  revision 2026-01-01;
+  container top {
+    leaf block {
+      type string {
+        pattern '\\p{IsBasicLatin}+';
+      }
+    }
+  }
+}
+"""
+
+
+def _compile_one_module(
+    tmp_path, module: str, source: str, protocol: str = "netconf", *extra: str
+):
+    """Compile a one-module tree through the same CLI seam as the tests above."""
+    yang = tmp_path / f"{module}.yang"
+    yang.write_text(source)
+    out = tmp_path / f"{module}_{protocol}_client"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from yang2sdk.cli.compiler import run_compiler;"
+                " run_compiler(sys.argv[1], sys.argv[2:])"
+            ),
+            protocol,
+            str(yang),
+            "--device",
+            module,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+            *extra,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    return proc, out
+
+
+def test_pattern_error_explains_the_xsd_grammar_and_the_escape_hatch(tmp_path):
+    """A lookahead pattern must be refused with a reason, not with libxml2's.
+
+    The vendor's own error names a facet on a synthetic schema at "line 6" and
+    says nothing about which construct is illegal or what to do. The refusal has
+    to carry the RFC, the reason (`(?!...)` has no XSD equivalent), and the exact
+    flag -- measured on G30's `coriant-rpc@2021-01-20.yang:533`.
+    """
+    proc, out = _compile_one_module(tmp_path, "tpat", LOOKAHEAD_PATTERN_YANG)
+
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "PATTERN_ERROR" in proc.stderr
+    assert "RFC 7950 Sec 9.4.5" in proc.stderr, "the refusal must cite the RFC"
+    assert "hint:" in proc.stderr
+    assert "--ignore-error PATTERN_ERROR" in proc.stderr
+    assert "Generated" not in proc.stdout, "a refused compile must not announce output"
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+def test_pattern_error_escape_hatch_keeps_the_constraint(tmp_path):
+    """`--ignore-error PATTERN_ERROR` must not silently drop the pattern.
+
+    pyang only skips *printing* the error; it never builds a pattern spec, so a
+    client that read the pattern from `i_type_spec` would lose the constraint.
+    The IR reads the `pattern` statement instead, so the emitted validator must
+    still contain the vendor's expression -- and be compilable by `re` (the
+    emitter now proves that before writing, so this also pins the anchor wrapper
+    and the quoting of the emitted literal).
+    """
+    proc, out = _compile_one_module(
+        tmp_path,
+        "tpat",
+        LOOKAHEAD_PATTERN_YANG,
+        "netconf",
+        "--ignore-error",
+        "PATTERN_ERROR",
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert "Generated" in proc.stdout
+    model = _pkg_file(out, "data_models", "tpat.py")
+    assert model.is_file(), sorted(out.rglob("*.py"))
+    tree = ast.parse(model.read_text(encoding="utf-8"))
+    emitted = [
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "check_pattern"
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ]
+    assert len(emitted) == 1, emitted
+    assert "(?!" in emitted[0], f"the vendor constraint was dropped: {emitted}"
+    re.compile(emitted[0])  # raises re.error if the anchor wrapper is wrong
+
+
+@pytest.mark.parametrize("protocol", ["netconf", "restconf"])
+def test_untranslatable_pattern_is_refused_instead_of_shipping_a_late_crash(
+    tmp_path, protocol
+):
+    """A pattern `re` cannot compile must fail here, not in the caller's project.
+
+    Measured before this guard: this exact module generated successfully, the
+    package imported cleanly, and `Top(block="abc")` raised
+    `re.error: bad escape \\p at position 4` from generated code -- because
+    `check_pattern` compiles the regex when a value is assigned, not when the
+    module is imported. pyang accepts the model (`\\p{IsBasicLatin}` is valid XML
+    Schema), so the PATTERN_ERROR path never sees it.
+
+    Both protocols are checked: each `emit()` builds its own IR list, so a guard
+    wired into only one of them would leave the other shipping the crash.
+    """
+    proc, out = _compile_one_module(
+        tmp_path, "txpat", XML_SCHEMA_ONLY_PATTERN_YANG, protocol
+    )
+
+    assert "syntax error in pattern" not in proc.stderr, (
+        "pyang must accept this pattern, or the test proves nothing about the "
+        f"emitter's own guard: {proc.stderr[-800:]}"
+    )
+    assert proc.returncode == 1, proc.stdout[-1000:]
+    assert "cannot be expressed as a Python regular expression" in proc.stderr
+    assert "txpat:block" in proc.stderr, "the refusal must name the leaf"
+    assert "bad escape" in proc.stderr
+    assert "Generated" not in proc.stdout
+    assert not out.exists(), f"a refused compile wrote {sorted(out.rglob('*'))[:5]}"
+
+
+DEVIATION_FOR_XML_SCHEMA_ONLY_PATTERN_YANG = """module txpatdev {
+  prefix txd;
+  namespace "urn:test:txpatdev";
+  import txpat { prefix txpat; }
+  revision 2026-01-01;
+  deviation "/txpat:top/txpat:block" {
+    deviate replace {
+      type string {
+        pattern '[A-Za-z]+';
+      }
+    }
+  }
+}
+"""
+
+
+def test_a_deviation_module_is_the_documented_way_out_of_a_pattern(tmp_path):
+    """The refusal's advice must actually work, not just sound plausible.
+
+    `deviate replace` rewrites the `type` statement and the IR reads the
+    deviated statement, so the client generates with the replacement pattern --
+    which is why the refusal can name `--deviation-module` instead of only
+    telling the operator to edit a vendor model they do not own.
+    """
+    deviation = tmp_path / "txpatdev.yang"
+    deviation.write_text(DEVIATION_FOR_XML_SCHEMA_ONLY_PATTERN_YANG)
+    proc, out = _compile_one_module(
+        tmp_path,
+        "txpat",
+        XML_SCHEMA_ONLY_PATTERN_YANG,
+        "netconf",
+        "--deviation-module",
+        str(deviation),
+    )
+
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert "Generated" in proc.stdout
+    model = _pkg_file(out, "data_models", "txpat.py").read_text(encoding="utf-8")
+    assert "check_pattern('^(?:[A-Za-z]+)$'" in model, model[:1000]
+    assert "IsBasicLatin" not in model

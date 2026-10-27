@@ -28,6 +28,7 @@ import pytest
 from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
 from ncclient.operations import RPCError
 
+from yang2sdk import layout
 from yang2sdk.cli.sdk_verify import (
     Report,
     Verifier,
@@ -45,7 +46,11 @@ TEMPLATE = (
     / "netconf"
     / "session_manager.py.jinja"
 )
-LOGGER = "tlog_netconf.session_manager"
+#: Dotted logger name of the generated module, set by the `sm` fixture. The
+#: generated code logs under `getLogger(__name__)`, so this is
+#: `<generated package>.session_manager` -- the package name embeds the device
+#: and OS version, so it is derived rather than hardcoded.
+LOGGER = ""
 
 YANG = """\
 module tlog {
@@ -121,8 +126,13 @@ def sm(tmp_path_factory):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-1500:]
-    sys.path.insert(0, str(tmp_path))
-    return importlib.import_module("tlog_netconf.session_manager")
+    # One copy, under src/: resolve it rather than assuming the container is
+    # the package (see yang2sdk.layout).
+    package = layout.resolve_package(tmp_path / "tlog_netconf")
+    sys.path.insert(0, str(package.parent))
+    global LOGGER
+    LOGGER = f"{package.name}.session_manager"
+    return importlib.import_module(LOGGER)
 
 
 def _elem() -> etree._Element:

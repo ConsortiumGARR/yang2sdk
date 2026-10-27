@@ -83,25 +83,28 @@ uv run pyang -p temp/yang_modules/<device>/ -f tree \
 
 ## What you get
 
-Each compile emits a self-contained package at
-`temp/<protocol>_clients/<device>_<os-version>/`:
+Each compile emits one self-contained, installable project per device **and**
+OS version, inside the `--output-dir` container:
 
 ```text
-<device>_<os-version>/
-  __init__.py                  # RestconfClient / NetconfClient
-  session_manager.py           # transport and credentials
-  data_models/
-  data_navigators/             # client.data.<module>_<node>(...)
-  pyproject.toml
-  README.md
-  MANIFEST.yang-revisions.json
-  py.typed
+temp/<protocol>_clients/<device>/          # container: holds one project
+└── <device>_<os-version>/                 # the project: `uv add` this
+    ├── pyproject.toml                     # name/version/deps (hatchling, src layout)
+    ├── README.md                          # device, OS version, YANG revisions
+    ├── MANIFEST.yang-revisions.json       # provenance: modules, features, deviations
+    └── src/<device>_<os-version>/         # the importable package
+        ├── __init__.py                    # RestconfClient / NetconfClient
+        ├── session_manager.py             # transport and credentials
+        ├── data_models/
+        ├── data_navigators/               # client.data.<module>_<node>(...)
+        └── py.typed
 ```
 
-Install it like any other dependency:
+One copy of the code, on disk and in the sdist. Install it like any other
+dependency:
 
 ```bash
-uv add path/to/temp/restconf_clients/<device>_<os-version>
+uv add path/to/temp/restconf_clients/<device>/<device>_<os-version>
 ```
 
 ```python
@@ -191,7 +194,26 @@ RFC 4252 §7.
 - **`replace()` refuses incomplete models.** A replace body is the complete
   resource; `allow_partial=True` is the deliberate escape hatch.
 - **Reads are depth-bounded by default.** A whole-tree read is a lab operation,
-  not a production convenience.
+  not a production convenience. The target node is level 1; a list and its
+  entries share that level, so entry children are one level deeper. At the
+  boundary, leaves and leaf-lists survive, keyed lists keep their keys (keys are
+  addressability metadata), and containers/keyless lists are dropped. Legacy
+  NETCONF (no NMDA) sends an RFC 6241 subtree filter that cannot select the
+  whole subtree; if the filter would collapse to the target, the client does
+  not send it, logs a warning, and returns a skeleton (empty container model,
+  `[]` for a keyless list, path keys for a keyed list item). NMDA uses
+  `max-depth` and RESTCONF uses `?depth=`; both read normally. `depth=1` is
+  valid. `depth="unbounded"` is the only full-subtree read. A skeleton is the
+  depth-bounded answer when the filter cannot be expressed; it is not proof the
+  node exists, and it does not distinguish not-found from an empty node. A
+  server that ignores the filter can still send extra bytes; the local pruner
+  bounds the model but cannot undo the transfer. A non-boundary container whose
+  only kept child sits on the boundary is omitted from the filter rather than
+  sent empty (an empty element would select its whole subtree), so a full read
+  pruned to the same depth can retain that container as an empty shell. A direct
+  `client.retrieve(depth=N)` on legacy NETCONF without a subtree filter is
+  refused, because it would be a whole-datastore read; use a navigator or
+  `depth="unbounded"` explicitly.
 - **`sdk-verify` and `yang-downloader` are lab-only.** The write tiers modify
   the device; `--write` alone is not enough (see [lab validation](docs/lab.md)).
 
