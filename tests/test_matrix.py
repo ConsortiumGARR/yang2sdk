@@ -1678,6 +1678,10 @@ INSTANCE_ID_YANG = """module tid {
     leaf hostname {
       type string;
     }
+    leaf level {
+      type string;
+      default "low";
+    }
     leaf-list dns {
       type string;
     }
@@ -1982,6 +1986,23 @@ def test_model_dump_instances_flattens_a_model_to_instance_paths(tmp_path):
     partial = models.System.model_validate({"hostname": "r1"})
     assert partial.model_dump_instances("/tid:system") == {"/tid:system/hostname": "r1"}
 
+    # A YANG `default` is emitted as the pydantic field default. An explicit
+    # value equal to it is still set, so it is present by default; with
+    # exclude_defaults it drops, matching a with-defaults report-all read where
+    # neither side configured the leaf. A non-default value is never dropped.
+    defaulted = models.System.model_validate({"hostname": "r1", "level": "low"})
+    assert defaulted.model_dump_instances("/tid:system") == {
+        "/tid:system/hostname": "r1",
+        "/tid:system/level": "low",
+    }
+    assert defaulted.model_dump_instances("/tid:system", exclude_defaults=True) == {
+        "/tid:system/hostname": "r1"
+    }
+    changed = models.System.model_validate({"level": "high"})
+    assert changed.model_dump_instances("/tid:system", exclude_defaults=True) == {
+        "/tid:system/level": "high"
+    }
+
     # RFC 8342 / RFC 8526 config-filter semantics, shared with model_dump.
     config_only = model.model_dump_instances("/tid:system", content="config")
     assert "/tid:system/uptime" not in config_only
@@ -2014,6 +2035,137 @@ def test_model_dump_instances_flattens_a_model_to_instance_paths(tmp_path):
         model.model_dump_instances("/")
     with pytest.raises(ValueError, match="content must be"):
         model.model_dump_instances("/tid:system", content="bogus")
+    # The root path must name THIS model, and a list item needs its keys.
+    with pytest.raises(ValueError, match="does not name"):
+        model.model_dump_instances("/tid:user")
+    with pytest.raises(ValueError, match="missing key predicate"):
+        models.UserItem(name="alice").model_dump_instances("/tid:system/user")
+
+
+def test_model_validate_instances_rebuilds_the_model_from_the_map(tmp_path):
+    """`model_validate_instances()` is the inverse of `model_dump_instances()`.
+
+    It parses the RFC 7950 Sec 9.13 path syntax (quoted values may contain
+    `/`, `[` or `]`), resolves each segment to a field by YANG name and
+    module (RFC 7951 Sec 6.11), fills a list entry's keys from its predicates,
+    and hands the assembled tree to `model_validate` so YANG constraints still
+    apply.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    models = _import(out, "data_models.tid")
+
+    model = models.System.model_validate(
+        {
+            "hostname": "r1",
+            "dns": ["1.1.1.1", "8.8.8.8"],
+            "uptime": 42,
+            "user": [
+                {
+                    "name": "alice",
+                    "enabled": True,
+                    "role": ["admin", "ops"],
+                    "last_login": "today",
+                    "prefs": {"addr": [{"ip": "10.0.0.1"}]},
+                },
+                {"name": "a/b]c=d", "enabled": False},
+                {"name": "o'brien", "enabled": False},
+                {"name": 'he said "hi"', "enabled": False},
+            ],
+            "server": [{"ip": "192.0.2.1", "port": 80}],
+            "port_first": [{"ip": "198.51.100.1", "port": 443, "descr": "api"}],
+            "flag": [{"on": True}],
+            "marker": [{"tag": ""}],
+            "mode": [{"m": "foo-bar", "note": "n"}],
+        }
+    )
+    dumped = model.model_dump_instances("/tid:system")
+
+    # A value containing /, ] and = must not be split as path syntax, and both
+    # quote styles must survive the round-trip (RFC 7950 Sec 14 has no escape).
+    assert "/tid:system/user[name='a/b]c=d']/name" in dumped
+    assert '/tid:system/user[name="o\'brien"]/name' in dumped
+    assert "/tid:system/user[name='he said \"hi\"']/name" in dumped
+
+    reloaded = models.System.model_validate_instances("/tid:system", dumped)
+    assert reloaded.model_dump_instances("/tid:system") == dumped
+
+    # JSON round-trip. sort_keys=False keeps leaf-list/list order (the default
+    # sort would reorder an ordered-by user collection).
+    as_json = model.model_dump_instances_json("/tid:system", sort_keys=False)
+    from_json = models.System.model_validate_instances_json("/tid:system", as_json)
+    assert from_json.model_dump_instances("/tid:system") == dumped
+
+    # A partial map is a partial model, not a complete datastore.
+    partial = models.System.model_validate_instances(
+        "/tid:system", {"/tid:system/hostname": "r1"}
+    )
+    assert partial.model_dump_instances("/tid:system") == {"/tid:system/hostname": "r1"}
+
+    # A list item model is addressed by its own keyed path; the key leaves are
+    # filled from the predicates even when the map omits them.
+    item_path = "/tid:system/user[name='alice']"
+    item = models.UserItem.model_validate_instances(
+        item_path, {f"{item_path}/enabled": True}
+    )
+    assert item.name == "alice" and item.enabled is True
+    assert item.model_dump_instances(item_path) == {
+        f"{item_path}/name": "alice",
+        f"{item_path}/enabled": True,
+    }
+
+    # The predicate and the key leaf entry must name the same entry.
+    with pytest.raises(ValueError, match="conflicting values"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/user[name='alice']/name": "bob"}
+        )
+
+    # Every key is required, and the key name must belong to the list.
+    with pytest.raises(ValueError, match="missing key predicate"):
+        models.System.model_validate_instances(
+            "/tid:system",
+            {"/tid:system/server[ip='192.0.2.1']/ip": "192.0.2.1"},
+        )
+    with pytest.raises(ValueError, match="not a key"):
+        models.System.model_validate_instances(
+            "/tid:system",
+            {"/tid:system/server[nope='x'][ip='192.0.2.1'][port='80']/ip": "x"},
+        )
+
+    # A leaf-list predicate must agree with the map value.
+    with pytest.raises(ValueError, match="does not match"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/dns[.='1.1.1.1']": "8.8.8.8"}
+        )
+    # A leaf has no predicates, and a keyless list has no entry path.
+    with pytest.raises(ValueError, match="leaf has no predicates"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/hostname[.='r1']": "r1"}
+        )
+    with pytest.raises(ValueError, match="keyless list entry"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/stats/sample/counter": 1}
+        )
+
+    # Unknown children, a wrong root, and paths outside the root fail closed.
+    with pytest.raises(ValueError, match="has no child"):
+        models.System.model_validate_instances("/tid:system", {"/tid:system/nope": 1})
+    with pytest.raises(ValueError, match="does not name"):
+        models.System.model_validate_instances("/tid:user", {"/tid:user/x": 1})
+    with pytest.raises(ValueError, match="not under"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:other/hostname": "r1"}
+        )
+    with pytest.raises(ValueError, match="the model root is not a leaf"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system": {"hostname": "r1"}}
+        )
+    with pytest.raises(ValueError, match="JSON object"):
+        models.System.model_validate_instances_json("/tid:system", "[]")
 
 
 def test_no_nonexistent_rfc_sections_cited():

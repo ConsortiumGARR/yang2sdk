@@ -44,12 +44,28 @@ documented — a date-versioned scheme carries no compatibility promise.
   is the comparison primitive for intent-vs-running: two models of the same
   subtree flatten to dictionaries that can be diffed key by key without
   field-order, list-order, or absent-optional-node noise. `content` matches
-  `model_dump`'s `config`/`all`/`nonconfig` filter, and
+  `model_dump`'s `config`/`all`/`nonconfig` filter;
   `exclude_unset`/`exclude_none` (both default true) keep only the values
-  actually present. A keyless list entry has no RFC 7950 §9.13
+  actually present, and `exclude_defaults` (off by default, matching pydantic)
+  drops a value equal to the YANG `default`, so an intent model and a
+  with-defaults `report-all` read compare equal when neither side configured
+  that leaf. A keyless list entry has no RFC 7950 §9.13
   instance-identifier, so it raises rather than collapsing entries under one
   path; `content="config"` excludes state-only keyless lists. Pinned by
   `tests/test_matrix.py::test_model_dump_instances_flattens_a_model_to_instance_paths`.
+- **NETCONF models can be rebuilt from that instance-path map.**
+  `Model.model_validate_instances(instance_path, mapping)` and
+  `model_validate_instances_json()` invert the dump: they parse the same
+  RFC 7950 §9.13 syntax (quoted values may contain `/`, `[` or `]`), resolve
+  each segment to a field by YANG name and module (RFC 7951 §6.11), fill a
+  list entry's key leaves from its predicates, and pass the assembled tree to
+  `model_validate`, so constraints, choices and required fields still apply.
+  The map is an intent fragment, not a complete datastore: a missing mandatory
+  leaf fails validation, an empty container (including a presence container
+  with no leaves) cannot be represented, and list/leaf-list order follows the
+  map's iteration order — use `model_dump_instances_json(sort_keys=False)` when
+  `ordered-by user` order must survive a JSON round-trip. Pinned by
+  `tests/test_matrix.py::test_model_validate_instances_rebuilds_the_model_from_the_map`.
 
 ### Changed
 

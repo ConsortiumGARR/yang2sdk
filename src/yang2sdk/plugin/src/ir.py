@@ -37,7 +37,12 @@ _RESERVED_MODEL_ATTRS = _reserved_model_attrs()
 # leaf with one of these names would shadow the method on that instance just
 # the same, so they belong in the reserved set.
 _GENERATED_MODEL_METHODS = frozenset(
-    {"model_dump_instances", "model_dump_instances_json"}
+    {
+        "model_dump_instances",
+        "model_dump_instances_json",
+        "model_validate_instances",
+        "model_validate_instances_json",
+    }
 )
 
 
@@ -1469,7 +1474,7 @@ class IRBuilder:
     def _to_field_name(self, name: str) -> str:
         """Convert YANG name to Python field name (snake_case).
 
-        Three reserved-name classes are handled, all of which produced
+        Four reserved-name classes are handled, all of which produced
         *silently broken* -- or unimportable -- models before:
 
         * Python keywords (`class`, `import`, ...) -- already handled.
@@ -1486,6 +1491,10 @@ class IRBuilder:
           *import* at all (`TypeError: 'property' object is not callable`),
           which the emitter's own `_validate_generated` parse check cannot
           catch because the file is syntactically valid.
+        * Public methods the generated NETCONF model base defines -- see
+          `_GENERATED_MODEL_METHODS`. A YANG leaf named `model_dump_instances`
+          would shadow the instance method on that model just as `schema`
+          shadows the inherited pydantic method.
 
         The wire name is unaffected: NETCONF models carry `element(tag=...)`
         and RESTCONF models carry `Field(alias=...)`, both derived from the
