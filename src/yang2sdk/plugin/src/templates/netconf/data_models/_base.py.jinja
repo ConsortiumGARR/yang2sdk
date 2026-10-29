@@ -1,4 +1,5 @@
 import json
+from enum import Enum
 from typing import Annotated, Any, ClassVar, Literal, Self, get_args, get_origin, Union
 import types
 from pydantic import ConfigDict, BaseModel, BeforeValidator, model_validator
@@ -7,7 +8,92 @@ from lxml import etree
 from decimal import Decimal
 import re
 
+from ..session_manager import MODULE_NAMESPACES
+
 NETCONF_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+# Inverted once at import: an instance-identifier names each node by its
+# DEFINING module (RFC 7951 Sec 6.11), and the model metadata carries
+# namespaces. The compile-time map is the authority here -- the device's
+# <hello> describes what the peer speaks, not which module a compiled node
+# came from, and `client.module_namespaces` is overlaid with it after
+# construction. Both the navigators and `model_dump_instances()` use this one
+# map.
+NAMESPACE_MODULES: dict[str, str] = {
+    ns: name for name, ns in MODULE_NAMESPACES.items()
+}
+
+
+def _predicate_value(value: Any) -> str:
+    """Render a predicate value as an RFC 7950 Sec 14 ``quoted-string``.
+
+    The value must be the node's LEXICAL form, not Python's repr: a boolean
+    key is ``true``/``false`` (Sec 9.7.2) and an enumeration key is its
+    assigned name (Sec 9.6.4) -- the generated enum's ``.value``, not its
+    Python ``.name`` (``FOO_BAR`` for the YANG value ``foo-bar``). ``str()``
+    on the enum would render ``ModeEnum.FOO_BAR``, silently naming a
+    different value.
+    """
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, Enum):
+        text = str(value.value)
+    elif value is None:
+        raise ValueError(
+            "a predicate value cannot be None: RFC 7950 Sec 7.8.2 requires "
+            "every key leaf to have a value in an instance-identifier predicate "
+            "(an `empty` key has none -- pass an empty string, Sec 9.13)"
+        )
+    else:
+        text = str(value)
+    # `quoted-string` has no escape mechanism (Sec 14), so a value holding both
+    # quote characters cannot be represented at all. Emitting it anyway would
+    # produce a string that parses as a different path.
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    raise ValueError(
+        f"predicate value {value!r} contains both quote characters, and "
+        "RFC 7950 Sec 14 `quoted-string` has no escape form, so it cannot "
+        "appear in an instance-identifier"
+    )
+
+
+def _module_name_for_model(model_cls: type) -> str:
+    """The YANG module that defines ``model_cls``'s root node.
+
+    A generated model's ``ns`` argument is a pydantic-xml *prefix alias* (empty
+    for the file's default namespace, a prefix for an augmented node); the
+    namespace URI is what identifies the module, and ``__xml_nsmap__`` is the
+    only place it is resolved.
+    """
+    nsmap = getattr(model_cls, "__xml_nsmap__", None) or {}
+    ns = nsmap.get(getattr(model_cls, "__xml_ns__", None) or "")
+    module = NAMESPACE_MODULES.get(ns)
+    if module is None:
+        raise ValueError(
+            f"no module name is known for namespace {ns!r} ({model_cls.__name__}); "
+            "cannot build a module-qualified instance-identifier"
+        )
+    return module
+
+
+def _instance_value(value: Any) -> Any:
+    """The value as it belongs in a ``{instance-identifier: value}`` map.
+
+    Enumerations become their YANG name (the generated enum's value) and
+    decimal64 becomes a string, which is RFC 7951's JSON encoding. Everything
+    else is already a JSON scalar (the model layer validates the type).
+    """
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (bool, str, int, float)) or value is None:
+        return value
+    return str(value)
+
 
 class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
     """Handles on-demand schema construction to bridge Pydantic v2's defer_build=True with pydantic-xml.
@@ -85,6 +171,144 @@ class NetconfXmlModel(BaseXmlModel, search_mode='unordered'):
     def to_xml(self, *args: Any, **kwargs: Any) -> bytes:
         ensure_instance_models_built(self)
         return super().to_xml(*args, **kwargs)
+
+
+def _content_matches(is_config: bool, content: str) -> bool:
+    """RFC 8342 / RFC 8526 config-filter semantics, shared with model_dump."""
+    if content == "all":
+        return True
+    if content == "config":
+        return is_config
+    return not is_config
+
+
+def _list_item_path(item: Any, parent_path: str, segment: str) -> str:
+    """Instance path of one list entry, with RFC 7950 Sec 9.13 predicates.
+
+    ``segment`` is already module-qualified relative to the parent. The
+    predicates come from the item's key fields in `key`-statement order
+    (``__yang_key_order__``); field declaration order is not key order.
+    """
+    key_order = getattr(type(item), "__yang_key_order__", ())
+    if not key_order:
+        raise ValueError(
+            f"{type(item).__name__} is a keyless list entry. RFC 7950 Sec 7.8.2 "
+            "allows keyless lists only for state data, and Sec 9.13 gives no "
+            "instance-identifier for an individual entry; use content='config' "
+            "to exclude state data"
+        )
+    by_yang_name: dict[str, str] = {}
+    for field_name, field_info in type(item).model_fields.items():
+        tag = (field_info.json_schema_extra or {}).get("tag")
+        if isinstance(tag, str):
+            by_yang_name[tag] = field_name
+    predicates: list[str] = []
+    for key_name in key_order:
+        field_name = by_yang_name.get(key_name)
+        if field_name is None:
+            raise ValueError(
+                f"{type(item).__name__} declares key {key_name!r} in "
+                "__yang_key_order__ but has no field with that YANG name"
+            )
+        value = getattr(item, field_name)
+        predicates.append(f"[{key_name}={_predicate_value(value)}]")
+    return f"{parent_path}/{segment}{''.join(predicates)}"
+
+
+def _collect_instances(
+    model: Any,
+    path: str,
+    module: str,
+    out: dict[str, Any],
+    *,
+    content: str,
+    exclude_none: bool,
+    exclude_unset: bool,
+) -> None:
+    """Walk ``model`` and add every populated leaf to ``out``.
+
+    ``path`` is the instance-identifier of ``model`` itself; ``module`` is its
+    defining module, used to decide whether a child needs RFC 7951 Sec 6.11
+    module qualification.
+    """
+    for field_name, field_info in type(model).model_fields.items():
+        # nc:operation is the RFC 6241 Sec 7.2 edit attribute, not a data node.
+        if field_name == "nc_operation":
+            continue
+        extra = field_info.json_schema_extra or {}
+        tag = extra.get("tag")
+        ns = extra.get("ns")
+        if not isinstance(tag, str) or not isinstance(ns, str):
+            raise ValueError(
+                f"{type(model).__name__}.{field_name} carries no YANG "
+                "tag/namespace metadata; model_dump_instances() is a NETCONF "
+                "data-model API"
+            )
+        field_module = NAMESPACE_MODULES.get(ns)
+        if field_module is None:
+            raise ValueError(
+                f"no module name is known for namespace {ns!r} "
+                f"({type(model).__name__}.{field_name}); cannot build a "
+                "module-qualified instance-identifier"
+            )
+        is_config = extra.get("is_config", True) is not False
+        # RFC 7950 Sec 7.21.1: a config false node has no config true
+        # descendants, so content=config can drop the whole subtree. The
+        # reverse is not true (a config true container may hold state leaves),
+        # so content=nonconfig still walks into it.
+        if content == "config" and not is_config:
+            continue
+        if exclude_unset and field_name not in model.model_fields_set:
+            continue
+        value = getattr(model, field_name)
+        segment = f"{field_module}:{tag}" if field_module != module else tag
+        child_path = f"{path}/{segment}"
+        if isinstance(value, NetconfXmlModel):
+            _collect_instances(
+                value,
+                child_path,
+                _module_name_for_model(type(value)),
+                out,
+                content=content,
+                exclude_none=exclude_none,
+                exclude_unset=exclude_unset,
+            )
+            continue
+        if isinstance(value, list) and value and isinstance(value[0], NetconfXmlModel):
+            for item in value:
+                if not isinstance(item, NetconfXmlModel):
+                    raise ValueError(
+                        f"{type(model).__name__}.{field_name} mixes list-entry "
+                        "models with scalar values"
+                    )
+                item_path = _list_item_path(item, path, segment)
+                _collect_instances(
+                    item,
+                    item_path,
+                    _module_name_for_model(type(item)),
+                    out,
+                    content=content,
+                    exclude_none=exclude_none,
+                    exclude_unset=exclude_unset,
+                )
+            continue
+        if value is None:
+            # A container/list field with no value has no instance. A leaf set
+            # explicitly to None is only emitted when the caller asked for it.
+            if exclude_none or _child_netconf_model(field_info.annotation) is not None:
+                continue
+            out[child_path] = None
+            continue
+        if not _content_matches(is_config, content):
+            continue
+        if isinstance(value, list):
+            # RFC 7950 Sec 9.13: a leaf-list entry is addressed by its value.
+            for item in value:
+                out[f"{child_path}[.={_predicate_value(item)}]"] = _instance_value(
+                    item
+                )
+        else:
+            out[child_path] = _instance_value(value)
 
 
 def rebuild_model_and_dependencies(cls: type[NetconfXmlModel], memo: set[type] = None) -> None:
@@ -427,6 +651,85 @@ class NetconfBaseModel(NetconfXmlModel, nsmap={"nc": NETCONF_BASE_NS}):
         ensure_ascii = bool(kwargs.pop("ensure_ascii", False))
         data = self.model_dump(content=content, **kwargs)
         return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+
+    def model_dump_instances(
+        self,
+        instance_path: str,
+        *,
+        content: Literal["config", "all", "nonconfig"] = "all",
+        exclude_none: bool = True,
+        exclude_unset: bool = True,
+    ) -> dict[str, Any]:
+        """Flatten this model into ``{instance-identifier: value}``.
+
+        ``instance_path`` is the RFC 7950 Sec 9.13 instance-identifier of THIS
+        model -- typically ``navigator.instance_identifier()``. Every populated
+        leaf and leaf-list entry below it becomes one entry, addressed with the
+        module qualification of RFC 7951 Sec 6.11 and, for a list entry, one
+        predicate per key in `key`-statement order.
+
+        This is the comparison primitive: two models of the same subtree (a
+        hand-written intent and a retrieved running config) flatten to
+        dictionaries that can be diffed key by key without caring about field
+        order, list order, or which optional nodes happen to be present.
+
+        ``content`` matches ``model_dump``'s config-filter semantics: ``config``
+        drops state leaves (and config-false subtrees, which cannot contain
+        config leaves -- RFC 7950 Sec 7.21.1), ``nonconfig`` drops config leaves
+        while still walking through their containers, ``all`` keeps both.
+        ``exclude_unset`` and ``exclude_none`` decide whether a field the model
+        never populated contributes an entry; their defaults keep only the
+        values actually present in the payload.
+        """
+        if not instance_path or not instance_path.startswith("/"):
+            raise ValueError(
+                "instance_path must be an absolute instance-identifier such as "
+                "'/module:container' (RFC 7950 Sec 9.13); pass the navigator's "
+                "instance_identifier()"
+            )
+        path = instance_path.rstrip("/")
+        if not path:
+            raise ValueError(
+                "the datastore root is not an instance node, so its contents "
+                "cannot be addressed relative to it (RFC 7950 Sec 9.13)"
+            )
+        if content not in ("config", "all", "nonconfig"):
+            raise ValueError(
+                f"content must be 'config', 'all' or 'nonconfig', not {content!r}"
+            )
+        out: dict[str, Any] = {}
+        _collect_instances(
+            self,
+            path,
+            _module_name_for_model(type(self)),
+            out,
+            content=content,
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+        )
+        return out
+
+    def model_dump_instances_json(
+        self,
+        instance_path: str,
+        *,
+        indent: int | None = None,
+        sort_keys: bool = True,
+        ensure_ascii: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        """JSON mirror of ``model_dump_instances``.
+
+        Keys are sorted by default: an instance-identifier map is a comparison
+        artifact, and stable key order makes a textual diff meaningful. Pass
+        ``sort_keys=False`` to keep the model's traversal order.
+        """
+        return json.dumps(
+            self.model_dump_instances(instance_path, **kwargs),
+            indent=indent,
+            sort_keys=sort_keys,
+            ensure_ascii=ensure_ascii,
+        )
 
     @classmethod
     def _prune_content(cls, data: Any, content: str, by_alias: bool) -> None:

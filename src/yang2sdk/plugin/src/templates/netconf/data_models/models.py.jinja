@@ -1,6 +1,6 @@
 """Auto-generated NETCONF pydantic-xml models"""
 
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, ClassVar, Literal, TypeVar
 from pydantic import ConfigDict, Field, AfterValidator
 from pydantic_xml import element, attr
 from enum import Enum
@@ -54,6 +54,11 @@ class {{ enum.name }}(str, Enum):
 {% for model in module.models %}
 class {{ model.name }}({% if model.is_rpc_envelope %}_ModuleRpcBase{% else %}_ModuleBase{% endif %}, tag="{{ model.yang_name }}", ns="{{ model.ns_alias }}"):
     """{{ model.description }}"""
+    {% if model.key_order %}
+    # RFC 7950 Sec 9.13: key predicates follow the `key` statement's order, not
+    # this class's field declaration order.
+    __yang_key_order__: ClassVar[tuple[str, ...]] = {{ model.key_order | pprint }}
+    {% endif %}
     {% if not model.fields and not model.is_rpc_envelope %}
     pass
     {% else %}

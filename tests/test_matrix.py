@@ -1675,6 +1675,16 @@ INSTANCE_ID_YANG = """module tid {
   revision 2026-01-01;
 
   container system {
+    leaf hostname {
+      type string;
+    }
+    leaf-list dns {
+      type string;
+    }
+    leaf uptime {
+      config false;
+      type uint32;
+    }
     list user {
       key "name";
       leaf name {
@@ -1682,6 +1692,13 @@ INSTANCE_ID_YANG = """module tid {
       }
       leaf enabled {
         type boolean;
+      }
+      leaf-list role {
+        type string;
+      }
+      leaf last-login {
+        config false;
+        type string;
       }
     }
     list server {
@@ -1691,6 +1708,18 @@ INSTANCE_ID_YANG = """module tid {
       }
       leaf port {
         type uint16;
+      }
+    }
+    list port-first {
+      key "port ip";
+      leaf ip {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+      leaf descr {
+        type string;
       }
     }
     list flag {
@@ -1703,6 +1732,28 @@ INSTANCE_ID_YANG = """module tid {
       key "tag";
       leaf tag {
         type empty;
+      }
+    }
+    list mode {
+      key "m";
+      leaf m {
+        type enumeration {
+          enum foo-bar;
+          enum baz-qux;
+          enum alpha;
+          enum beta;
+        }
+      }
+      leaf note {
+        type string;
+      }
+    }
+    container stats {
+      config false;
+      list sample {
+        leaf counter {
+          type uint32;
+        }
       }
     }
   }
@@ -1795,6 +1846,19 @@ def test_instance_identifier_names_each_node_by_its_defining_module(tmp_path):
     # Python's True/False.
     assert system.flag(True).instance_identifier() == "/tid:system/flag[on='true']"
 
+    # RFC 7950 Sec 9.6.4: an enumeration key is its YANG name (`foo-bar`), not
+    # the generated Python member name (`FOO_BAR`).
+    assert (
+        system.mode("foo-bar").instance_identifier() == "/tid:system/mode[m='foo-bar']"
+    )
+
+    # RFC 7950 Sec 9.13: key predicates follow the `key` statement, even when
+    # the leaves are declared in the opposite order.
+    assert (
+        system.port_first(443, "198.51.100.1").instance_identifier()
+        == "/tid:system/port-first[port='443'][ip='198.51.100.1']"
+    )
+
     # RFC 7950 Sec 9.13: a key of type empty has no value and is a zero-length
     # string; None is refused rather than rendered as "None".
     assert system.marker("").instance_identifier() == "/tid:system/marker[tag='']"
@@ -1834,6 +1898,122 @@ def test_instance_identifier_names_each_node_by_its_defining_module(tmp_path):
     # "same module as the parent" (RFC 7951 Sec 6.11), i.e. a different path.
     with pytest.raises(ValueError, match="no module name is known"):
         base.Node(None, [("urn:test:unknown", "x", {})]).instance_identifier()
+
+
+def test_model_dump_instances_flattens_a_model_to_instance_paths(tmp_path):
+    """`model_dump_instances()` is the comparison primitive.
+
+    It flattens a model to `{instance-identifier: value}` using the same
+    RFC 7950 Sec 9.13 / RFC 7951 Sec 6.11 encoding as `instance_identifier()`,
+    so a hand-written intent model and a retrieved running-config model can be
+    diffed without caring about field order, list order, or absent optional
+    nodes. Key predicates follow the `key` statement (not field order), an
+    enumeration key uses its YANG name (not the generated Python member name),
+    a leaf-list entry is addressed by its value, and an augmented child is
+    qualified with the augmenting module.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    models = _import(out, "data_models.tid")
+
+    model = models.System.model_validate(
+        {
+            "hostname": "r1",
+            "dns": ["1.1.1.1", "8.8.8.8"],
+            "uptime": 42,
+            "user": [
+                {
+                    "name": "alice",
+                    "enabled": True,
+                    "role": ["admin", "ops"],
+                    "last_login": "today",
+                    "prefs": {"addr": [{"ip": "10.0.0.1"}]},
+                },
+                {"name": "o'brien", "enabled": False},
+            ],
+            "server": [{"ip": "192.0.2.1", "port": 80}],
+            "port_first": [{"ip": "198.51.100.1", "port": 443, "descr": "api"}],
+            "flag": [{"on": True}],
+            "marker": [{"tag": ""}],
+            "mode": [{"m": "foo-bar", "note": "n"}],
+        }
+    )
+
+    alice = "/tid:system/user[name='alice']"
+    obrien = '/tid:system/user[name="o\'brien"]'
+    expected = {
+        "/tid:system/hostname": "r1",
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+        "/tid:system/uptime": 42,
+        f"{alice}/name": "alice",
+        f"{alice}/enabled": True,
+        f"{alice}/role[.='admin']": "admin",
+        f"{alice}/role[.='ops']": "ops",
+        f"{alice}/last-login": "today",
+        f"{alice}/tidadd:prefs/addr[ip='10.0.0.1']/ip": "10.0.0.1",
+        f"{obrien}/name": "o'brien",
+        f"{obrien}/enabled": False,
+        "/tid:system/server[ip='192.0.2.1'][port='80']/ip": "192.0.2.1",
+        "/tid:system/server[ip='192.0.2.1'][port='80']/port": 80,
+        # `key "port ip"` while the leaves are declared ip then port: RFC 7950
+        # Sec 9.13 follows the key statement, not field order.
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/ip": "198.51.100.1",
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/port": 443,
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/descr": "api",
+        "/tid:system/flag[on='true']/on": True,
+        "/tid:system/marker[tag='']/tag": "",
+        # The generated enum member is FOO_BAR; the YANG lexical value is
+        # foo-bar (RFC 7950 Sec 9.6.4).
+        "/tid:system/mode[m='foo-bar']/m": "foo-bar",
+        "/tid:system/mode[m='foo-bar']/note": "n",
+    }
+    assert model.model_dump_instances("/tid:system") == expected
+    assert model.model_dump_instances_json("/tid:system") == json.dumps(
+        expected, sort_keys=True
+    )
+
+    # A partial intent model contributes only the values it actually sets, so
+    # a hand-written config can be compared against a full running config.
+    partial = models.System.model_validate({"hostname": "r1"})
+    assert partial.model_dump_instances("/tid:system") == {"/tid:system/hostname": "r1"}
+
+    # RFC 8342 / RFC 8526 config-filter semantics, shared with model_dump.
+    config_only = model.model_dump_instances("/tid:system", content="config")
+    assert "/tid:system/uptime" not in config_only
+    assert f"{alice}/last-login" not in config_only
+    assert config_only["/tid:system/hostname"] == "r1"
+    assert config_only[f"{alice}/name"] == "alice"
+    state_only = model.model_dump_instances("/tid:system", content="nonconfig")
+    assert state_only == {
+        "/tid:system/uptime": 42,
+        f"{alice}/last-login": "today",
+    }
+
+    # A keyless list is state data (RFC 7950 Sec 7.8.2) and Sec 9.13 gives no
+    # instance-identifier for an individual entry; refuse rather than merge
+    # entries under one path. content=config drops the config-false subtree.
+    keyless = models.System.model_validate({"stats": {"sample": [{"counter": 1}]}})
+    with pytest.raises(ValueError, match="keyless list entry"):
+        keyless.model_dump_instances("/tid:system", content="all")
+    assert keyless.model_dump_instances("/tid:system", content="config") == {}
+
+    # A value holding both quote characters has no representable predicate.
+    unquotable = models.System.model_validate({"user": [{"name": "both'\"quotes"}]})
+    with pytest.raises(ValueError, match="both quote characters"):
+        unquotable.model_dump_instances("/tid:system")
+
+    # The root path is required and must be an instance node.
+    with pytest.raises(ValueError, match="absolute instance-identifier"):
+        model.model_dump_instances("tid:system")
+    with pytest.raises(ValueError, match="datastore root"):
+        model.model_dump_instances("/")
+    with pytest.raises(ValueError, match="content must be"):
+        model.model_dump_instances("/tid:system", content="bogus")
 
 
 def test_no_nonexistent_rfc_sections_cited():
@@ -4127,6 +4307,7 @@ BUILTIN_COLLISION_YANG = """module tbi {
       leaf bool { type boolean; }
       leaf after { type string; }
       leaf-list list { type uint8; }
+      leaf model_dump_instances { type string; }
       list nested { key id; leaf id { type string; } }
     }
     container sibling-after { leaf b { type string; } }
@@ -4243,6 +4424,9 @@ def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
             ("int_", "int"),
             ("bool_", "bool"),
             ("list_", "list"),
+            # A method the NETCONF model base defines; a leaf with this name
+            # would shadow it on that instance.
+            ("model_dump_instances_", "model_dump_instances"),
         ):
             assert escaped in holder, (fmt, sorted(holder))
             extra = holder[escaped].json_schema_extra or {}
@@ -4264,10 +4448,18 @@ def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
 
         # 4. The value round-trips through the escaped attribute.
         inst = models.Holder.model_validate(
-            {"str": "a", "int": 2, "bool": True, "list": [1, 2], "after": "z"}
+            {
+                "str": "a",
+                "int": 2,
+                "bool": True,
+                "list": [1, 2],
+                "model_dump_instances": "shadow",
+                "after": "z",
+            }
         )
         assert inst.str_ == "a" and inst.int_ == 2 and inst.bool_ is True
         assert inst.list_ == [1, 2] and inst.after == "z"
+        assert inst.model_dump_instances_ == "shadow"
 
         # 5. An rpc input leaf is escaped too -- this is the `get-schema` shape.
         do_it_in = models.DoItInput.model_fields

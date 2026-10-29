@@ -19,8 +19,9 @@ documented — a date-versioned scheme carries no compatibility promise.
   is `/ietf-interfaces:interfaces/interface[name='ge-0/0/0']/ietf-ip:ipv4/address[ip='10.0.0.1']`
   (the RFC 7951 §6.11 example shape, verified on a fresh compile of the IETF
   modules). Key values are rendered in their YANG lexical form — a boolean key
-  is `true`/`false` (§9.7.2), an enumeration key is its assigned name (§9.6.4) —
-  and quoted with single quotes, or double quotes when the value contains a
+  is `true`/`false` (§9.7.2), an enumeration key is its YANG name — the
+  generated enum's value, not its Python member name (§9.6.4) — and quoted
+  with single quotes, or double quotes when the value contains a
   single quote; a value containing both cannot be represented, because
   §14's `quoted-string` has no escape mechanism, so it raises instead of
   emitting a string that parses as a different path. A datastore root, a list
@@ -32,6 +33,23 @@ documented — a date-versioned scheme carries no compatibility promise.
   NETCONF-only on purpose: RESTCONF addresses nodes by a resource URI
   (RFC 8040 §3.5.3), which is not an instance-identifier. Pinned by
   `tests/test_matrix.py::test_instance_identifier_names_each_node_by_its_defining_module`.
+- **NETCONF models can flatten themselves to an instance-path map.**
+  `model.model_dump_instances("/tid:system")` returns
+  `{instance-identifier: value}` for every populated leaf and leaf-list entry
+  under that model, and `model_dump_instances_json()` returns the same map as
+  JSON (keys sorted by default). The path uses the same RFC 7950 §9.13 /
+  RFC 7951 §6.11 encoding as `instance_identifier()`: module qualification at
+  each module boundary, one predicate per list key in `key`-statement order
+  (not field-declaration order), and `[.='value']` for a leaf-list entry. This
+  is the comparison primitive for intent-vs-running: two models of the same
+  subtree flatten to dictionaries that can be diffed key by key without
+  field-order, list-order, or absent-optional-node noise. `content` matches
+  `model_dump`'s `config`/`all`/`nonconfig` filter, and
+  `exclude_unset`/`exclude_none` (both default true) keep only the values
+  actually present. A keyless list entry has no RFC 7950 §9.13
+  instance-identifier, so it raises rather than collapsing entries under one
+  path; `content="config"` excludes state-only keyless lists. Pinned by
+  `tests/test_matrix.py::test_model_dump_instances_flattens_a_model_to_instance_paths`.
 
 ### Changed
 

@@ -96,6 +96,31 @@ Reads and writes route through NMDA (`<get-data>` / `<edit-data>`, RFC 8526) whe
 
 `replace()` on a container or keyed item (PUT / `operation="replace"`) refuses a model with unset config fields (`allow_partial=True` overrides): a replace body is the complete resource, so a partial model would silently delete the rest. Whole-list `replace()` takes a bare list with no guard — the list body *is* the complete resource. State (`config false`) leaves never count toward the guard.
 
+## Reading and comparing configuration
+
+A NETCONF navigator can render its own instance-identifier, and a model can flatten itself to an instance-path map. The pair is the intent-vs-running comparison primitive: both a hand-written model and a retrieved one reduce to `{instance-identifier: value}`, so a diff is key-by-key instead of a structural walk.
+
+```python
+nav = client.data.ietf_interfaces_interfaces
+running = nav.retrieve(content="config")
+running_map = running.model_dump_instances(nav.instance_identifier(), content="config")
+intended_map = intended.model_dump_instances(
+    nav.instance_identifier(), content="config"
+)
+
+missing = intended_map.keys() - running_map.keys()
+extra = running_map.keys() - intended_map.keys()
+changed = {
+    path: (running_map[path], intended_map[path])
+    for path in intended_map.keys() & running_map.keys()
+    if intended_map[path] != running_map[path]
+}
+```
+
+`model_dump_instances()` follows RFC 7950 §9.13 / RFC 7951 §6.11: the path is module-qualified at every module boundary, a list entry carries one predicate per key in `key`-statement order, and a leaf-list entry is addressed as `[.='value']`. `content` is the same `config`/`all`/`nonconfig` filter as `model_dump`; `exclude_unset` and `exclude_none` (both default true) keep only the values actually present. `model_dump_instances_json()` returns the same map as JSON with sorted keys, for a textual diff. A keyless list entry is state data (RFC 7950 §7.8.2) and has no instance-identifier (§9.13), so it raises; `content="config"` excludes those subtrees.
+
+This API is NETCONF-only, like `instance_identifier()`: RESTCONF addresses nodes by a resource URI (RFC 8040 §3.5.3), not an instance-identifier.
+
 ## RPCs and actions
 
 RPCs live under `client.operations` with the same `<module>_<rpc>` naming:
