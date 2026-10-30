@@ -9,6 +9,38 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Added
 
+- **NETCONF diff / plan / reconcile.** `NetconfClient.diff_instances(running_map, intended_map)`
+  classifies two `model_dump_instances()` maps into `{+, ~, -}`. Leaf-lists are
+  compared as ordered sequences (any difference — reorder, add, remove — is one
+  `~` keyed by the leaf-list node); `-` is collapsed at diff time to the highest
+  wholly-removed node and carries `Removal.kind` (`leaf`, `container`,
+  `list-entry`), so `plan()` and `reconcile()` need only the diff. `plan()`
+  builds one surgical `<config>`, prints it, and dry-runs it:
+  `<test-option>test-only</test-option>` when `:validate:1.1` is advertised
+  (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds
+  `test-only`), otherwise candidate staging + `<validate>` +
+  `<discard-changes>` (locking first and refusing a candidate that already
+  differs from running), otherwise message-only with `ok=None`. A plan never
+  applies to running and never commits, even with `auto_commit=True`.
+  `reconcile()` sends the same bytes and commits by default. `edit()` gained
+  `test_option=` and a per-call `commit=` override. Pinned by
+  `tests/test_matrix.py::test_diff_instances_classifies_and_collapses`,
+  `::test_build_config_emits_one_surgical_edit`,
+  `::test_plan_prefers_test_only_and_never_commits`,
+  `::test_plan_falls_back_to_candidate_and_refuses_a_dirty_one` and
+  `::test_reconcile_commits_even_when_auto_commit_is_false`.
+- **`client.data.retrieve()` fetches all compiled config in one RPC.**
+  `client.data.retrieve(content="config", depth="unbounded", fields=[...])`
+  sends one multi-root subtree filter naming only compiled top-level nodes, so
+  `Data.from_xml()` never sees a module this client was not compiled for.
+  `fields` entries are `module:root[/child...]`, grouped by root; `fields=None`
+  selects every compiled root with its whole subtree. `Data.model_dump_instances()`
+  with no path flattens all roots to absolute instance-identifiers. Relative
+  `node.retrieve(fields=[...])` now resolves a field by Python name or YANG name
+  and raises on an unknown one instead of silently selecting nothing. Pinned by
+  `tests/test_matrix.py::test_data_retrieve_sends_one_multi_root_filter` and
+  `::test_node_retrieve_fields_accept_yang_and_python_names`.
+
 - **NETCONF navigators can render their own instance-identifier.**
   `nav.instance_identifier()` returns the node as RFC 7950 §9.13 defines it,
   encoded with the module-name qualification of RFC 7951 §6.11: the leftmost
@@ -86,6 +118,23 @@ documented — a date-versioned scheme carries no compatibility promise.
   a release is cut, `test_the_real_changelog_becomes_releasable_once_the_version_is_promoted`
   derived that release's own version and `promote` refused the duplicate. It now
   freezes the clock and treats every documented version as taken.
+
+### Fixed
+
+- **`:validate:1.1`-only devices were reported as having no validation.**
+  `has_validate` matched only `urn:...:validate:1.0` exactly, so a device that
+  advertised 1.1 alone was treated as unvalidatable. It is now true for either
+  version (1.1 extends 1.0), and the new `has_validate_1_1` gates
+  `<test-option>test-only</test-option>`, which RFC 6241 §8.6.4.1 adds in 1.1
+  and §7.2 permits only with 1.1.
+- **The aggregate `Data` model could not be rebuilt from XML.** Its module
+  aliases were imported only under `TYPE_CHECKING`, so the first
+  `Data.from_xml()` raised `PydanticUndefinedAnnotation: name '_m_<module>' is
+  not defined`. The aliases are now bound at runtime with
+  `importlib.import_module` — not `from . import <name>`, which returns an
+  existing package attribute (the `element` callable, for a YANG module named
+  `element`) instead of the submodule — and the compiler's aggregate-annotation
+  guard recognises that assignment as a module binding rather than an object.
 
 ## [2026.10.27] - 2026-10-27
 

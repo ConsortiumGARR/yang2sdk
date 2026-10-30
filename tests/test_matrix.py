@@ -2168,6 +2168,301 @@ def test_model_validate_instances_rebuilds_the_model_from_the_map(tmp_path):
         models.System.model_validate_instances_json("/tid:system", "[]")
 
 
+def test_diff_instances_classifies_and_collapses(tmp_path):
+    """`diff_instances` is the plan's input: leaf-level buckets, collapsed `-`.
+
+    A leaf removal stays a leaf when an unchanged sibling survives; a whole
+    list entry or container collapses to that node, so `plan()` can emit one
+    `remove` at the right granularity without needing the running/intended
+    maps again.
+    """
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+
+    running = {
+        "/tid:system/hostname": "old",
+        "/tid:system/level": "low",
+        "/tid:system/user[name='alice']/name": "alice",
+        "/tid:system/user[name='alice']/enabled": True,
+        "/tid:system/user[name='alice']/tidadd:prefs/addr[ip='10.0.0.1']/ip": "10.0.0.1",
+        "/tid:system/user[name='bob']/name": "bob",
+        "/tid:system/user[name='bob']/enabled": False,
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+    }
+    intended = {
+        "/tid:system/hostname": "new",
+        "/tid:system/level": "low",
+        "/tid:system/user[name='alice']/name": "alice",
+        "/tid:system/user[name='alice']/enabled": True,
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+    }
+    diff = session.diff_instances(running, intended)
+
+    assert diff["+"] == {}
+    assert diff["~"]["/tid:system/hostname"] == ("old", "new")
+    assert diff["~"]["/tid:system/dns"] == (
+        ["1.1.1.1", "8.8.8.8"],
+        ["8.8.8.8", "1.1.1.1"],
+    )
+    assert set(diff["-"]) == {
+        "/tid:system/user[name='bob']",
+        "/tid:system/user[name='alice']/tidadd:prefs",
+    }
+    assert diff["-"]["/tid:system/user[name='bob']"].kind == "list-entry"
+    assert diff["-"]["/tid:system/user[name='alice']/tidadd:prefs"].kind == "container"
+    assert "/tid:system/level" not in diff["-"]
+
+    # An unchanged sibling blocks the collapse: only the leaf is deleted.
+    leaf_diff = session.diff_instances(
+        {"/tid:system/hostname": "old", "/tid:system/level": "low"},
+        {"/tid:system/level": "low"},
+    )
+    assert leaf_diff["-"]["/tid:system/hostname"].kind == "leaf"
+
+
+def test_build_config_emits_one_surgical_edit(tmp_path):
+    """`+`/`~` merge, `-` removes at the collapsed node, leaf-lists remove+add."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+
+    diff = session.InstanceDiff(
+        added={"/tid:system/level": "high"},
+        changed={
+            "/tid:system/hostname": ("old", "new"),
+            "/tid:system/dns": (["1.1.1.1"], ["8.8.8.8"]),
+        },
+        removed={
+            "/tid:system/user[name='bob']": session.Removal(
+                path="/tid:system/user[name='bob']",
+                kind="list-entry",
+                leaves={
+                    "/tid:system/user[name='bob']/name": "bob",
+                    "/tid:system/user[name='bob']/enabled": False,
+                },
+            )
+        },
+    )
+    config = session.build_config(diff, session.MODULE_NAMESPACES)
+    assert config.tag == "{urn:ietf:params:xml:ns:netconf:base:1.0}config"
+
+    system = config[0]
+    assert etree.QName(system).localname == "system"
+    by_tag = {}
+    for child in system:
+        by_tag.setdefault(etree.QName(child).localname, []).append(child)
+
+    assert by_tag["level"][0].text == "high"
+    assert by_tag["hostname"][0].text == "new"
+    assert [entry.text for entry in by_tag["dns"]] == ["1.1.1.1", "8.8.8.8"]
+    assert (
+        by_tag["dns"][0].get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation")
+        == "remove"
+    )
+    assert (
+        by_tag["dns"][1].get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation")
+        is None
+    )
+    user = by_tag["user"][0]
+    assert user.get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation") == "remove"
+    assert [etree.QName(child).localname for child in user] == ["name"]
+    assert user[0].text == "bob"
+
+
+def test_data_retrieve_sends_one_multi_root_filter(tmp_path):
+    """`Data.retrieve()` selects compiled roots in one subtree filter."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    nav = _import(out, "data_navigators")
+    session = _import(out, "session_manager")
+
+    class FakeClient:
+        module_namespaces = session.MODULE_NAMESPACES
+
+        def __init__(self):
+            self.kwargs: dict = {}
+
+        def retrieve(self, **kwargs):
+            self.kwargs = kwargs
+            return etree.fromstring(
+                '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                '<system xmlns="urn:test:tid"><hostname>r1</hostname></system>'
+                "</data>"
+            )
+
+    client = FakeClient()
+    data = nav.Data(client, []).retrieve(fields=["tid:system/hostname"])
+    assert client.kwargs["content"] == "config"
+    assert client.kwargs["depth"] == "unbounded"
+    roots = client.kwargs["filter_xml"]
+    assert isinstance(roots, list) and len(roots) == 1
+    assert etree.QName(roots[0]).localname == "system"
+    assert [etree.QName(child).localname for child in roots[0]] == ["hostname"]
+    assert data is not None
+    assert data.tid_system.hostname == "r1"
+    assert data.model_dump_instances(content="config") == {"/tid:system/hostname": "r1"}
+
+    # No fields: every compiled root, each empty (whole subtree).
+    nav.Data(client, []).retrieve()
+    roots = client.kwargs["filter_xml"]
+    assert [etree.QName(root).localname for root in roots] == ["system"]
+    assert len(roots[0]) == 0
+
+    # A bare root wins over child selections for the same root.
+    nav.Data(client, []).retrieve(fields=["tid:system/hostname", "tid:system"])
+    roots = client.kwargs["filter_xml"]
+    assert len(roots[0]) == 0
+
+    with pytest.raises(ValueError, match="not a compiled top-level node"):
+        nav.Data(client, []).retrieve(fields=["tid:nope"])
+
+
+def test_node_retrieve_fields_accept_yang_and_python_names(tmp_path):
+    """A filter field must resolve by Python name or YANG name, and a typo
+    must raise instead of silently selecting nothing."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tid")
+    path = [("urn:test:tid", "system", {})]
+
+    tree = base.build_filter_tree(path, models.System, fields=["port-first"])
+    assert [etree.QName(child).localname for child in tree] == ["port-first"]
+
+    tree = base.build_filter_tree(path, models.System, fields=["port_first"])
+    assert [etree.QName(child).localname for child in tree] == ["port-first"]
+
+    # The depth-bounded (legacy) path resolves the same names and raises too.
+    tree = base.build_depth_filter(path, models.System, 2, fields=["port-first"])
+    assert tree is not None
+    child = tree.find("{urn:test:tid}port-first")
+    assert child is not None
+    assert {etree.QName(grandchild).localname for grandchild in child} == {
+        "port",
+        "ip",
+    }
+
+    with pytest.raises(ValueError, match="has no field"):
+        base.build_filter_tree(path, models.System, fields=["nope"])
+    with pytest.raises(ValueError, match="has no field"):
+        base.build_depth_filter(path, models.System, 2, fields=["nope"])
+
+
+def _plan_client(session, **overrides):
+    """A NetconfClient with transport calls replaced by recorders."""
+    client = object.__new__(session.NetconfClient)
+    client.module_namespaces = session.MODULE_NAMESPACES
+    client.default_target = "candidate"
+    client.has_nmda = False
+    client.has_validate_1_1 = False
+    client.has_validate = True
+    client.has_candidate = True
+    client.auto_commit = False
+    client.events = []
+
+    def record(name):
+        def call(*args, **kwargs):
+            client.events.append((name, args, kwargs))
+            return True
+
+        return call
+
+    for name in ("edit", "validate", "commit", "lock", "unlock", "discard_changes"):
+        setattr(client, name, record(name))
+    client._candidate_is_clean = lambda: True
+    for key, value in overrides.items():
+        setattr(client, key, value)
+    return client
+
+
+def test_plan_prefers_test_only_and_never_commits(tmp_path):
+    """`test-only` needs :validate:1.1 and must never commit, even with
+    auto_commit=True."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, has_validate_1_1=True, auto_commit=True)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    result = session.NetconfClient.plan(client, diff, show=False)
+
+    assert result.validated == "syntax"
+    assert result.ok is True
+    assert client.events[0][0] == "edit"
+    assert client.events[0][2]["test_option"] == "test-only"
+    assert client.events[0][2]["commit"] is False
+    assert all(event[0] != "commit" for event in client.events)
+
+
+def test_plan_falls_back_to_candidate_and_refuses_a_dirty_one(tmp_path):
+    """No :validate:1.1 means stage+validate+discard; a dirty candidate must
+    fail loudly and must never be discarded."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    dirty = _plan_client(session)
+    dirty._candidate_is_clean = lambda: False
+    with pytest.raises(RuntimeError, match="candidate already holds"):
+        session.NetconfClient.plan(dirty, diff, show=False)
+    assert all(event[0] != "discard_changes" for event in dirty.events)
+    assert any(event[0] == "unlock" for event in dirty.events)
+
+    clean = _plan_client(session)
+    result = session.NetconfClient.plan(clean, diff, show=False)
+    assert result.validated == "datastore"
+    names = [event[0] for event in clean.events]
+    assert names[:2] == ["lock", "edit"]
+    assert "validate" in names
+    assert "discard_changes" in names
+    assert "unlock" in names
+
+
+def test_plan_falls_back_when_test_only_is_rejected(tmp_path):
+    """A device may advertise :validate:1.1 and still answer
+    operation-not-supported for test-only; plan must stage to candidate."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, has_validate_1_1=True)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    class Rejected(RuntimeError):
+        rpc_error_tag = "operation-not-supported"
+
+    def edit(config, **kwargs):
+        if kwargs.get("test_option") == "test-only":
+            raise Rejected("NETCONF RPC Error: operation-not-supported")
+        client.events.append(("edit", (), kwargs))
+        return True
+
+    client.edit = edit
+    result = session.NetconfClient.plan(client, diff, show=False)
+    assert result.validated == "datastore"
+    assert any(event[0] == "discard_changes" for event in client.events)
+
+
+def test_reconcile_commits_even_when_auto_commit_is_false(tmp_path):
+    """`plan` is expected first, so `reconcile` commits by default; auto_commit
+    must not be able to commit before validation."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, auto_commit=False)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    assert session.NetconfClient.reconcile(client, diff) is True
+
+    names = [event[0] for event in client.events]
+    assert names[:2] == ["lock", "edit"]
+    assert client.events[1][2] == {"target": "candidate", "commit": False}
+    assert "validate" in names
+    assert "commit" in names
+    assert names.index("validate") < names.index("commit")
+
+
 def test_no_nonexistent_rfc_sections_cited():
     """Guard against wrong RFC cites (e.g. RFC 8040 has no Sec 4.6.2; Sec 5.2
     is message encoding, not PATCH bodies; list encoding is RFC 7951 Sec 5.4,
@@ -3844,6 +4139,37 @@ def test_netconf_depth_uses_the_filter_and_prunes_a_lying_server(tmp_path):
     assert model.items[0].label is None, "boundary leaf survived the pruner"
 
 
+def test_netconf_retrieve_accepts_a_list_of_filter_roots(tmp_path):
+    """`Data.retrieve()` passes several selection nodes in one RPC.
+
+    Legacy ncclient wraps a list in one `<filter type="subtree">`; NMDA appends
+    every node to one `<subtree-filter>`. A single element keeps its existing
+    `(type, criteria)` path.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    client, mgr = _netconf_client(tmp_path, _BASE_CAPS)
+    roots = [
+        etree.Element("{urn:test:a}a", nsmap={None: "urn:test:a"}),
+        etree.Element("{urn:test:b}b", nsmap={None: "urn:test:b"}),
+    ]
+
+    client.retrieve(source="running", content="config", filter_xml=roots)
+    assert mgr.get_config_kwargs["filter"] is roots
+
+    nmda_client, nmda_mgr = _netconf_client(
+        tmp_path / "nmda",
+        [*_BASE_CAPS, "urn:ietf:params:netconf:capability:nmda:1.0"],
+    )
+    nmda_client.retrieve(source="candidate", content="config", filter_xml=roots)
+    rpc = nmda_mgr.dispatched[-1]
+    filter_el = rpc.find(
+        "{urn:ietf:params:xml:ns:yang:ietf-netconf-nmda}subtree-filter"
+    )
+    assert filter_el is not None
+    assert [etree.QName(child).localname for child in filter_el] == ["a", "b"]
+
+
 def test_depth_validation_rejects_only_inexpressible_values(tmp_path):
     """`depth=1` is valid; reject bool/0/negative/non-numeric/>65535/None
     before any transport work, on both protocols.
@@ -3990,6 +4316,8 @@ class _FakeNcclientManager:
         self.closed = 0
         self.dispatched: list[Any] = []
         self.commits = 0
+        self.get_config_kwargs: dict = {}
+        self.get_kwargs: dict = {}
 
     def close_session(self):
         self.closed += 1
@@ -4002,6 +4330,14 @@ class _FakeNcclientManager:
 
     def commit(self):
         self.commits += 1
+        return self
+
+    def get_config(self, **kwargs):
+        self.get_config_kwargs = kwargs
+        return self
+
+    def get(self, **kwargs):
+        self.get_kwargs = kwargs
         return self
 
     def dispatch(self, rpc):

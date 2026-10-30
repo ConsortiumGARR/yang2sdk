@@ -3,6 +3,9 @@ import copy
 import logging
 import os
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Self
 from urllib.parse import parse_qs
 
@@ -22,7 +25,12 @@ _CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0
 _CAP_NMDA = "urn:ietf:params:netconf:capability:nmda:1.0"
 _CAP_CONFIRMED_COMMIT = "urn:ietf:params:netconf:capability:confirmed-commit:1.1"
 _CAP_ROLLBACK_ON_ERROR = "urn:ietf:params:netconf:capability:rollback-on-error:1.0"
-_CAP_VALIDATE = "urn:ietf:params:netconf:capability:validate:1.0"
+_CAP_VALIDATE_1_0 = "urn:ietf:params:netconf:capability:validate:1.0"
+# RFC 6241 Sec 7.2: <test-option> MAY be sent only with :validate:1.1, and
+# Sec 8.6.4.1 makes "test-only" a 1.1-only value. A device that advertises
+# only 1.0 supports <validate> but not a dry run, so the two versions are
+# tracked separately.
+_CAP_VALIDATE_1_1 = "urn:ietf:params:netconf:capability:validate:1.1"
 
 # Every module pyang loaded for this client: module name -> namespace, merged
 # across the compiled roots. This is a COMPILE-TIME fact, not a device one, and
@@ -33,6 +41,394 @@ _CAP_VALIDATE = "urn:ietf:params:netconf:capability:validate:1.0"
 #     (RFC 7951 Sec 6.11), which is a schema property, so the navigators invert
 #     this map rather than asking the peer's <hello>.
 MODULE_NAMESPACES: dict[str, str] = {{ module_namespaces_literal }}
+
+# --- instance-identifier parsing, surgical diff and plan --------------------
+#
+# The plan builder is model-free: it consumes the `{instance-identifier:
+# value}` maps produced by `model_dump_instances()` and emits one
+# `<config>` for `<edit-config>` / `<edit-data>`. Paths follow RFC 7950
+# Sec 9.13 and RFC 7951 Sec 6.11, so the only schema fact needed is
+# module -> namespace, which is the compile-time map above.
+
+NETCONF_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
+_MISSING = object()
+
+
+def split_instance_path(path: str) -> list[str]:
+    """Split on ``/`` outside RFC 7950 Sec 14 quoted strings.
+
+    A predicate value is a quoted string with no escape mechanism, so a value
+    may legally contain ``/``, ``[`` or ``]``. Splitting naively on ``/`` would
+    turn a key like ``10.0.0.0/24`` into two segments.
+    """
+    if path.startswith("/"):
+        path = path[1:]
+    if not path:
+        return []
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    for index, char in enumerate(path):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "/":
+            parts.append(path[start:index])
+            start = index + 1
+    if quote is not None:
+        raise ValueError(f"unterminated quoted string in instance path {path!r}")
+    parts.append(path[start:])
+    if any(part == "" for part in parts):
+        raise ValueError(f"empty segment in instance path {path!r}")
+    return parts
+
+
+def parse_instance_path_segment(
+    segment: str,
+) -> tuple[str | None, str, list[tuple[str, str]]]:
+    """Parse ``module:name[key='value']...`` into its three parts."""
+    bracket = segment.find("[")
+    if bracket == -1:
+        head, rest = segment, ""
+    else:
+        head, rest = segment[:bracket], segment[bracket:]
+    if ":" in head:
+        prefix, name = head.split(":", 1)
+        if not prefix or not name or ":" in name:
+            raise ValueError(f"invalid module-qualified segment {segment!r}")
+    else:
+        prefix, name = None, head
+    if not name:
+        raise ValueError(f"empty node name in segment {segment!r}")
+
+    predicates: list[tuple[str, str]] = []
+    rest = rest.lstrip()
+    while rest:
+        if not rest.startswith("["):
+            raise ValueError(f"malformed predicate in segment {segment!r}")
+        equals = rest.find("=", 1)
+        if equals == -1:
+            raise ValueError(f"predicate without '=' in segment {segment!r}")
+        key = rest[1:equals].strip()
+        if not key:
+            raise ValueError(f"predicate without a name in segment {segment!r}")
+        index = equals + 1
+        while index < len(rest) and rest[index].isspace():
+            index += 1
+        if index >= len(rest) or rest[index] not in ("'", '"'):
+            raise ValueError(f"predicate value is not quoted in segment {segment!r}")
+        quote = rest[index]
+        index += 1
+        value_start = index
+        while index < len(rest) and rest[index] != quote:
+            index += 1
+        if index >= len(rest):
+            raise ValueError(f"unterminated predicate value in segment {segment!r}")
+        value = rest[value_start:index]
+        index += 1
+        while index < len(rest) and rest[index].isspace():
+            index += 1
+        if index >= len(rest) or rest[index] != "]":
+            raise ValueError(f"predicate is not closed in segment {segment!r}")
+        predicates.append((key, value))
+        rest = rest[index + 1:].lstrip()
+    return prefix, name, predicates
+
+
+def parse_instance_path(
+    path: str, module_namespaces: Mapping[str, str]
+) -> list[tuple[str, str, dict[str, str]]]:
+    """Turn an absolute instance-identifier into ``(namespace, tag, keys)``.
+
+    A bare segment inherits the nearest preceding module (RFC 7951 Sec 6.11),
+    so ``/ne:ne/shelf`` names ``ne:shelf``. The leftmost segment must be
+    module-qualified; without it the path is ambiguous.
+    """
+    if not path.startswith("/"):
+        raise ValueError(
+            f"instance path {path!r} must be absolute (RFC 7950 Sec 9.13)"
+        )
+    segments: list[tuple[str, str, dict[str, str]]] = []
+    previous: str | None = None
+    for raw in split_instance_path(path):
+        prefix, name, predicates = parse_instance_path_segment(raw)
+        module = prefix or previous
+        if module is None:
+            raise ValueError(
+                f"instance path {path!r} must module-qualify its leftmost node "
+                "(RFC 7951 Sec 6.11)"
+            )
+        namespace = module_namespaces.get(module)
+        if namespace is None:
+            raise ValueError(
+                f"instance path {path!r} names module {module!r}, which this "
+                "client was not compiled for"
+            )
+        segments.append((namespace, name, dict(predicates)))
+        previous = module
+    return segments
+
+
+def _is_leaf_list_entry(path: str) -> bool:
+    """True when the last segment is a ``[.='value']`` leaf-list entry."""
+    _, _, predicates = parse_instance_path_segment(path.rsplit("/", 1)[-1])
+    return len(predicates) == 1 and predicates[0][0] == "."
+
+
+def _leaf_list_base(path: str) -> str:
+    head, _, last = path.rpartition("/")
+    bracket = last.find("[")
+    node = last[:bracket] if bracket != -1 else last
+    return f"{head}/{node}" if head else node
+
+
+def _leaf_list_sequences(mapping: Mapping[str, Any]) -> dict[str, list[Any]]:
+    sequences: dict[str, list[Any]] = {}
+    for path, value in mapping.items():
+        if _is_leaf_list_entry(path):
+            sequences.setdefault(_leaf_list_base(path), []).append(value)
+    return sequences
+
+
+@dataclass(frozen=True)
+class Removal:
+    """One collapsed ``-`` entry.
+
+    ``kind`` is ``"leaf"``, ``"container"`` or ``"list-entry"``, so a caller
+    can tell before planning whether one leaf or a whole subtree will be
+    deleted. ``leaves`` keeps the leaf-level ``-`` lines for display.
+    """
+
+    path: str
+    kind: str
+    leaves: dict[str, Any] = field(default_factory=dict)
+
+
+class InstanceDiff(dict):
+    """``{"+": ..., "~": ..., "-": ...}`` with attribute aliases."""
+
+    def __init__(
+        self,
+        added: dict[str, Any],
+        changed: dict[str, Any],
+        removed: dict[str, Removal],
+    ) -> None:
+        super().__init__({"+": added, "~": changed, "-": removed})
+
+    @property
+    def added(self) -> dict[str, Any]:
+        return self["+"]
+
+    @property
+    def changed(self) -> dict[str, Any]:
+        return self["~"]
+
+    @property
+    def removed(self) -> dict[str, Removal]:
+        return self["-"]
+
+
+def _collapse_removals(
+    removed: Mapping[str, Any], intended_keys: Mapping[str, Any] | list[str]
+) -> dict[str, Removal]:
+    """Collapse leaf-level removals to the highest wholly-removed node.
+
+    A key leaf cannot be deleted (RFC 7950 Sec 7.8.2), and deleting a
+    container that still has an intended child would delete that child. So
+    walk up while the parent has no intended descendant, and remove there.
+    """
+    intended = list(intended_keys)
+    groups: dict[str, dict[str, Any]] = {}
+    for path, value in removed.items():
+        ancestor = path
+        while True:
+            parent = ancestor.rsplit("/", 1)[0]
+            if not parent:
+                break
+            if any(k == parent or k.startswith(parent + "/") for k in intended):
+                break
+            ancestor = parent
+        groups.setdefault(ancestor, {})[path] = value
+
+    collapsed: dict[str, Removal] = {}
+    for ancestor, leaves in groups.items():
+        last = ancestor.rsplit("/", 1)[-1]
+        if ancestor in leaves:
+            kind = "leaf"
+        elif "[" in last:
+            kind = "list-entry"
+        else:
+            kind = "container"
+        collapsed[ancestor] = Removal(path=ancestor, kind=kind, leaves=leaves)
+    return collapsed
+
+
+def diff_instances(
+    running_map: Mapping[str, Any], intended_map: Mapping[str, Any]
+) -> InstanceDiff:
+    """Classify two ``model_dump_instances()`` maps into ``{+, ~, -}``.
+
+    Leaf-lists are compared as ordered sequences: any difference (reorder,
+    add, remove) is one ``~`` keyed by the leaf-list node, carrying
+    ``(running_sequence, intended_sequence)``. ``-`` is already collapsed, so
+    ``plan()`` and ``reconcile()`` need only the diff.
+    """
+    running_ll = _leaf_list_sequences(running_map)
+    intended_ll = _leaf_list_sequences(intended_map)
+    changed: dict[str, Any] = {}
+    for base in dict.fromkeys([*running_ll, *intended_ll]):
+        running_sequence = running_ll.get(base, [])
+        intended_sequence = intended_ll.get(base, [])
+        if running_sequence != intended_sequence:
+            changed[base] = (running_sequence, intended_sequence)
+
+    added: dict[str, Any] = {}
+    removed: dict[str, Any] = {}
+    for path, value in intended_map.items():
+        if _is_leaf_list_entry(path):
+            continue
+        if path not in running_map:
+            added[path] = value
+        elif running_map[path] != value:
+            changed[path] = (running_map[path], value)
+    for path, value in running_map.items():
+        if _is_leaf_list_entry(path):
+            continue
+        if path not in intended_map:
+            removed[path] = value
+
+    return InstanceDiff(added, changed, _collapse_removals(removed, intended_map))
+
+
+@dataclass
+class PlanResult:
+    """Outcome of ``plan()``: the message, the device verdict, what ran."""
+
+    xml: str
+    ok: bool | None
+    errors: list[str] = field(default_factory=list)
+    validated: str = "none"
+
+
+def _lexical(value: Any) -> str:
+    """YANG lexical form for an XML text node (RFC 7950 Sec 9)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Enum):
+        return str(value.value)
+    if value is None:
+        raise ValueError("a plan value cannot be None")
+    return str(value)
+
+
+def _path_key(segment: tuple[str, str, dict[str, str]]) -> tuple[str, str, tuple]:
+    namespace, tag, keys = segment
+    return (namespace, tag, tuple(keys.items()))
+
+
+def _insert(
+    tree: dict,
+    segments: list[tuple[str, str, dict[str, str]]],
+    *,
+    value: Any = _MISSING,
+    operation: str | None = None,
+    leaf_list: list[tuple[str | None, Any]] | None = None,
+) -> None:
+    node_map = tree
+    node: dict | None = None
+    for segment in segments:
+        key = _path_key(segment)
+        if key not in node_map:
+            node_map[key] = {
+                "segment": segment,
+                "children": {},
+                "value": _MISSING,
+                "operation": None,
+                "leaf_list": None,
+            }
+        node = node_map[key]
+        node_map = node["children"]
+    if node is None:
+        raise ValueError("an edit path needs at least one segment")
+    if value is not _MISSING:
+        node["value"] = value
+    if operation is not None:
+        node["operation"] = operation
+    if leaf_list is not None:
+        node["leaf_list"] = leaf_list
+
+
+def _render(node_map: dict, parent: etree._Element) -> None:
+    for node in node_map.values():
+        namespace, tag, keys = node["segment"]
+        if node["leaf_list"] is not None:
+            # A leaf-list has no wrapper element; its entries are repeated
+            # siblings (RFC 7950 Sec 7.7). Remove old values, then merge the
+            # intended ones in order.
+            for operation, value in node["leaf_list"]:
+                element = etree.SubElement(parent, "{" + namespace + "}" + tag)
+                if operation:
+                    element.set("{" + NETCONF_NS + "}operation", operation)
+                element.text = _lexical(value)
+            continue
+
+        element = etree.Element(
+            "{" + namespace + "}" + tag, nsmap={None: namespace}
+        )
+        if node["operation"]:
+            element.set("{" + NETCONF_NS + "}operation", node["operation"])
+        for key, key_value in keys.items():
+            key_element = etree.SubElement(element, "{" + namespace + "}" + key)
+            key_element.text = key_value
+        if node["value"] is not _MISSING:
+            element.text = _lexical(node["value"])
+        _render(node["children"], element)
+        parent.append(element)
+
+
+def build_config(
+    diff: Mapping[str, Any], module_namespaces: Mapping[str, str]
+) -> etree._Element:
+    """Build one ``<config>`` from ``{+, ~, -}``: the surgical edit body."""
+    tree: dict = {}
+    for path, value in diff["+"].items():
+        _insert(tree, parse_instance_path(path, module_namespaces), value=value)
+
+    for path, pair in diff["~"].items():
+        old, new = pair
+        if isinstance(old, (list, tuple)) and isinstance(new, (list, tuple)):
+            entries: list[tuple[str | None, Any]] = [
+                ("remove", item) for item in old
+            ]
+            entries.extend((None, item) for item in new)
+            _insert(
+                tree,
+                parse_instance_path(path, module_namespaces),
+                leaf_list=entries,
+            )
+        else:
+            _insert(tree, parse_instance_path(path, module_namespaces), value=new)
+
+    for removal in diff["-"].values():
+        _insert(
+            tree,
+            parse_instance_path(removal.path, module_namespaces),
+            operation="remove",
+        )
+
+    root = etree.Element("{" + NETCONF_NS + "}config", nsmap={None: NETCONF_NS})
+    _render(tree, root)
+    return root
+
+
+def _c14n(element: etree._Element | None) -> bytes:
+    if element is None:
+        return b""
+    return etree.tostring(element, method="c14n")
+
 
 # SSH public-key authentication. `DEVICE_SSH_KEY` points at the private key
 # (or at its OpenSSH certificate, which paramiko resolves to the adjacent
@@ -359,6 +755,15 @@ class NetconfClient:
     alternatives; supplying both is rejected.
     """
 
+    @staticmethod
+    def diff_instances(running_map, intended_map) -> InstanceDiff:
+        """Classify two ``model_dump_instances()`` maps into ``{+, ~, -}``.
+
+        The result is already collapsed, so ``plan()`` and ``reconcile()``
+        need only the diff: no running or intended map is required.
+        """
+        return diff_instances(running_map, intended_map)
+
     def __init__(self, loopback_ip: str | None = None, management_ip: str | None = None, port: int = 830, username: str | None = None, password: str | None = None, verify: bool = True, timeout: int = 60, auto_commit: bool = False, log_bodies: bool = False, key_filename: str | os.PathLike[str] | list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] | None = None, passphrase: str | None = None, **kwargs):
         # Back-compat alias: older generated code / call sites used
         # hostkey_verify explicitly. `verify` wins when both are given.
@@ -549,12 +954,18 @@ class NetconfClient:
         self.has_nmda = _has_capability(self.server_capabilities, _CAP_NMDA)
         self.has_confirmed_commit = _has_capability(self.server_capabilities, _CAP_CONFIRMED_COMMIT)
         self.has_rollback_on_error = _has_capability(self.server_capabilities, _CAP_ROLLBACK_ON_ERROR)
-        # Plain attributes, not methods, for every capability flag: the five
+        # Plain attributes, not methods, for every capability flag: the
         # siblings above are attributes, and a lone method among them is a
         # trap -- `if client.has_validate:` is always truthy (it tests a bound
         # method), so validation would be silently skipped on a device that
         # does not implement it.
-        self.has_validate = _has_capability(self.server_capabilities, _CAP_VALIDATE)
+        #
+        # RFC 6241 Sec 8.6.4.1: 1.1 extends 1.0, so `has_validate` is true for
+        # either version (both support the <validate> operation). `test-only`
+        # is a 1.1 addition and Sec 7.2 allows <test-option> only with 1.1,
+        # hence the separate flag.
+        self.has_validate_1_1 = _has_capability(self.server_capabilities, _CAP_VALIDATE_1_1)
+        self.has_validate = self.has_validate_1_1 or _has_capability(self.server_capabilities, _CAP_VALIDATE_1_0)
         if self.has_nmda:
             log.info("Device supports NMDA (RFC 8526): reads/writes routed via get-data/edit-data.")
         else:
@@ -707,7 +1118,12 @@ class NetconfClient:
             if extra:
                 error_msg += f" - {extra}"
             log.error(error_msg)
-            raise RuntimeError(error_msg) from e
+            error = RuntimeError(error_msg)
+            # Keep the RFC 6241 <error-tag> machine-readable: plan() falls back
+            # to candidate staging on operation-not-supported/invalid-value
+            # instead of string-matching the human message.
+            setattr(error, "rpc_error_tag", _rpcerror_attr(e, "tag"))
+            raise error from e
         except (OSError, ValueError) as e:
             # A transport or parse failure is not an RPC-level error and has no
             # errlist; surface it unchanged rather than losing it.
@@ -720,8 +1136,14 @@ class NetconfClient:
         log.info("NETCONF response: %s ok (%.2fs)", name, elapsed)
         return reply
 
-    def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
-        """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running."""
+    def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | list[etree._Element] | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:
+        """Capability-routed retrieval. Defaults to operational state if retrieving all, otherwise running.
+
+        ``filter_xml`` may be one selection node or a list of them; a list is
+        how ``Data.retrieve()`` selects several compiled roots in one RPC.
+        ncclient's ``build_filter`` wraps a list in a single
+        ``<filter type="subtree">`` (RFC 6241 Sec 6).
+        """
         requested_depth = validate_depth(depth)
         if source is None:
             source = "running" if content == "config" else "operational"
@@ -751,7 +1173,11 @@ class NetconfClient:
             
             if filter_xml is not None:
                 sf = etree.SubElement(rpc, "{" + NMDA_NS + "}subtree-filter")
-                sf.append(filter_xml)
+                if isinstance(filter_xml, (list, tuple)):
+                    for item in filter_xml:
+                        sf.append(item)
+                else:
+                    sf.append(filter_xml)
                 
             if content in ("config", "nonconfig"):
                 cf = etree.SubElement(rpc, "{" + NMDA_NS + "}config-filter")
@@ -781,6 +1207,9 @@ class NetconfClient:
 
         else:
             # Fallback to Legacy <get> and <get-config> (RFC 6241)
+            # A single selection element becomes ncclient's (type, criteria)
+            # tuple; a list is passed through and build_filter wraps every
+            # entry in one <filter type="subtree">.
             if isinstance(filter_xml, etree._Element):
                 filter_xml = ("subtree", etree.tostring(filter_xml, encoding="unicode"))
             kwargs = {"with_defaults": with_defaults} if with_defaults else {}
@@ -801,11 +1230,22 @@ class NetconfClient:
                 data_node = root.find("data")
             return data_node
 
-    def edit(self, config_xml: str | etree._Element, target: str | None = None, default_operation: str = "merge") -> bool:
-        """Capability-routed edits. Uses <edit-data> if NMDA is supported, otherwise raw <edit-config>."""
+    def edit(self, config_xml: str | etree._Element, target: str | None = None, default_operation: str = "merge", test_option: str | None = None, commit: bool | None = None) -> bool:
+        """Capability-routed edits. Uses <edit-data> if NMDA is supported, otherwise raw <edit-config>.
+
+        ``test_option="test-only"`` validates without applying and requires
+        :validate:1.1 (RFC 6241 Sec 7.2, Sec 8.6.4.1). ``commit`` overrides
+        ``auto_commit`` for this call; ``plan()`` passes False so a dry run can
+        never commit.
+        """
         target = target or self.default_target
         if isinstance(config_xml, str):
             config_xml = etree.fromstring(config_xml)
+        if self.has_nmda and test_option:
+            raise ValueError(
+                "NMDA <edit-data> has no <test-option> (RFC 8526 Sec 2.2); "
+                "stage to candidate and call validate() instead"
+            )
 
         if self.has_nmda:
             # Construct NMDA <edit-data> (RFC 8526)
@@ -844,6 +1284,14 @@ class NetconfClient:
             def_op = etree.SubElement(rpc, "{" + NC_NS + "}default-operation")
             def_op.text = default_operation
 
+            # RFC 6241 Sec 7.2: <test-option> may be sent only with
+            # :validate:1.1; "test-only" validates without applying
+            # (Sec 8.6.4.1). Ordered per the YANG input: target,
+            # default-operation, test-option, error-option, config.
+            if test_option:
+                test_opt = etree.SubElement(rpc, "{" + NC_NS + "}test-option")
+                test_opt.text = test_option
+
             # RFC 6241 Sec 7.2: <error-option>rollback-on-error makes the server
             # stop at the first error-severity <rpc-error> and restore the
             # datastore to its complete state at the start of THIS edit-config,
@@ -875,9 +1323,142 @@ class NetconfClient:
             reply = self._handle_rpc(self._mc.dispatch, rpc)
             success = reply.ok
 
-        if success and target == "candidate" and self.auto_commit:
+        effective_commit = self.auto_commit if commit is None else commit
+        if success and target == "candidate" and effective_commit:
             self.commit()
         return success
+
+    def plan(self, diff, *, target: str | None = None, show: bool = True) -> PlanResult:
+        """Show the surgical edit and dry-run it on the device.
+
+        Tier order: ``test-only`` when :validate:1.1 is advertised (no write),
+        else candidate staging + ``<validate>`` + discard, else message only.
+        A plan never applies to running and never commits.
+        """
+        config = build_config(diff, self.module_namespaces)
+        xml = etree.tostring(config, pretty_print=True, encoding="unicode")
+        if show:
+            print(xml)
+        target = target or self.default_target
+
+        if self.has_nmda:
+            return self._plan_via_candidate(config, xml)
+
+        if self.has_validate_1_1:
+            try:
+                ok = self.edit(
+                    config, target=target, test_option="test-only", commit=False
+                )
+            except RuntimeError as exc:
+                tag = getattr(exc, "rpc_error_tag", None)
+                if tag not in ("operation-not-supported", "invalid-value"):
+                    raise
+                log.warning(
+                    "Device rejected test-only (%s); falling back to candidate staging.",
+                    tag,
+                )
+                return self._plan_via_candidate(config, xml)
+            return PlanResult(xml=xml, ok=ok, validated="syntax")
+
+        if self.has_candidate:
+            return self._plan_via_candidate(config, xml)
+
+        log.warning(
+            "Device offers neither :validate:1.1 nor :candidate; the plan is "
+            "message-only and was NOT validated on the device."
+        )
+        return PlanResult(xml=xml, ok=None, validated="none")
+
+    def _plan_via_candidate(self, config: etree._Element, xml: str) -> PlanResult:
+        if not self.has_candidate:
+            raise RuntimeError(
+                "Device has no :candidate datastore, so a plan cannot be staged "
+                "for validation."
+            )
+        if not self.lock("candidate"):
+            raise RuntimeError(
+                "Could not lock candidate; refusing to stage a plan."
+            )
+        staged = False
+        try:
+            if not self._candidate_is_clean():
+                raise RuntimeError(
+                    "candidate already holds uncommitted changes; refusing to "
+                    "stage a plan (discard-changes would destroy them)."
+                )
+            staged = True
+            ok = self.edit(config, target="candidate", commit=False)
+            validated = "edit"
+            if ok and self.has_validate:
+                ok = self.validate(source="candidate")
+                validated = "datastore"
+            return PlanResult(xml=xml, ok=ok, validated=validated)
+        finally:
+            if staged:
+                try:
+                    self.discard_changes()
+                except Exception:
+                    log.exception(
+                        "Failed to discard the staged plan; candidate may still hold it."
+                    )
+            try:
+                self.unlock("candidate")
+            except Exception:
+                log.exception("Failed to release the candidate lock after plan().")
+
+    def _candidate_is_clean(self) -> bool:
+        candidate = self.retrieve(source="candidate", content="config")
+        running = self.retrieve(source="running", content="config")
+        return _c14n(candidate) == _c14n(running)
+
+    def reconcile(self, diff, *, target: str | None = None, commit: bool = True) -> bool:
+        """Apply the surgical edit and (by default) commit it.
+
+        ``commit=True`` is the default even when ``auto_commit`` is False:
+        ``plan()`` is expected to run first. ``auto_commit`` never applies
+        here, so the edit cannot be committed before validation.
+        """
+        config = build_config(diff, self.module_namespaces)
+        target = target or self.default_target
+
+        if target == "candidate" and self.has_candidate:
+            if not self.lock("candidate"):
+                raise RuntimeError(
+                    "Could not lock candidate; refusing to reconcile."
+                )
+            staged = False
+            try:
+                if not self._candidate_is_clean():
+                    raise RuntimeError(
+                        "candidate already holds uncommitted changes; refusing "
+                        "to reconcile (commit would include them)."
+                    )
+                staged = True
+                ok = self.edit(config, target="candidate", commit=False)
+                if ok and self.has_validate:
+                    ok = self.validate(source="candidate")
+                if ok and commit:
+                    ok = self.commit()
+                if not ok:
+                    self.discard_changes()
+                    staged = False
+                return ok
+            except Exception:
+                if staged:
+                    try:
+                        self.discard_changes()
+                    except Exception:
+                        log.exception(
+                            "Failed to discard the failed reconcile; candidate may still hold it."
+                        )
+                raise
+            finally:
+                try:
+                    self.unlock("candidate")
+                except Exception:
+                    log.exception("Failed to release the candidate lock after reconcile().")
+
+        return self.edit(config, target=target, commit=False)
 
     def commit(self) -> bool:
         if not self.has_candidate:

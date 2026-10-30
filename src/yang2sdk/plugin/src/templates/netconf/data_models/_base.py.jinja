@@ -10,6 +10,8 @@ from decimal import Decimal
 import re
 
 from ..session_manager import MODULE_NAMESPACES
+from ..session_manager import parse_instance_path_segment as _parse_segment
+from ..session_manager import split_instance_path as _split_instance_path
 
 NETCONF_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
 
@@ -368,88 +370,6 @@ def _collect_instances(
                 )
         else:
             out[child_path] = _instance_value(value)
-
-
-def _split_instance_path(path: str) -> list[str]:
-    """Split on ``/`` outside RFC 7950 Sec 14 quoted strings.
-
-    A predicate value is a quoted string with no escape mechanism, so a value
-    may legally contain ``/``, ``[`` or ``]``. Splitting naively on ``/`` would
-    turn a key like ``10.0.0.0/24`` into two segments.
-    """
-    if path.startswith("/"):
-        path = path[1:]
-    if not path:
-        return []
-    parts: list[str] = []
-    start = 0
-    quote: str | None = None
-    for index, char in enumerate(path):
-        if quote is not None:
-            if char == quote:
-                quote = None
-            continue
-        if char in ("'", '"'):
-            quote = char
-        elif char == "/":
-            parts.append(path[start:index])
-            start = index + 1
-    if quote is not None:
-        raise ValueError(f"unterminated quoted string in instance path {path!r}")
-    parts.append(path[start:])
-    if any(part == "" for part in parts):
-        raise ValueError(f"empty segment in instance path {path!r}")
-    return parts
-
-
-def _parse_segment(segment: str) -> tuple[str | None, str, list[tuple[str, str]]]:
-    """Parse ``module:name[key='value']...`` into its three parts."""
-    bracket = segment.find("[")
-    if bracket == -1:
-        head, rest = segment, ""
-    else:
-        head, rest = segment[:bracket], segment[bracket:]
-    if ":" in head:
-        prefix, name = head.split(":", 1)
-        if not prefix or not name or ":" in name:
-            raise ValueError(f"invalid module-qualified segment {segment!r}")
-    else:
-        prefix, name = None, head
-    if not name:
-        raise ValueError(f"empty node name in segment {segment!r}")
-
-    predicates: list[tuple[str, str]] = []
-    rest = rest.lstrip()
-    while rest:
-        if not rest.startswith("["):
-            raise ValueError(f"malformed predicate in segment {segment!r}")
-        equals = rest.find("=", 1)
-        if equals == -1:
-            raise ValueError(f"predicate without '=' in segment {segment!r}")
-        key = rest[1:equals].strip()
-        if not key:
-            raise ValueError(f"predicate without a name in segment {segment!r}")
-        index = equals + 1
-        while index < len(rest) and rest[index].isspace():
-            index += 1
-        if index >= len(rest) or rest[index] not in ("'", '"'):
-            raise ValueError(f"predicate value is not quoted in segment {segment!r}")
-        quote = rest[index]
-        index += 1
-        value_start = index
-        while index < len(rest) and rest[index] != quote:
-            index += 1
-        if index >= len(rest):
-            raise ValueError(f"unterminated predicate value in segment {segment!r}")
-        value = rest[value_start:index]
-        index += 1
-        while index < len(rest) and rest[index].isspace():
-            index += 1
-        if index >= len(rest) or rest[index] != "]":
-            raise ValueError(f"predicate is not closed in segment {segment!r}")
-        predicates.append((key, value))
-        rest = rest[index + 1:].lstrip()
-    return prefix, name, predicates
 
 
 def _root_segments(

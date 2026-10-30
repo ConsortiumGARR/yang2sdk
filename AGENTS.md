@@ -270,13 +270,16 @@ and say why; never weaken the client default to make a test pass.
 `candidate` is invisible in `running` until an explicit `<commit>`. Any test asserting a read-back
 of a NETCONF write must run edit → `validate` → `commit`, and must skip `validate` when `:validate`
 is not advertised (RFC 6241 §8.6.4.1 makes it optional).
-- Every capability flag (`has_validate`, `has_candidate`, `has_nmda`,
+- Every capability flag (`has_validate`, `has_validate_1_1`, `has_candidate`, `has_nmda`,
   `has_writable_running`, `has_confirmed_commit`, `has_rollback_on_error`) is a
   plain **bool attribute**, never a method or property. `getattr(client,
   "has_validate", False)` therefore returns the real flag, and
   `if client.has_validate:` is a correct test. One of these was briefly a method
-  while its five siblings were attributes, which made `if client.has_validate:`
-  always true and silently skipped validation — keep the six consistent.
+  while its siblings were attributes, which made `if client.has_validate:`
+  always true and silently skipped validation — keep the seven consistent.
+  `has_validate` is true for `:validate:1.0` **or** `:validate:1.1` (1.1 extends
+  1.0); `has_validate_1_1` is the separate gate for `<test-option>test-only</test-option>`,
+  which RFC 6241 §7.2 permits only with 1.1 and §8.6.4.1 adds to it.
 - Do not add tests that require a live production device.
 - Until golden fixtures land: verify template/IR changes by (a) generating a sample client, (b) running `ruff` + `ty` + `pyrefly`, (c) importing the sample and validating a live-simulator or lab-captured payload. State exactly what was and was not executed in the PR/summary.
 

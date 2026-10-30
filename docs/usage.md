@@ -90,7 +90,7 @@ client.commit()
 
 `commit()`, `validate()`, `lock()`, `unlock()` and `discard_changes()` are client methods; `discard_changes()` throws the candidate away (RFC 6241 §8.3.4.2), leaving `running` untouched. `auto_commit=True` commits after *every* edit, which is why it is opt-in and warns. As a context manager the client locks on entry and, on exception, discards the candidate and releases the lock.
 
-Reads and writes route through NMDA (`<get-data>` / `<edit-data>`, RFC 8526) when the exact `:nmda:1.0` capability URI is present, else legacy `<get>` / `<get-config>` / `<edit-config>` (RFC 6241). `default_target` is `candidate` when the device offers `:candidate`, else `running`. The six capability flags are plain booleans, so `if client.has_validate:` is the correct test: `has_candidate`, `has_writable_running`, `has_nmda`, `has_validate`, `has_confirmed_commit`, `has_rollback_on_error`.
+Reads and writes route through NMDA (`<get-data>` / `<edit-data>`, RFC 8526) when the exact `:nmda:1.0` capability URI is present, else legacy `<get>` / `<get-config>` / `<edit-config>` (RFC 6241). `default_target` is `candidate` when the device offers `:candidate`, else `running`. The seven capability flags are plain booleans, so `if client.has_validate:` is the correct test: `has_candidate`, `has_writable_running`, `has_nmda`, `has_validate`, `has_validate_1_1`, `has_confirmed_commit`, `has_rollback_on_error`.
 
 `edit()` emits `<error-option>rollback-on-error</error-option>` (RFC 6241 §7.2) only when `target == "running"` and the device advertises `:rollback-on-error` — not on `candidate` (use `<discard-changes>`), not on the NMDA `<edit-data>` branch (RFC 8526 §3.1.2 already behaves that way). Callers writing `running` are expected to hold a lock first (§8.5.1).
 
@@ -122,6 +122,34 @@ changed = {
 The inverse is `Model.model_validate_instances(instance_path, mapping)` / `model_validate_instances_json`. It parses the same path syntax (quoted key values may contain `/`, `[` or `]`), fills a list entry's key leaves from its predicates, and passes the assembled tree to `model_validate`, so YANG constraints, choices and required fields still apply. The map is an intent fragment rather than a complete datastore: a missing mandatory leaf fails validation, an empty container or presence container with no leaves cannot be represented, and list/leaf-list order follows the map's iteration order — use `sort_keys=False` for a JSON round-trip when `ordered-by user` order matters.
 
 This API is NETCONF-only, like `instance_identifier()`: RESTCONF addresses nodes by a resource URI (RFC 8040 §3.5.3), not an instance-identifier.
+
+## Diff, plan and reconcile
+
+The comparison primitive extends to a surgical write pipeline. `client.data.retrieve()` fetches every compiled top-level node in one RPC, using a multi-root subtree filter that names only compiled roots — so the aggregate model never sees a module this client was not compiled for.
+
+```python
+running = client.data.retrieve(content="config", depth="unbounded")
+running_map = running.model_dump_instances(content="config")
+
+intended = Model.model_validate_instances(root, intended_map)  # offline schema check
+intended_map = intended.model_dump_instances(root, content="config")
+
+diff = client.diff_instances(running_map, intended_map)  # {+, ~, -}
+client.plan(diff)  # show + dry run
+client.reconcile(diff)  # apply + commit
+```
+
+`fields=["ne:ne/shelf", "system:system/hostname"]` restricts the retrieve to those schema paths (grouped by root into one filter); on a node navigator the same argument is relative, `client.data.ne_ne.retrieve(fields=["shelf"])`. A field resolves by Python name or YANG name, and an unknown one raises instead of silently selecting nothing.
+
+`diff_instances()` returns `{"+": {path: value}, "~": {path: (running, intended)}, "-": {path: Removal}}`. Leaf-lists are compared as sequences: any difference (reorder, add, remove) is one `~` keyed by the leaf-list node, carrying `(running_sequence, intended_sequence)`. `-` is already collapsed to the highest wholly-removed node, and `Removal.kind` is `leaf`, `container` or `list-entry`, so the plan's granularity is visible before it is built. Collapsing in `diff_instances()` (which has both maps) is what lets `plan()` and `reconcile()` take the diff alone.
+
+`plan()` builds one `<config>` — merge for `+`/`~`, `nc:operation="remove"` for `-`, remove-then-merge for a leaf-list — prints it, and dry-runs it. The tiers are: `test-only` when the device advertises `:validate:1.1` (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds `test-only`), otherwise candidate staging + `<validate>` + `<discard-changes>`, otherwise message-only with `ok=None`. A plan never applies to running and never commits, even with `auto_commit=True`. `PlanResult.validated` reports which check ran (`syntax`, `edit`, `datastore` or `none`). The candidate tier locks first, refuses a candidate that already differs from running (so `discard-changes` cannot destroy another session's work), and discards only after staging.
+
+`reconcile()` sends the same bytes and commits by default on a candidate, even when `auto_commit=False` — `plan()` is expected first. It passes `commit=False` to `edit()`, then validates and commits itself, so `auto_commit` can never commit before validation.
+
+The intended map must cover the same scope as the retrieve. If `fields` selects one subtree but the intended map covers the whole config, every unretrieved sibling looks like `+`; filter both maps to the same roots before diffing.
+
+Both `Data.retrieve()` and the node navigators default to `with_defaults="report-all"`, so a running map contains default leaves. If the intended model omits them, they appear as `-` removals; pass `with_defaults="explicit"` to the retrieve (or `exclude_defaults=True` to `model_dump_instances`) when the diff should ignore defaults.
 
 ## RPCs and actions
 
