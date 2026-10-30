@@ -18,6 +18,7 @@ from typing import Any, ClassVar, cast, get_args
 import pytest
 
 from yang2sdk import layout
+from yang2sdk.cli import model_gaps
 from yang2sdk.cli.compiler import resolve_features
 from yang2sdk.cli.features import (
     parse_capability_features,
@@ -534,6 +535,52 @@ def _gen_restconf(yang_text: str, name: str, tmp_path):
     assert pkg_root.is_dir(), f"expected package at {pkg_root}"
     sys.path.insert(0, str(pkg_root.parent))
     return str(pkg_root.parent), pkg_root.name
+
+
+def _gen_netconf(
+    yang_text: str,
+    name: str,
+    tmp_path,
+    extra: dict[str, str] | None = None,
+) -> Path:
+    """Generate a NETCONF client into ``tmp_path/<name>_netconf``; return it.
+
+    ``extra`` writes additional modules beside the root and passes them as
+    further roots, which is how a cross-module `augment` gets compiled in.
+    """
+    yang = tmp_path / f"{name}.yang"
+    yang.write_text(yang_text)
+    roots = [str(yang)]
+    for filename, text in (extra or {}).items():
+        path = tmp_path / filename
+        path.write_text(text)
+        roots.append(str(path))
+    out = tmp_path / f"{name}_netconf"
+    code = (
+        "import sys; from yang2sdk.cli.compiler import run_compiler; "
+        "run_compiler('netconf', sys.argv[1:])"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            *roots,
+            "--device",
+            name,
+            "--yang-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    return out
 
 
 def test_restconf_unwraps_a_reply_nested_under_the_ancestor(tmp_path):
@@ -1522,6 +1569,898 @@ def test_netconf_identityref_binding_and_normalization(tmp_path):
     assert b"tbase:base-id" in (
         payload if isinstance(payload, bytes) else payload.encode()
     )
+
+
+NSMAP_YANG = """module tnsmap {
+  prefix tn;
+  namespace "urn:test:tnsmap";
+  import ietf-netconf {
+    prefix nc;
+  }
+  revision 2026-01-01;
+  container top {
+    leaf name {
+      type string;
+    }
+  }
+  rpc do-thing {
+    input {
+      leaf arg {
+        type string;
+      }
+    }
+    output {
+      leaf result {
+        type string;
+      }
+    }
+  }
+}
+"""
+
+
+def test_netconf_declares_the_module_nsmap_once_and_models_inherit_it(tmp_path):
+    """The per-module nsmap is emitted once, on an intermediate base class.
+
+    It used to be re-declared on every model class -- identical for all of them,
+    because `namespace` and `imports_nsmap` are per-module (measured on the G30
+    tree: the same 25-entry map on 1358 classes, 1.9 MiB of `data_models/`).
+    pydantic-xml merges a subclass nsmap into the parent's
+    (`BaseXmlModel.__init_subclass__`: `dict(parent_nsmap, **nsmap)`), so one
+    declaration is enough -- but the emitter must keep emitting it, or the
+    models lose `nc` / the default namespace.
+
+    Two things this pins that the earlier template got wrong:
+    * a module that imports ietf-netconf (prefix `nc`) emitted `"nc"` twice in
+      the same dict literal;
+    * the RPC envelopes derive from `NetconfXmlModel`, not `NetconfBaseModel`,
+      so they need their own base and cannot share the data-model one.
+    """
+    out = _gen_netconf(NSMAP_YANG, "tnsmap", tmp_path)
+    source = (_package(out) / "data_models" / "tnsmap.py").read_text()
+
+    declarations = [
+        line
+        for line in source.splitlines()
+        if line.startswith("class ") and "nsmap={" in line
+    ]
+    assert [line.split("(")[0] for line in declarations] == [
+        "class _ModuleBase",
+        "class _ModuleRpcBase",
+    ], declarations
+    for line in declarations:
+        assert line.count('"nc":') == 1, f"duplicate nc entry: {line}"
+        assert '"nc": "urn:ietf:params:xml:ns:netconf:base:1.0"' in line
+        assert '"": "urn:test:tnsmap"' in line
+        assert '"tn": "urn:test:tnsmap"' in line
+    assert "nsmap={" not in "".join(
+        line
+        for line in source.splitlines()
+        if line.startswith("class ") and not line.startswith("class _")
+    ), "a model class re-declares the nsmap"
+
+    models = _import(out, "data_models.tnsmap")
+    top = models.Top
+    assert top.__xml_nsmap__ == {
+        "nc": "urn:ietf:params:xml:ns:netconf:base:1.0",
+        "": "urn:test:tnsmap",
+        "tn": "urn:test:tnsmap",
+    }, top.__xml_nsmap__
+    # The inherited map has to reach the serializer, not just the class:
+    # `nc_operation` is an attribute resolved through the model nsmap
+    # (RFC 6241 Sec 7.1), and the element carries the module's default ns.
+    inst = top(name="x")
+    inst.nc_operation = "merge"
+    xml = inst.to_xml()
+    xml = xml if isinstance(xml, bytes) else xml.encode()
+    assert b'nc:operation="merge"' in xml, xml
+    assert b'xmlns="urn:test:tnsmap"' in xml, xml
+    # The RPC envelope comes from the other base and still gets the same map.
+    assert models.DoThing.__xml_nsmap__ == top.__xml_nsmap__
+    assert "nc_operation" not in models.DoThing.model_fields
+
+    # model_gaps inventories model classes by walking module attributes; the
+    # nsmap bases are plumbing and must not be counted as models.
+    surface = model_gaps.introspect(out, max_depth=8, max_paths=5000)
+    assert "tnsmap.Top" in surface.model_classes, surface.model_classes
+    assert not [
+        name for name in surface.model_classes if name.split(".", 1)[1].startswith("_")
+    ], surface.model_classes
+
+
+INSTANCE_ID_YANG = """module tid {
+  yang-version 1.1;
+  prefix ti;
+  namespace "urn:test:tid";
+  revision 2026-01-01;
+
+  container system {
+    leaf hostname {
+      type string;
+    }
+    leaf level {
+      type string;
+      default "low";
+    }
+    leaf-list dns {
+      type string;
+    }
+    leaf uptime {
+      config false;
+      type uint32;
+    }
+    list user {
+      key "name";
+      leaf name {
+        type string;
+      }
+      leaf enabled {
+        type boolean;
+      }
+      leaf-list role {
+        type string;
+      }
+      leaf last-login {
+        config false;
+        type string;
+      }
+    }
+    list server {
+      key "ip port";
+      leaf ip {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+    }
+    list port-first {
+      key "port ip";
+      leaf ip {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+      leaf descr {
+        type string;
+      }
+    }
+    list flag {
+      key "on";
+      leaf on {
+        type boolean;
+      }
+    }
+    list marker {
+      key "tag";
+      leaf tag {
+        type empty;
+      }
+    }
+    list mode {
+      key "m";
+      leaf m {
+        type enumeration {
+          enum foo-bar;
+          enum baz-qux;
+          enum alpha;
+          enum beta;
+        }
+      }
+      leaf note {
+        type string;
+      }
+    }
+    container stats {
+      config false;
+      list sample {
+        leaf counter {
+          type uint32;
+        }
+      }
+    }
+  }
+
+  rpc do-thing {
+    input {
+      leaf arg {
+        type string;
+      }
+    }
+  }
+}
+"""
+
+INSTANCE_ID_AUGMENT_YANG = """module tidadd {
+  yang-version 1.1;
+  prefix ta;
+  namespace "urn:test:tidadd";
+  import tid { prefix ti; }
+  revision 2026-01-01;
+
+  augment "/ti:system/ti:user" {
+    container prefs {
+      list addr {
+        key "ip";
+        leaf ip {
+          type string;
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def test_instance_identifier_names_each_node_by_its_defining_module(tmp_path):
+    """`instance_identifier()` renders RFC 7950 Sec 9.13 / RFC 7951 Sec 6.11.
+
+    RFC 7951 Sec 6.11 gives the exact shape:
+
+        /ietf-interfaces:interfaces/interface[name='eth0']/ietf-ip:ipv4/ip
+
+    -- the leftmost node always qualified, a later node qualified only when its
+    module differs from its parent's, and the same rule for key names. RFC 7950
+    Sec 9.13 adds that every key of a list entry needs a predicate, and Sec 14
+    defines `quoted-string` with no escape mechanism.
+
+    The qualification is a SCHEMA fact, so it must come from the compile-time
+    module map, not from `client.namespace_modules` (which the device's <hello>
+    overlays). The navigators are built with `client=None` here precisely to
+    pin that no transport is needed to name a path.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    nav = _import(out, "data_navigators")
+    base = _import(out, "data_navigators._base")
+    session = _import(out, "session_manager")
+
+    # One literal, inverted once: the navigator map is derived from the
+    # session manager's compile-time map rather than re-declared.
+    assert session.MODULE_NAMESPACES == {
+        "tid": "urn:test:tid",
+        "tidadd": "urn:test:tidadd",
+    }
+    assert base.NAMESPACE_MODULES == {
+        "urn:test:tid": "tid",
+        "urn:test:tidadd": "tidadd",
+    }
+
+    data = nav.Data(None, [])
+    system = data.tid_system
+
+    # Same module all the way down: only the top-level node is qualified.
+    assert system.instance_identifier() == "/tid:system"
+    assert (
+        system.user("alice").instance_identifier() == "/tid:system/user[name='alice']"
+    )
+
+    # RFC 7950 Sec 9.13: one predicate per key, in key order.
+    assert (
+        system.server("192.0.2.1", 80).instance_identifier()
+        == "/tid:system/server[ip='192.0.2.1'][port='80']"
+    )
+
+    # RFC 7950 Sec 9.7.2: a boolean key's lexical form is true/false, not
+    # Python's True/False.
+    assert system.flag(True).instance_identifier() == "/tid:system/flag[on='true']"
+
+    # RFC 7950 Sec 9.6.4: an enumeration key is its YANG name (`foo-bar`), not
+    # the generated Python member name (`FOO_BAR`).
+    assert (
+        system.mode("foo-bar").instance_identifier() == "/tid:system/mode[m='foo-bar']"
+    )
+
+    # RFC 7950 Sec 9.13: key predicates follow the `key` statement, even when
+    # the leaves are declared in the opposite order.
+    assert (
+        system.port_first(443, "198.51.100.1").instance_identifier()
+        == "/tid:system/port-first[port='443'][ip='198.51.100.1']"
+    )
+
+    # RFC 7950 Sec 9.13: a key of type empty has no value and is a zero-length
+    # string; None is refused rather than rendered as "None".
+    assert system.marker("").instance_identifier() == "/tid:system/marker[tag='']"
+    with pytest.raises(ValueError, match="cannot be None"):
+        system.user(None).instance_identifier()
+
+    # RFC 7950 Sec 7.17: an augmented node keeps its own module, so the path
+    # qualifies at the module boundary and drops the prefix again after it.
+    assert (
+        system.user("alice").prefs.instance_identifier()
+        == "/tid:system/user[name='alice']/tidadd:prefs"
+    )
+    assert (
+        system.user("alice").prefs.addr("10.0.0.1").instance_identifier()
+        == "/tid:system/user[name='alice']/tidadd:prefs/addr[ip='10.0.0.1']"
+    )
+
+    # RFC 7950 Sec 14: either quote style, whichever the value allows.
+    assert (
+        system.user("o'brien").instance_identifier()
+        == '/tid:system/user[name="o\'brien"]'
+    )
+
+    # A value holding both quote characters has no representable form.
+    with pytest.raises(ValueError, match="both quote characters"):
+        system.user("both'\"quotes").instance_identifier()
+
+    # Not instance nodes: the datastore root, a list collection, an rpc.
+    with pytest.raises(ValueError, match="datastore root"):
+        data.instance_identifier()
+    with pytest.raises(ValueError, match="list collection"):
+        system.user.instance_identifier()
+    with pytest.raises(ValueError, match="not in the data tree"):
+        nav.Operations(None, []).tid_do_thing.instance_identifier()
+
+    # An unknown namespace must fail closed: a bare name would silently mean
+    # "same module as the parent" (RFC 7951 Sec 6.11), i.e. a different path.
+    with pytest.raises(ValueError, match="no module name is known"):
+        base.Node(None, [("urn:test:unknown", "x", {})]).instance_identifier()
+
+
+def test_model_dump_instances_flattens_a_model_to_instance_paths(tmp_path):
+    """`model_dump_instances()` is the comparison primitive.
+
+    It flattens a model to `{instance-identifier: value}` using the same
+    RFC 7950 Sec 9.13 / RFC 7951 Sec 6.11 encoding as `instance_identifier()`,
+    so a hand-written intent model and a retrieved running-config model can be
+    diffed without caring about field order, list order, or absent optional
+    nodes. Key predicates follow the `key` statement (not field order), an
+    enumeration key uses its YANG name (not the generated Python member name),
+    a leaf-list entry is addressed by its value, and an augmented child is
+    qualified with the augmenting module.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    models = _import(out, "data_models.tid")
+
+    model = models.System.model_validate(
+        {
+            "hostname": "r1",
+            "dns": ["1.1.1.1", "8.8.8.8"],
+            "uptime": 42,
+            "user": [
+                {
+                    "name": "alice",
+                    "enabled": True,
+                    "role": ["admin", "ops"],
+                    "last_login": "today",
+                    "prefs": {"addr": [{"ip": "10.0.0.1"}]},
+                },
+                {"name": "o'brien", "enabled": False},
+            ],
+            "server": [{"ip": "192.0.2.1", "port": 80}],
+            "port_first": [{"ip": "198.51.100.1", "port": 443, "descr": "api"}],
+            "flag": [{"on": True}],
+            "marker": [{"tag": ""}],
+            "mode": [{"m": "foo-bar", "note": "n"}],
+        }
+    )
+
+    alice = "/tid:system/user[name='alice']"
+    obrien = '/tid:system/user[name="o\'brien"]'
+    expected = {
+        "/tid:system/hostname": "r1",
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+        "/tid:system/uptime": 42,
+        f"{alice}/name": "alice",
+        f"{alice}/enabled": True,
+        f"{alice}/role[.='admin']": "admin",
+        f"{alice}/role[.='ops']": "ops",
+        f"{alice}/last-login": "today",
+        f"{alice}/tidadd:prefs/addr[ip='10.0.0.1']/ip": "10.0.0.1",
+        f"{obrien}/name": "o'brien",
+        f"{obrien}/enabled": False,
+        "/tid:system/server[ip='192.0.2.1'][port='80']/ip": "192.0.2.1",
+        "/tid:system/server[ip='192.0.2.1'][port='80']/port": 80,
+        # `key "port ip"` while the leaves are declared ip then port: RFC 7950
+        # Sec 9.13 follows the key statement, not field order.
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/ip": "198.51.100.1",
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/port": 443,
+        "/tid:system/port-first[port='443'][ip='198.51.100.1']/descr": "api",
+        "/tid:system/flag[on='true']/on": True,
+        "/tid:system/marker[tag='']/tag": "",
+        # The generated enum member is FOO_BAR; the YANG lexical value is
+        # foo-bar (RFC 7950 Sec 9.6.4).
+        "/tid:system/mode[m='foo-bar']/m": "foo-bar",
+        "/tid:system/mode[m='foo-bar']/note": "n",
+    }
+    assert model.model_dump_instances("/tid:system") == expected
+    assert model.model_dump_instances_json("/tid:system") == json.dumps(
+        expected, sort_keys=True
+    )
+
+    # A partial intent model contributes only the values it actually sets, so
+    # a hand-written config can be compared against a full running config.
+    partial = models.System.model_validate({"hostname": "r1"})
+    assert partial.model_dump_instances("/tid:system") == {"/tid:system/hostname": "r1"}
+
+    # A YANG `default` is emitted as the pydantic field default. An explicit
+    # value equal to it is still set, so it is present by default; with
+    # exclude_defaults it drops, matching a with-defaults report-all read where
+    # neither side configured the leaf. A non-default value is never dropped.
+    defaulted = models.System.model_validate({"hostname": "r1", "level": "low"})
+    assert defaulted.model_dump_instances("/tid:system") == {
+        "/tid:system/hostname": "r1",
+        "/tid:system/level": "low",
+    }
+    assert defaulted.model_dump_instances("/tid:system", exclude_defaults=True) == {
+        "/tid:system/hostname": "r1"
+    }
+    changed = models.System.model_validate({"level": "high"})
+    assert changed.model_dump_instances("/tid:system", exclude_defaults=True) == {
+        "/tid:system/level": "high"
+    }
+
+    # RFC 8342 / RFC 8526 config-filter semantics, shared with model_dump.
+    config_only = model.model_dump_instances("/tid:system", content="config")
+    assert "/tid:system/uptime" not in config_only
+    assert f"{alice}/last-login" not in config_only
+    assert config_only["/tid:system/hostname"] == "r1"
+    assert config_only[f"{alice}/name"] == "alice"
+    state_only = model.model_dump_instances("/tid:system", content="nonconfig")
+    assert state_only == {
+        "/tid:system/uptime": 42,
+        f"{alice}/last-login": "today",
+    }
+
+    # A keyless list is state data (RFC 7950 Sec 7.8.2) and Sec 9.13 gives no
+    # instance-identifier for an individual entry; refuse rather than merge
+    # entries under one path. content=config drops the config-false subtree.
+    keyless = models.System.model_validate({"stats": {"sample": [{"counter": 1}]}})
+    with pytest.raises(ValueError, match="keyless list entry"):
+        keyless.model_dump_instances("/tid:system", content="all")
+    assert keyless.model_dump_instances("/tid:system", content="config") == {}
+
+    # A value holding both quote characters has no representable predicate.
+    unquotable = models.System.model_validate({"user": [{"name": "both'\"quotes"}]})
+    with pytest.raises(ValueError, match="both quote characters"):
+        unquotable.model_dump_instances("/tid:system")
+
+    # The root path is required and must be an instance node.
+    with pytest.raises(ValueError, match="absolute instance-identifier"):
+        model.model_dump_instances("tid:system")
+    with pytest.raises(ValueError, match="datastore root"):
+        model.model_dump_instances("/")
+    with pytest.raises(ValueError, match="content must be"):
+        model.model_dump_instances("/tid:system", content="bogus")
+    # The root path must name THIS model, and a list item needs its keys.
+    with pytest.raises(ValueError, match="does not name"):
+        model.model_dump_instances("/tid:user")
+    with pytest.raises(ValueError, match="missing key predicate"):
+        models.UserItem(name="alice").model_dump_instances("/tid:system/user")
+
+
+def test_model_validate_instances_rebuilds_the_model_from_the_map(tmp_path):
+    """`model_validate_instances()` is the inverse of `model_dump_instances()`.
+
+    It parses the RFC 7950 Sec 9.13 path syntax (quoted values may contain
+    `/`, `[` or `]`), resolves each segment to a field by YANG name and
+    module (RFC 7951 Sec 6.11), fills a list entry's keys from its predicates,
+    and hands the assembled tree to `model_validate` so YANG constraints still
+    apply.
+    """
+    out = _gen_netconf(
+        INSTANCE_ID_YANG,
+        "tid",
+        tmp_path,
+        extra={"tidadd.yang": INSTANCE_ID_AUGMENT_YANG},
+    )
+    models = _import(out, "data_models.tid")
+
+    model = models.System.model_validate(
+        {
+            "hostname": "r1",
+            "dns": ["1.1.1.1", "8.8.8.8"],
+            "uptime": 42,
+            "user": [
+                {
+                    "name": "alice",
+                    "enabled": True,
+                    "role": ["admin", "ops"],
+                    "last_login": "today",
+                    "prefs": {"addr": [{"ip": "10.0.0.1"}]},
+                },
+                {"name": "a/b]c=d", "enabled": False},
+                {"name": "o'brien", "enabled": False},
+                {"name": 'he said "hi"', "enabled": False},
+            ],
+            "server": [{"ip": "192.0.2.1", "port": 80}],
+            "port_first": [{"ip": "198.51.100.1", "port": 443, "descr": "api"}],
+            "flag": [{"on": True}],
+            "marker": [{"tag": ""}],
+            "mode": [{"m": "foo-bar", "note": "n"}],
+        }
+    )
+    dumped = model.model_dump_instances("/tid:system")
+
+    # A value containing /, ] and = must not be split as path syntax, and both
+    # quote styles must survive the round-trip (RFC 7950 Sec 14 has no escape).
+    assert "/tid:system/user[name='a/b]c=d']/name" in dumped
+    assert '/tid:system/user[name="o\'brien"]/name' in dumped
+    assert "/tid:system/user[name='he said \"hi\"']/name" in dumped
+
+    reloaded = models.System.model_validate_instances("/tid:system", dumped)
+    assert reloaded.model_dump_instances("/tid:system") == dumped
+
+    # JSON round-trip. sort_keys=False keeps leaf-list/list order (the default
+    # sort would reorder an ordered-by user collection).
+    as_json = model.model_dump_instances_json("/tid:system", sort_keys=False)
+    from_json = models.System.model_validate_instances_json("/tid:system", as_json)
+    assert from_json.model_dump_instances("/tid:system") == dumped
+
+    # A partial map is a partial model, not a complete datastore.
+    partial = models.System.model_validate_instances(
+        "/tid:system", {"/tid:system/hostname": "r1"}
+    )
+    assert partial.model_dump_instances("/tid:system") == {"/tid:system/hostname": "r1"}
+
+    # A list item model is addressed by its own keyed path; the key leaves are
+    # filled from the predicates even when the map omits them.
+    item_path = "/tid:system/user[name='alice']"
+    item = models.UserItem.model_validate_instances(
+        item_path, {f"{item_path}/enabled": True}
+    )
+    assert item.name == "alice" and item.enabled is True
+    assert item.model_dump_instances(item_path) == {
+        f"{item_path}/name": "alice",
+        f"{item_path}/enabled": True,
+    }
+
+    # The predicate and the key leaf entry must name the same entry.
+    with pytest.raises(ValueError, match="conflicting values"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/user[name='alice']/name": "bob"}
+        )
+
+    # Every key is required, and the key name must belong to the list.
+    with pytest.raises(ValueError, match="missing key predicate"):
+        models.System.model_validate_instances(
+            "/tid:system",
+            {"/tid:system/server[ip='192.0.2.1']/ip": "192.0.2.1"},
+        )
+    with pytest.raises(ValueError, match="not a key"):
+        models.System.model_validate_instances(
+            "/tid:system",
+            {"/tid:system/server[nope='x'][ip='192.0.2.1'][port='80']/ip": "x"},
+        )
+
+    # A leaf-list predicate must agree with the map value.
+    with pytest.raises(ValueError, match="does not match"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/dns[.='1.1.1.1']": "8.8.8.8"}
+        )
+    # A leaf has no predicates, and a keyless list has no entry path.
+    with pytest.raises(ValueError, match="leaf has no predicates"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/hostname[.='r1']": "r1"}
+        )
+    with pytest.raises(ValueError, match="keyless list entry"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system/stats/sample/counter": 1}
+        )
+
+    # Unknown children, a wrong root, and paths outside the root fail closed.
+    with pytest.raises(ValueError, match="has no child"):
+        models.System.model_validate_instances("/tid:system", {"/tid:system/nope": 1})
+    with pytest.raises(ValueError, match="does not name"):
+        models.System.model_validate_instances("/tid:user", {"/tid:user/x": 1})
+    with pytest.raises(ValueError, match="not under"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:other/hostname": "r1"}
+        )
+    with pytest.raises(ValueError, match="the model root is not a leaf"):
+        models.System.model_validate_instances(
+            "/tid:system", {"/tid:system": {"hostname": "r1"}}
+        )
+    with pytest.raises(ValueError, match="JSON object"):
+        models.System.model_validate_instances_json("/tid:system", "[]")
+
+
+def test_diff_instances_classifies_and_collapses(tmp_path):
+    """`diff_instances` is the plan's input: leaf-level buckets, collapsed `-`.
+
+    A leaf removal stays a leaf when an unchanged sibling survives; a whole
+    list entry or container collapses to that node, so `plan()` can emit one
+    `remove` at the right granularity without needing the running/intended
+    maps again.
+    """
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+
+    running = {
+        "/tid:system/hostname": "old",
+        "/tid:system/level": "low",
+        "/tid:system/user[name='alice']/name": "alice",
+        "/tid:system/user[name='alice']/enabled": True,
+        "/tid:system/user[name='alice']/tidadd:prefs/addr[ip='10.0.0.1']/ip": "10.0.0.1",
+        "/tid:system/user[name='bob']/name": "bob",
+        "/tid:system/user[name='bob']/enabled": False,
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+    }
+    intended = {
+        "/tid:system/hostname": "new",
+        "/tid:system/level": "low",
+        "/tid:system/user[name='alice']/name": "alice",
+        "/tid:system/user[name='alice']/enabled": True,
+        "/tid:system/dns[.='8.8.8.8']": "8.8.8.8",
+        "/tid:system/dns[.='1.1.1.1']": "1.1.1.1",
+    }
+    diff = session.diff_instances(running, intended)
+
+    assert diff["+"] == {}
+    assert diff["~"]["/tid:system/hostname"] == ("old", "new")
+    assert diff["~"]["/tid:system/dns"] == (
+        ["1.1.1.1", "8.8.8.8"],
+        ["8.8.8.8", "1.1.1.1"],
+    )
+    assert set(diff["-"]) == {
+        "/tid:system/user[name='bob']",
+        "/tid:system/user[name='alice']/tidadd:prefs",
+    }
+    assert diff["-"]["/tid:system/user[name='bob']"].kind == "list-entry"
+    assert diff["-"]["/tid:system/user[name='alice']/tidadd:prefs"].kind == "container"
+    assert "/tid:system/level" not in diff["-"]
+
+    # An unchanged sibling blocks the collapse: only the leaf is deleted.
+    leaf_diff = session.diff_instances(
+        {"/tid:system/hostname": "old", "/tid:system/level": "low"},
+        {"/tid:system/level": "low"},
+    )
+    assert leaf_diff["-"]["/tid:system/hostname"].kind == "leaf"
+
+
+def test_build_config_emits_one_surgical_edit(tmp_path):
+    """`+`/`~` merge, `-` removes at the collapsed node, leaf-lists remove+add."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+
+    diff = session.InstanceDiff(
+        added={"/tid:system/level": "high"},
+        changed={
+            "/tid:system/hostname": ("old", "new"),
+            "/tid:system/dns": (["1.1.1.1"], ["8.8.8.8"]),
+        },
+        removed={
+            "/tid:system/user[name='bob']": session.Removal(
+                path="/tid:system/user[name='bob']",
+                kind="list-entry",
+                leaves={
+                    "/tid:system/user[name='bob']/name": "bob",
+                    "/tid:system/user[name='bob']/enabled": False,
+                },
+            )
+        },
+    )
+    config = session.build_config(diff, session.MODULE_NAMESPACES)
+    assert config.tag == "{urn:ietf:params:xml:ns:netconf:base:1.0}config"
+
+    system = config[0]
+    assert etree.QName(system).localname == "system"
+    by_tag = {}
+    for child in system:
+        by_tag.setdefault(etree.QName(child).localname, []).append(child)
+
+    assert by_tag["level"][0].text == "high"
+    assert by_tag["hostname"][0].text == "new"
+    assert [entry.text for entry in by_tag["dns"]] == ["1.1.1.1", "8.8.8.8"]
+    assert (
+        by_tag["dns"][0].get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation")
+        == "remove"
+    )
+    assert (
+        by_tag["dns"][1].get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation")
+        is None
+    )
+    user = by_tag["user"][0]
+    assert user.get("{urn:ietf:params:xml:ns:netconf:base:1.0}operation") == "remove"
+    assert [etree.QName(child).localname for child in user] == ["name"]
+    assert user[0].text == "bob"
+
+
+def test_data_retrieve_sends_one_multi_root_filter(tmp_path):
+    """`Data.retrieve()` selects compiled roots in one subtree filter."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    nav = _import(out, "data_navigators")
+    session = _import(out, "session_manager")
+
+    class FakeClient:
+        module_namespaces = session.MODULE_NAMESPACES
+
+        def __init__(self):
+            self.kwargs: dict = {}
+
+        def retrieve(self, **kwargs):
+            self.kwargs = kwargs
+            return etree.fromstring(
+                '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                '<system xmlns="urn:test:tid"><hostname>r1</hostname></system>'
+                "</data>"
+            )
+
+    client = FakeClient()
+    data = nav.Data(client, []).retrieve(fields=["tid:system/hostname"])
+    assert client.kwargs["content"] == "config"
+    assert client.kwargs["depth"] == "unbounded"
+    roots = client.kwargs["filter_xml"]
+    assert isinstance(roots, list) and len(roots) == 1
+    assert etree.QName(roots[0]).localname == "system"
+    assert [etree.QName(child).localname for child in roots[0]] == ["hostname"]
+    assert data is not None
+    assert data.tid_system.hostname == "r1"
+    assert data.model_dump_instances(content="config") == {"/tid:system/hostname": "r1"}
+
+    # No fields: every compiled root, each empty (whole subtree).
+    nav.Data(client, []).retrieve()
+    roots = client.kwargs["filter_xml"]
+    assert [etree.QName(root).localname for root in roots] == ["system"]
+    assert len(roots[0]) == 0
+
+    # A bare root wins over child selections for the same root.
+    nav.Data(client, []).retrieve(fields=["tid:system/hostname", "tid:system"])
+    roots = client.kwargs["filter_xml"]
+    assert len(roots[0]) == 0
+
+    with pytest.raises(ValueError, match="not a compiled top-level node"):
+        nav.Data(client, []).retrieve(fields=["tid:nope"])
+
+
+def test_node_retrieve_fields_accept_yang_and_python_names(tmp_path):
+    """A filter field must resolve by Python name or YANG name, and a typo
+    must raise instead of silently selecting nothing."""
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    base = _import(out, "data_navigators._base")
+    models = _import(out, "data_models.tid")
+    path = [("urn:test:tid", "system", {})]
+
+    tree = base.build_filter_tree(path, models.System, fields=["port-first"])
+    assert [etree.QName(child).localname for child in tree] == ["port-first"]
+
+    tree = base.build_filter_tree(path, models.System, fields=["port_first"])
+    assert [etree.QName(child).localname for child in tree] == ["port-first"]
+
+    # The depth-bounded (legacy) path resolves the same names and raises too.
+    tree = base.build_depth_filter(path, models.System, 2, fields=["port-first"])
+    assert tree is not None
+    child = tree.find("{urn:test:tid}port-first")
+    assert child is not None
+    assert {etree.QName(grandchild).localname for grandchild in child} == {
+        "port",
+        "ip",
+    }
+
+    with pytest.raises(ValueError, match="has no field"):
+        base.build_filter_tree(path, models.System, fields=["nope"])
+    with pytest.raises(ValueError, match="has no field"):
+        base.build_depth_filter(path, models.System, 2, fields=["nope"])
+
+
+def _plan_client(session, **overrides):
+    """A NetconfClient with transport calls replaced by recorders."""
+    client = object.__new__(session.NetconfClient)
+    client.module_namespaces = session.MODULE_NAMESPACES
+    client.default_target = "candidate"
+    client.has_nmda = False
+    client.has_validate_1_1 = False
+    client.has_validate = True
+    client.has_candidate = True
+    client.auto_commit = False
+    client.events = []
+
+    def record(name):
+        def call(*args, **kwargs):
+            client.events.append((name, args, kwargs))
+            return True
+
+        return call
+
+    for name in ("edit", "validate", "commit", "lock", "unlock", "discard_changes"):
+        setattr(client, name, record(name))
+    client._candidate_is_clean = lambda: True
+    for key, value in overrides.items():
+        setattr(client, key, value)
+    return client
+
+
+def test_plan_prefers_test_only_and_never_commits(tmp_path):
+    """`test-only` needs :validate:1.1 and must never commit, even with
+    auto_commit=True."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, has_validate_1_1=True, auto_commit=True)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    result = session.NetconfClient.plan(client, diff, show=False)
+
+    assert result.validated == "syntax"
+    assert result.ok is True
+    assert client.events[0][0] == "edit"
+    assert client.events[0][2]["test_option"] == "test-only"
+    assert client.events[0][2]["commit"] is False
+    assert all(event[0] != "commit" for event in client.events)
+
+
+def test_plan_falls_back_to_candidate_and_refuses_a_dirty_one(tmp_path):
+    """No :validate:1.1 means stage+validate+discard; a dirty candidate must
+    fail loudly and must never be discarded."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    dirty = _plan_client(session)
+    dirty._candidate_is_clean = lambda: False
+    with pytest.raises(RuntimeError, match="candidate already holds"):
+        session.NetconfClient.plan(dirty, diff, show=False)
+    assert all(event[0] != "discard_changes" for event in dirty.events)
+    assert any(event[0] == "unlock" for event in dirty.events)
+
+    clean = _plan_client(session)
+    result = session.NetconfClient.plan(clean, diff, show=False)
+    assert result.validated == "datastore"
+    names = [event[0] for event in clean.events]
+    assert names[:2] == ["lock", "edit"]
+    assert "validate" in names
+    assert "discard_changes" in names
+    assert "unlock" in names
+
+
+def test_plan_falls_back_when_test_only_is_rejected(tmp_path):
+    """A device may advertise :validate:1.1 and still answer
+    operation-not-supported for test-only; plan must stage to candidate."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, has_validate_1_1=True)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    class Rejected(RuntimeError):
+        rpc_error_tag = "operation-not-supported"
+
+    def edit(config, **kwargs):
+        if kwargs.get("test_option") == "test-only":
+            raise Rejected("NETCONF RPC Error: operation-not-supported")
+        client.events.append(("edit", (), kwargs))
+        return True
+
+    client.edit = edit
+    result = session.NetconfClient.plan(client, diff, show=False)
+    assert result.validated == "datastore"
+    assert any(event[0] == "discard_changes" for event in client.events)
+
+
+def test_reconcile_commits_even_when_auto_commit_is_false(tmp_path):
+    """`plan` is expected first, so `reconcile` commits by default; auto_commit
+    must not be able to commit before validation."""
+    out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
+    session = _import(out, "session_manager")
+    client = _plan_client(session, auto_commit=False)
+    diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
+
+    assert session.NetconfClient.reconcile(client, diff) is True
+
+    names = [event[0] for event in client.events]
+    assert names[:2] == ["lock", "edit"]
+    assert client.events[1][2] == {"target": "candidate", "commit": False}
+    assert "validate" in names
+    assert "commit" in names
+    assert names.index("validate") < names.index("commit")
 
 
 def test_no_nonexistent_rfc_sections_cited():
@@ -3200,6 +4139,37 @@ def test_netconf_depth_uses_the_filter_and_prunes_a_lying_server(tmp_path):
     assert model.items[0].label is None, "boundary leaf survived the pruner"
 
 
+def test_netconf_retrieve_accepts_a_list_of_filter_roots(tmp_path):
+    """`Data.retrieve()` passes several selection nodes in one RPC.
+
+    Legacy ncclient wraps a list in one `<filter type="subtree">`; NMDA appends
+    every node to one `<subtree-filter>`. A single element keeps its existing
+    `(type, criteria)` path.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    client, mgr = _netconf_client(tmp_path, _BASE_CAPS)
+    roots = [
+        etree.Element("{urn:test:a}a", nsmap={None: "urn:test:a"}),
+        etree.Element("{urn:test:b}b", nsmap={None: "urn:test:b"}),
+    ]
+
+    client.retrieve(source="running", content="config", filter_xml=roots)
+    assert mgr.get_config_kwargs["filter"] is roots
+
+    nmda_client, nmda_mgr = _netconf_client(
+        tmp_path / "nmda",
+        [*_BASE_CAPS, "urn:ietf:params:netconf:capability:nmda:1.0"],
+    )
+    nmda_client.retrieve(source="candidate", content="config", filter_xml=roots)
+    rpc = nmda_mgr.dispatched[-1]
+    filter_el = rpc.find(
+        "{urn:ietf:params:xml:ns:yang:ietf-netconf-nmda}subtree-filter"
+    )
+    assert filter_el is not None
+    assert [etree.QName(child).localname for child in filter_el] == ["a", "b"]
+
+
 def test_depth_validation_rejects_only_inexpressible_values(tmp_path):
     """`depth=1` is valid; reject bool/0/negative/non-numeric/>65535/None
     before any transport work, on both protocols.
@@ -3346,6 +4316,8 @@ class _FakeNcclientManager:
         self.closed = 0
         self.dispatched: list[Any] = []
         self.commits = 0
+        self.get_config_kwargs: dict = {}
+        self.get_kwargs: dict = {}
 
     def close_session(self):
         self.closed += 1
@@ -3358,6 +4330,14 @@ class _FakeNcclientManager:
 
     def commit(self):
         self.commits += 1
+        return self
+
+    def get_config(self, **kwargs):
+        self.get_config_kwargs = kwargs
+        return self
+
+    def get(self, **kwargs):
+        self.get_kwargs = kwargs
         return self
 
     def dispatch(self, rpc):
@@ -3815,6 +4795,7 @@ BUILTIN_COLLISION_YANG = """module tbi {
       leaf bool { type boolean; }
       leaf after { type string; }
       leaf-list list { type uint8; }
+      leaf model_dump_instances { type string; }
       list nested { key id; leaf id { type string; } }
     }
     container sibling-after { leaf b { type string; } }
@@ -3931,6 +4912,9 @@ def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
             ("int_", "int"),
             ("bool_", "bool"),
             ("list_", "list"),
+            # A method the NETCONF model base defines; a leaf with this name
+            # would shadow it on that instance.
+            ("model_dump_instances_", "model_dump_instances"),
         ):
             assert escaped in holder, (fmt, sorted(holder))
             extra = holder[escaped].json_schema_extra or {}
@@ -3952,10 +4936,18 @@ def test_builtin_named_nodes_do_not_break_the_generated_import(tmp_path):
 
         # 4. The value round-trips through the escaped attribute.
         inst = models.Holder.model_validate(
-            {"str": "a", "int": 2, "bool": True, "list": [1, 2], "after": "z"}
+            {
+                "str": "a",
+                "int": 2,
+                "bool": True,
+                "list": [1, 2],
+                "model_dump_instances": "shadow",
+                "after": "z",
+            }
         )
         assert inst.str_ == "a" and inst.int_ == 2 and inst.bool_ is True
         assert inst.list_ == [1, 2] and inst.after == "z"
+        assert inst.model_dump_instances_ == "shadow"
 
         # 5. An rpc input leaf is escaped too -- this is the `get-schema` shape.
         do_it_in = models.DoItInput.model_fields

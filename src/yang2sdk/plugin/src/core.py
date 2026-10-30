@@ -663,16 +663,32 @@ def _target_names(node: ast.expr) -> set[str]:
     return set()
 
 
+def _is_module_import_call(value: ast.expr) -> bool:
+    """True for ``alias = importlib.import_module(".name", __package__)``.
+
+    The aggregate binds its module aliases at runtime with importlib so that
+    ``Data.from_xml()`` can rebuild the model. That is still a *module*
+    binding: the alias must resolve, and the guard below must not treat it as
+    an object whose attribute access can raise.
+    """
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if not isinstance(func, ast.Attribute) or func.attr != "import_module":
+        return False
+    return _root_name(func.value) in ("importlib", "_importlib")
+
+
 def _annotation_runtime_names(tree: ast.Module) -> set[str]:
     """Names an aggregate annotation would see before pydantic evaluates it.
 
-    Only top-level statements count: the aggregate imports its own modules
-    under ``if TYPE_CHECKING``, and those names are deliberately *not* bound
-    at runtime. A module import shadows a builtin (``from . import license``
-    would make ``license.Licenses`` valid), so module bindings are removed
-    from the dangerous set; object bindings (the template's ``element`` /
-    ``Field`` / ``ConfigDict``) are added to it. Assignments, classes and
-    functions are treated as objects, which is all the aggregate emits.
+    Only top-level statements count. A *module* binding -- an ``import`` or
+    ``alias = importlib.import_module(...)`` -- makes ``alias.Class`` valid and
+    is removed from the dangerous set. An *object* binding (the template's
+    ``element`` / ``Field`` / ``ConfigDict``) is added to it, because attribute
+    access on a non-module raises ``AttributeError``, which pydantic does not
+    defer. Assignments, classes and functions are treated as objects unless
+    the value is an ``import_module`` call.
     """
     dangerous = set(dir(builtins))
     safe_modules: set[str] = set()
@@ -705,9 +721,13 @@ def _annotation_runtime_names(tree: ast.Module) -> set[str]:
         elif isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             bind_object(stmt.name)
         elif isinstance(stmt, ast.Assign):
+            module_binding = _is_module_import_call(stmt.value)
             for target in stmt.targets:
                 for name in _target_names(target):
-                    bind_object(name)
+                    if module_binding:
+                        bind_module(name)
+                    else:
+                        bind_object(name)
         elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
             for name in _target_names(stmt.target):
                 bind_object(name)

@@ -80,6 +80,12 @@ for info in pkgutil.iter_modules(list(models_pkg.__path__)):
             continue
         if obj.__module__ != mod.__name__:
             continue
+        # Skip the module's nsmap base classes (`_ModuleBase` / `_ModuleRpcBase`
+        # in models.py): they are plumbing, not models. Every real model class is
+        # emitted with `tag=`, the bases with none, so the tag is the exact
+        # discriminator -- a name test would also have to guess at future bases.
+        if getattr(obj, "__xml_tag__", None) is None:
+            continue
         model_classes.add(info.name + "." + name)
         nsmap = getattr(obj, "__xml_nsmap__", None) or {}
         default_ns = nsmap.get("")

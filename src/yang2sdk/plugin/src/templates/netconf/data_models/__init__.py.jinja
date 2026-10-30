@@ -1,13 +1,29 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+import importlib as _importlib
+from typing import Any, Literal
 from pydantic import ConfigDict
 from pydantic_xml import element
-from ._base import NetconfXmlModel
+from ._base import NetconfXmlModel, _collect_instances
 
-if TYPE_CHECKING:
+# Runtime imports, not TYPE_CHECKING: Data/Operations carry string forward
+# references to these aliases, and Data.from_xml() must be able to rebuild the
+# aggregate model. Under TYPE_CHECKING the aliases do not exist at runtime and
+# pydantic raised "name '_m_<module>' is not defined" on the first parse.
+#
+# `from . import <name>` cannot be used: if the package already has an
+# attribute with that name (a YANG module named `element` or `ConfigDict`),
+# importlib's fromlist handling returns the attribute instead of the submodule.
+# import_module always returns the module object.
 {% for mod_name in module_names %}
-    from . import {{ mod_name }} as {{ module_aliases[mod_name] }}
+{{ module_aliases[mod_name] }} = _importlib.import_module(".{{ mod_name }}", __package__)
 {% endfor %}
+
+# A colliding submodule overwrote its name in this package's namespace. Restore
+# the callables the class bodies use; the aliases above still hold the modules.
+from typing import Any, Literal
+from pydantic import ConfigDict
+from pydantic_xml import element
+from ._base import NetconfXmlModel, _collect_instances
 
 {% set seen_data_ns = [] %}
 class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netconf:base:1.0'{% for prop in data_props %}{% if prop.module not in seen_data_ns %}, '{{ prop.module }}': '{{ prop.ns }}'{% set _ = seen_data_ns.append(prop.module) %}{% endif %}{% endfor %}}, ns=''):
@@ -16,8 +32,42 @@ class Data(NetconfXmlModel, tag='data', nsmap={'': 'urn:ietf:params:xml:ns:netco
     
     {% if not data_props %}pass{% else %}
     {% for prop in data_props %}
-    {{ prop.module }}_{{ prop.field }}: '{{ module_aliases[prop.module] }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None)
+    {{ prop.module }}_{{ prop.field }}: '{{ module_aliases[prop.module] }}.{{ prop.cls }} | None' = element(tag='{{ prop.alias.split(":")[1] }}', ns='{{ prop.module }}', default=None, json_schema_extra={'tag': '{{ prop.alias.split(":")[1] }}', 'ns': '{{ prop.ns }}'})
     {% endfor %}
+
+    def model_dump_instances(
+        self,
+        instance_path: str = "",
+        *,
+        content: Literal["config", "all", "nonconfig"] = "all",
+        exclude_none: bool = True,
+        exclude_unset: bool = True,
+        exclude_defaults: bool = False,
+    ) -> dict[str, Any]:
+        """Flatten every populated compiled root to ``{instance-id: value}``.
+
+        The datastore root has no instance-identifier (RFC 7950 Sec 9.13), so
+        this override dumps each top-level node under its own absolute path
+        instead of taking one. It is what makes ``Data.retrieve()`` usable as
+        a single-line running-config snapshot.
+        """
+        if instance_path not in ("", "/"):
+            raise ValueError(
+                "Data.model_dump_instances() dumps the datastore root; pass no "
+                "instance_path (use a node navigator for a subtree)"
+            )
+        out: dict[str, Any] = {}
+        _collect_instances(
+            self,
+            "",
+            "",
+            out,
+            content=content,
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+        )
+        return out
     {% endif %}
 
 {% set seen_rpc_ns = [] %}

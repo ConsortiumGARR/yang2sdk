@@ -32,6 +32,19 @@ def _reserved_model_attrs() -> frozenset[str]:
 
 _RESERVED_MODEL_ATTRS = _reserved_model_attrs()
 
+# Public methods the NETCONF model base itself defines. They are not in
+# `dir(BaseModel)` because they live in the generated `_base.py`, but a YANG
+# leaf with one of these names would shadow the method on that instance just
+# the same, so they belong in the reserved set.
+_GENERATED_MODEL_METHODS = frozenset(
+    {
+        "model_dump_instances",
+        "model_dump_instances_json",
+        "model_validate_instances",
+        "model_validate_instances_json",
+    }
+)
+
 
 def _generated_code_builtins() -> frozenset[str]:
     """Builtins the emitter writes as bare names *inside a class body*.
@@ -111,6 +124,12 @@ class IRModel:
     #: with "root element not found" even though the device answered correctly
     #: (measured on SR Linux: /system/aaa, tls, ssh-server, ... -- 77 nodes).
     ns_alias: str = ""
+    #: YANG `key` statement order for a list's item model, empty otherwise.
+    #: Field declaration order is NOT key order: a list keyed "port ip" whose
+    #: leaves are declared `ip` then `port` would otherwise render
+    #: `[ip=...][port=...]`, and RFC 7950 Sec 9.13 requires the predicates in
+    #: key-statement order.
+    key_order: tuple[str, ...] = ()
 
 
 @dataclass
@@ -620,6 +639,14 @@ class IRBuilder:
             # for augments it returns the augmenting module's prefix, backfilled
             # into imports_nsmap before render so the declaration exists.
             ns_alias=self._ns_alias(self._get_module_namespace(stmt)),
+            # RFC 7950 Sec 9.13: a list entry's key predicates appear in the
+            # order of the `key` statement, which need not match the order the
+            # key leaves are declared in.
+            key_order=tuple(
+                stmt.search_one("key").arg.split()
+                if stmt.keyword == "list" and stmt.search_one("key")
+                else ()
+            ),
         )
 
         if hasattr(stmt, "i_children"):
@@ -1447,7 +1474,7 @@ class IRBuilder:
     def _to_field_name(self, name: str) -> str:
         """Convert YANG name to Python field name (snake_case).
 
-        Three reserved-name classes are handled, all of which produced
+        Four reserved-name classes are handled, all of which produced
         *silently broken* -- or unimportable -- models before:
 
         * Python keywords (`class`, `import`, ...) -- already handled.
@@ -1464,6 +1491,10 @@ class IRBuilder:
           *import* at all (`TypeError: 'property' object is not callable`),
           which the emitter's own `_validate_generated` parse check cannot
           catch because the file is syntactically valid.
+        * Public methods the generated NETCONF model base defines -- see
+          `_GENERATED_MODEL_METHODS`. A YANG leaf named `model_dump_instances`
+          would shadow the instance method on that model just as `schema`
+          shadows the inherited pydantic method.
 
         The wire name is unaffected: NETCONF models carry `element(tag=...)`
         and RESTCONF models carry `Field(alias=...)`, both derived from the
@@ -1475,7 +1506,11 @@ class IRBuilder:
             res = f"{res}_"
         # `while`, not `if`: a YANG leaf literally named `str_` must not
         # collide with the escaped form of `str`.
-        while res in _RESERVED_MODEL_ATTRS or res in _GENERATED_CODE_BUILTINS:
+        while (
+            res in _RESERVED_MODEL_ATTRS
+            or res in _GENERATED_CODE_BUILTINS
+            or res in _GENERATED_MODEL_METHODS
+        ):
             res = f"{res}_"
         return res
 

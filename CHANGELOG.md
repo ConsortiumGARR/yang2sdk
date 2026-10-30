@@ -7,6 +7,135 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+### Added
+
+- **NETCONF diff / plan / reconcile.** `NetconfClient.diff_instances(running_map, intended_map)`
+  classifies two `model_dump_instances()` maps into `{+, ~, -}`. Leaf-lists are
+  compared as ordered sequences (any difference — reorder, add, remove — is one
+  `~` keyed by the leaf-list node); `-` is collapsed at diff time to the highest
+  wholly-removed node and carries `Removal.kind` (`leaf`, `container`,
+  `list-entry`), so `plan()` and `reconcile()` need only the diff. `plan()`
+  builds one surgical `<config>`, prints it, and dry-runs it:
+  `<test-option>test-only</test-option>` when `:validate:1.1` is advertised
+  (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds
+  `test-only`), otherwise candidate staging + `<validate>` +
+  `<discard-changes>` (locking first and refusing a candidate that already
+  differs from running), otherwise message-only with `ok=None`. A plan never
+  applies to running and never commits, even with `auto_commit=True`.
+  `reconcile()` sends the same bytes and commits by default. `edit()` gained
+  `test_option=` and a per-call `commit=` override. Pinned by
+  `tests/test_matrix.py::test_diff_instances_classifies_and_collapses`,
+  `::test_build_config_emits_one_surgical_edit`,
+  `::test_plan_prefers_test_only_and_never_commits`,
+  `::test_plan_falls_back_to_candidate_and_refuses_a_dirty_one` and
+  `::test_reconcile_commits_even_when_auto_commit_is_false`.
+- **`client.data.retrieve()` fetches all compiled config in one RPC.**
+  `client.data.retrieve(content="config", depth="unbounded", fields=[...])`
+  sends one multi-root subtree filter naming only compiled top-level nodes, so
+  `Data.from_xml()` never sees a module this client was not compiled for.
+  `fields` entries are `module:root[/child...]`, grouped by root; `fields=None`
+  selects every compiled root with its whole subtree. `Data.model_dump_instances()`
+  with no path flattens all roots to absolute instance-identifiers. Relative
+  `node.retrieve(fields=[...])` now resolves a field by Python name or YANG name
+  and raises on an unknown one instead of silently selecting nothing. Pinned by
+  `tests/test_matrix.py::test_data_retrieve_sends_one_multi_root_filter` and
+  `::test_node_retrieve_fields_accept_yang_and_python_names`.
+
+- **NETCONF navigators can render their own instance-identifier.**
+  `nav.instance_identifier()` returns the node as RFC 7950 §9.13 defines it,
+  encoded with the module-name qualification of RFC 7951 §6.11: the leftmost
+  node is always qualified, a later node only when its defining module differs
+  from its parent's, and a list entry carries one predicate per key in key
+  order. For example
+  `client.data.ietf_interfaces_interfaces.interface("ge-0/0/0").ipv4.address("10.0.0.1").instance_identifier()`
+  is `/ietf-interfaces:interfaces/interface[name='ge-0/0/0']/ietf-ip:ipv4/address[ip='10.0.0.1']`
+  (the RFC 7951 §6.11 example shape, verified on a fresh compile of the IETF
+  modules). Key values are rendered in their YANG lexical form — a boolean key
+  is `true`/`false` (§9.7.2), an enumeration key is its YANG name — the
+  generated enum's value, not its Python member name (§9.6.4) — and quoted
+  with single quotes, or double quotes when the value contains a
+  single quote; a value containing both cannot be represented, because
+  §14's `quoted-string` has no escape mechanism, so it raises instead of
+  emitting a string that parses as a different path. A datastore root, a list
+  *collection* and an rpc/action node raise: none of them is an instance node
+  (§9.13, §7.15). The module map comes from the compile-time
+  `MODULE_NAMESPACES` (hoisted to module scope in `session_manager`), not from
+  `client.module_namespaces`, because which module a compiled node belongs to
+  is a schema fact while the client's map is overlaid with the peer's `<hello>`.
+  NETCONF-only on purpose: RESTCONF addresses nodes by a resource URI
+  (RFC 8040 §3.5.3), which is not an instance-identifier. Pinned by
+  `tests/test_matrix.py::test_instance_identifier_names_each_node_by_its_defining_module`.
+- **NETCONF models can flatten themselves to an instance-path map.**
+  `model.model_dump_instances("/tid:system")` returns
+  `{instance-identifier: value}` for every populated leaf and leaf-list entry
+  under that model, and `model_dump_instances_json()` returns the same map as
+  JSON (keys sorted by default). The path uses the same RFC 7950 §9.13 /
+  RFC 7951 §6.11 encoding as `instance_identifier()`: module qualification at
+  each module boundary, one predicate per list key in `key`-statement order
+  (not field-declaration order), and `[.='value']` for a leaf-list entry. This
+  is the comparison primitive for intent-vs-running: two models of the same
+  subtree flatten to dictionaries that can be diffed key by key without
+  field-order, list-order, or absent-optional-node noise. `content` matches
+  `model_dump`'s `config`/`all`/`nonconfig` filter;
+  `exclude_unset`/`exclude_none` (both default true) keep only the values
+  actually present, and `exclude_defaults` (off by default, matching pydantic)
+  drops a value equal to the YANG `default`, so an intent model and a
+  with-defaults `report-all` read compare equal when neither side configured
+  that leaf. A keyless list entry has no RFC 7950 §9.13
+  instance-identifier, so it raises rather than collapsing entries under one
+  path; `content="config"` excludes state-only keyless lists. Pinned by
+  `tests/test_matrix.py::test_model_dump_instances_flattens_a_model_to_instance_paths`.
+- **NETCONF models can be rebuilt from that instance-path map.**
+  `Model.model_validate_instances(instance_path, mapping)` and
+  `model_validate_instances_json()` invert the dump: they parse the same
+  RFC 7950 §9.13 syntax (quoted values may contain `/`, `[` or `]`), resolve
+  each segment to a field by YANG name and module (RFC 7951 §6.11), fill a
+  list entry's key leaves from its predicates, and pass the assembled tree to
+  `model_validate`, so constraints, choices and required fields still apply.
+  The map is an intent fragment, not a complete datastore: a missing mandatory
+  leaf fails validation, an empty container (including a presence container
+  with no leaves) cannot be represented, and list/leaf-list order follows the
+  map's iteration order — use `model_dump_instances_json(sort_keys=False)` when
+  `ordered-by user` order must survive a JSON round-trip. Pinned by
+  `tests/test_matrix.py::test_model_validate_instances_rebuilds_the_model_from_the_map`.
+
+### Changed
+
+- **A NETCONF module's namespace map is declared once per file instead of on
+  every model class.** Every class used to carry an identical `nsmap=`, because
+  the template believed pydantic-xml *replaces* a parent's map; it merges
+  (`BaseXmlModel.__init_subclass__`: `dict(parent_nsmap, **nsmap)`, unchanged
+  between the 2.21.0 floor and 2.22.0), so one intermediate `_ModuleBase` (and
+  `_ModuleRpcBase` for RPC envelopes, which derive from `NetconfXmlModel`) now
+  carries it for the whole file. Measured on the G30 client: 7.50 MB → 5.67 MB
+  for `ne.py` alone, 1.9 MiB across `data_models/`, with `__xml_nsmap__`, the
+  wire element QName and `to_xml()` bytes unchanged for all 1358 classes.
+  `--check-model-gaps` no longer counts the new base classes as models. A module
+  that imports `ietf-netconf` also stopped emitting `"nc"` twice in one literal.
+  Pinned by
+  `tests/test_matrix.py::test_netconf_declares_the_module_nsmap_once_and_models_inherit_it`.
+  Writing this entry also exposed a date-dependent release rehearsal: on the day
+  a release is cut, `test_the_real_changelog_becomes_releasable_once_the_version_is_promoted`
+  derived that release's own version and `promote` refused the duplicate. It now
+  freezes the clock and treats every documented version as taken.
+
+### Fixed
+
+- **`:validate:1.1`-only devices were reported as having no validation.**
+  `has_validate` matched only `urn:...:validate:1.0` exactly, so a device that
+  advertised 1.1 alone was treated as unvalidatable. It is now true for either
+  version (1.1 extends 1.0), and the new `has_validate_1_1` gates
+  `<test-option>test-only</test-option>`, which RFC 6241 §8.6.4.1 adds in 1.1
+  and §7.2 permits only with 1.1.
+- **The aggregate `Data` model could not be rebuilt from XML.** Its module
+  aliases were imported only under `TYPE_CHECKING`, so the first
+  `Data.from_xml()` raised `PydanticUndefinedAnnotation: name '_m_<module>' is
+  not defined`. The aliases are now bound at runtime with
+  `importlib.import_module` — not `from . import <name>`, which returns an
+  existing package attribute (the `element` callable, for a YANG module named
+  `element`) instead of the submodule — and the compiler's aggregate-annotation
+  guard recognises that assignment as a module binding rather than an object.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Changed

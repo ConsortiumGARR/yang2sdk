@@ -576,7 +576,21 @@ def test_the_real_changelog_becomes_releasable_once_the_version_is_promoted(
             "test_the_real_changelog_is_well_formed covers"
         )
 
-    _stub_taken(monkeypatch, pypi={"2026.10.16"}, tags={"v2026.10.16.1"})
+    # Two calendar dependencies, both removed here. The clock is frozen like the
+    # rest of this file (`on_a_frozen_day`), and every version the changelog
+    # already documents counts as taken -- otherwise, on the day a release was
+    # cut, `next_version()` returns the version that release documents and
+    # `promote` refuses a duplicate. Treating the documented set as taken is what
+    # a same-day re-release does in production, so the rehearsal picks the first
+    # free sequence number instead of depending on when the suite runs.
+    _freeze_clock(monkeypatch, release, FROZEN_DAY)
+    _freeze_clock(monkeypatch, changelog, FROZEN_DAY)
+    documented = {s.version for s in changelog.parse(text) if s.date}
+    _stub_taken(
+        monkeypatch,
+        pypi={"2026.10.16", release.declared_version(), *documented},
+        tags={"v2026.10.16.1"},
+    )
     version, _ = release.next_version()
 
     promoted = changelog.promote(text, version)
