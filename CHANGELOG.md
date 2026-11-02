@@ -7,6 +7,8 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ## [Unreleased]
 
+## [2026.11.2] - 2026-11-02
+
 ### Added
 
 - **NETCONF diff / plan / reconcile.** `NetconfClient.diff_instances(running_map, intended_map)`
