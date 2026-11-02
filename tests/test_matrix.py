@@ -2380,16 +2380,19 @@ def _plan_client(session, **overrides):
     return client
 
 
-def test_plan_prefers_test_only_and_never_commits(tmp_path):
+def test_plan_prefers_test_only_and_never_commits(tmp_path, capsys):
     """`test-only` needs :validate:1.1 and must never commit, even with
-    auto_commit=True."""
+    auto_commit=True. The plan renders into ``PlanResult.xml`` and writes
+    nothing to stdout: printing is the caller's choice."""
     out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
     session = _import(out, "session_manager")
     client = _plan_client(session, has_validate_1_1=True, auto_commit=True)
     diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
 
-    result = session.NetconfClient.plan(client, diff, show=False)
+    result = session.NetconfClient.plan(client, diff)
 
+    assert result.xml.startswith("<config")
+    assert capsys.readouterr().out == ""
     assert result.validated == "syntax"
     assert result.ok is True
     assert client.events[0][0] == "edit"
@@ -2408,12 +2411,12 @@ def test_plan_falls_back_to_candidate_and_refuses_a_dirty_one(tmp_path):
     dirty = _plan_client(session)
     dirty._candidate_is_clean = lambda: False
     with pytest.raises(RuntimeError, match="candidate already holds"):
-        session.NetconfClient.plan(dirty, diff, show=False)
+        session.NetconfClient.plan(dirty, diff)
     assert all(event[0] != "discard_changes" for event in dirty.events)
     assert any(event[0] == "unlock" for event in dirty.events)
 
     clean = _plan_client(session)
-    result = session.NetconfClient.plan(clean, diff, show=False)
+    result = session.NetconfClient.plan(clean, diff)
     assert result.validated == "datastore"
     names = [event[0] for event in clean.events]
     assert names[:2] == ["lock", "edit"]
@@ -2440,7 +2443,7 @@ def test_plan_falls_back_when_test_only_is_rejected(tmp_path):
         return True
 
     client.edit = edit
-    result = session.NetconfClient.plan(client, diff, show=False)
+    result = session.NetconfClient.plan(client, diff)
     assert result.validated == "datastore"
     assert any(event[0] == "discard_changes" for event in client.events)
 

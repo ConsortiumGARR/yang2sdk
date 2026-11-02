@@ -15,7 +15,7 @@ documented — a date-versioned scheme carries no compatibility promise.
   `~` keyed by the leaf-list node); `-` is collapsed at diff time to the highest
   wholly-removed node and carries `Removal.kind` (`leaf`, `container`,
   `list-entry`), so `plan()` and `reconcile()` need only the diff. `plan()`
-  builds one surgical `<config>`, prints it, and dry-runs it:
+  builds one surgical `<config>`, returns it on `PlanResult.xml` and dry-runs it:
   `<test-option>test-only</test-option>` when `:validate:1.1` is advertised
   (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds
   `test-only`), otherwise candidate staging + `<validate>` +

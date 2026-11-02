@@ -135,7 +135,8 @@ intended = Model.model_validate_instances(root, intended_map)  # offline schema 
 intended_map = intended.model_dump_instances(root, content="config")
 
 diff = client.diff_instances(running_map, intended_map)  # {+, ~, -}
-client.plan(diff)  # show + dry run
+result = client.plan(diff)  # build + dry run, no output
+print(result.xml)  # ...the rendered <config> is yours to print (or not)
 client.reconcile(diff)  # apply + commit
 ```
 
@@ -143,7 +144,7 @@ client.reconcile(diff)  # apply + commit
 
 `diff_instances()` returns `{"+": {path: value}, "~": {path: (running, intended)}, "-": {path: Removal}}`. Leaf-lists are compared as sequences: any difference (reorder, add, remove) is one `~` keyed by the leaf-list node, carrying `(running_sequence, intended_sequence)`. `-` is already collapsed to the highest wholly-removed node, and `Removal.kind` is `leaf`, `container` or `list-entry`, so the plan's granularity is visible before it is built. Collapsing in `diff_instances()` (which has both maps) is what lets `plan()` and `reconcile()` take the diff alone.
 
-`plan()` builds one `<config>` — merge for `+`/`~`, `nc:operation="remove"` for `-`, remove-then-merge for a leaf-list — prints it, and dry-runs it. The tiers are: `test-only` when the device advertises `:validate:1.1` (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds `test-only`), otherwise candidate staging + `<validate>` + `<discard-changes>`, otherwise message-only with `ok=None`. A plan never applies to running and never commits, even with `auto_commit=True`. `PlanResult.validated` reports which check ran (`syntax`, `edit`, `datastore` or `none`). The candidate tier locks first, refuses a candidate that already differs from running (so `discard-changes` cannot destroy another session's work), and discards only after staging.
+`plan()` builds one `<config>` — merge for `+`/`~`, `nc:operation="remove"` for `-`, remove-then-merge for a leaf-list — and dry-runs it, returning it as `PlanResult.xml` instead of printing it. The tiers are: `test-only` when the device advertises `:validate:1.1` (RFC 6241 §7.2 permits `<test-option>` only with 1.1; §8.6.4.1 adds `test-only`), otherwise candidate staging + `<validate>` + `<discard-changes>`, otherwise message-only with `ok=None`. A plan never applies to running and never commits, even with `auto_commit=True`. `PlanResult.validated` reports which check ran (`syntax`, `edit`, `datastore` or `none`). The candidate tier locks first, refuses a candidate that already differs from running (so `discard-changes` cannot destroy another session's work), and discards only after staging.
 
 `reconcile()` sends the same bytes and commits by default on a candidate, even when `auto_commit=False` — `plan()` is expected first. It passes `commit=False` to `edit()`, then validates and commits itself, so `auto_commit` can never commit before validation.
 

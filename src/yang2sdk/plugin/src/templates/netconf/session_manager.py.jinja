@@ -1328,17 +1328,17 @@ class NetconfClient:
             self.commit()
         return success
 
-    def plan(self, diff, *, target: str | None = None, show: bool = True) -> PlanResult:
-        """Show the surgical edit and dry-run it on the device.
+    def plan(self, diff, *, target: str | None = None) -> PlanResult:
+        """Build the surgical edit and dry-run it on the device.
 
-        Tier order: ``test-only`` when :validate:1.1 is advertised (no write),
-        else candidate staging + ``<validate>`` + discard, else message only.
-        A plan never applies to running and never commits.
+        The rendered intent is returned as ``PlanResult.xml``; print it if you
+        want to read it. Tier order: ``test-only`` when :validate:1.1 is
+        advertised (no write), else candidate staging + ``<validate>`` +
+        discard, else message only. A plan never applies to running and never
+        commits.
         """
         config = build_config(diff, self.module_namespaces)
         xml = etree.tostring(config, pretty_print=True, encoding="unicode")
-        if show:
-            print(xml)
         target = target or self.default_target
 
         if self.has_nmda:
