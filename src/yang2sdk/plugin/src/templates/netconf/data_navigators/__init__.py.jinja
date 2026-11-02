@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
+from lxml import etree
 from ._base import Node
 
 if TYPE_CHECKING:
@@ -9,6 +10,41 @@ if TYPE_CHECKING:
 
 class Data(Node):
     """Navigator for data nodes."""
+
+    def retrieve(
+        self,
+        *,
+        fields: list[str] | None = None,
+        source: str | None = None,
+        content: str = "config",
+        with_defaults: str = "report-all",
+        depth: int | str = "unbounded",
+    ):
+        """Retrieve all compiled top-level nodes in one RPC.
+
+        ``fields`` is a list of ``module:root[/child...]`` schema paths;
+        ``None`` selects every compiled root with its whole subtree. The
+        filter names only compiled roots, so ``Data.from_xml`` never sees an
+        uncompiled module and ``extra="forbid"`` cannot fire.
+        """
+        from ..data_models import Data as DataModel
+        from ._base import build_root_filter
+
+        roots = build_root_filter(DataModel, fields)
+        xml_data = self._client.retrieve(
+            source=source,
+            filter_xml=roots,
+            content=content,
+            with_defaults=with_defaults,
+            depth=depth,
+        )
+        if xml_data is None:
+            return None
+        return DataModel.from_xml(
+            etree.tostring(xml_data),
+            module_namespaces=self._client.module_namespaces,
+        )
+
     {% if not data_props %}
     pass
     {% endif %}
