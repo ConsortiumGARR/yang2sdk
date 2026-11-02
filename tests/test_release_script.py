@@ -21,6 +21,7 @@ from __future__ import annotations
 import email.message
 import hashlib
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -922,10 +923,120 @@ def test_needs_is_normalised_for_both_yaml_spellings() -> None:
     assert _needs("github-release") == ["build", "publish"]
 
 
+def _install_step() -> dict[str, Any]:
+    """The step that installs from PyPI, parsed rather than copied."""
+    steps = _workflow()["jobs"]["verify-published"]["steps"]
+    return next(
+        s for s in steps if s.get("name") == "Install the published release from PyPI"
+    )
+
+
 def test_verify_published_installs_the_exact_published_version() -> None:
-    """Not `yang2sdk` unpinned: that would install whatever is newest."""
-    assert "yang2sdk==${{ needs.build.outputs.version }}" in _job_shell(
-        "verify-published"
+    """Not `yang2sdk` unpinned: that would install whatever is newest.
+
+    The version reaches the shell through `env:` (see the empty guard), so the
+    assertion is on the pair: the expression is wired into `VERSION`, and the
+    command consumes `$VERSION` rather than a second copy of the expression
+    that could drift from it.
+    """
+    step = _install_step()
+    assert step["env"]["VERSION"] == "${{ needs.build.outputs.version }}"
+    assert "yang2sdk==$VERSION" in str(step["run"])
+
+
+def _retry_probe(tmp_path: Path, install_failures: int) -> tuple[int, str, str]:
+    """Run the workflow's own install step with stubbed `uv` and `sleep`.
+
+    The step text is parsed from `release.yaml`, never reproduced here. `uv` and
+    `sleep` are shell stubs on PATH, so the loop's control flow is what runs:
+    the stub records every invocation and fails the first `install_failures`
+    installs with the real error text, and the sleep stub logs instead of
+    waiting.
+    """
+    log = tmp_path / "calls.log"
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    uv = stubs / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$*" >> "$STUB_LOG"\n'
+        'case "$*" in\n'
+        '  *"pip install"*)\n'
+        "    n=$(grep -c 'pip install' \"$STUB_LOG\")\n"
+        '    if [ "$n" -le "$STUB_FAILURES" ]; then\n'
+        "      echo 'error: No solution found when resolving dependencies' >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    uv.chmod(0o755)
+    sleep = stubs / "sleep"
+    sleep.write_text('#!/usr/bin/env bash\necho "sleep $*" >> "$STUB_LOG"\n')
+    sleep.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stubs}:{env['PATH']}"
+    env["STUB_LOG"] = str(log)
+    env["STUB_FAILURES"] = str(install_failures)
+    env["VERSION"] = "2026.10.27"
+    proc = subprocess.run(
+        ["bash", "-e", "-c", str(_install_step()["run"])],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        env=env,
+    )
+    calls = log.read_text() if log.exists() else ""
+    return proc.returncode, calls, proc.stderr
+
+
+def test_the_install_waits_for_the_index_to_list_the_release(
+    tmp_path: Path,
+) -> None:
+    """An upload accepted is not yet an index entry that resolution can see.
+
+    Tag v2026.10.27 (run 40508021728) published correctly -- both artifacts
+    uploaded at 12:59:50Z/12:59:52Z, `publish` green at 12:59:55Z -- and this
+    job resolved at 13:00:01Z and failed with "there is no version of
+    yang2sdk==2026.10.27". The step must retry before it calls a good release
+    broken. Two stub failures then a success is that window, replayed.
+    """
+    rc, calls, stderr = _retry_probe(tmp_path, install_failures=2)
+    assert rc == 0, stderr
+    installs = calls.count("pip install")
+    assert installs == 3, calls
+    # each failure waited, the success did not
+    assert calls.count("sleep") == 2, calls
+    # and every attempt asked for the version, never for a bare package name
+    assert calls.count("yang2sdk==2026.10.27") == installs, calls
+    assert stderr.count("attempt") == 2, stderr
+
+
+def test_a_stale_cache_cannot_make_every_attempt_idempotently_fail(
+    tmp_path: Path,
+) -> None:
+    """`setup-uv` restores `~/.cache/uv`, so a retry without a refresh is theatre.
+
+    A cached simple-index page for this project predates the upload, and uv
+    treats it as fresh for its cache lifetime. `--refresh-package yang2sdk`
+    forces that one package's index data to be re-fetched on every attempt;
+    without it the loop would log six identical failures and report a broken
+    release.
+    """
+    rc, calls, stderr = _retry_probe(tmp_path, install_failures=99)
+    installs = calls.count("pip install")
+    assert calls.count("--refresh-package yang2sdk") == installs, calls
+    assert rc == 1
+    # bounded: it gives up rather than waiting forever
+    assert 2 <= installs <= 10, calls
+    assert calls.count("sleep") == installs - 1, calls
+    assert "2026.10.27" in stderr
+    assert "pypi.org/simple/yang2sdk" in stderr, (
+        "the final word must name where to look, so a genuine publish problem "
+        "is distinguishable from an index that is simply late: " + stderr
     )
 
 
@@ -1026,14 +1137,48 @@ def test_no_job_uses_a_uv_flag_that_does_not_exist() -> None:
     Found by running the step on uv 0.11.7, which rejected it outright. Checking
     the few flags these jobs use is cheaper than finding it during a release,
     and the fix was to delete the flag rather than to pin uv.
+
+    Lines are joined at `\\` first, and a leading shell keyword is stripped, so
+    the check sees the command GitHub would run rather than the fragment a
+    wrapped, `if`-guarded invocation starts with. Both were silently skipped
+    before: `--refresh-package` lives on a continuation line inside the retry
+    loop, and a check that cannot see it is not a check on it.
     """
     allowed = {("uv", "venv"), ("uv", "pip", "install"), ("uv", "pip", "--python")}
-    for line in _job_shell("verify-published").splitlines():
-        tokens = line.strip().split()
-        if tokens[:1] == ["uv"]:
-            assert any(tuple(tokens[: len(k)]) == k for k in allowed), (
-                f"unrecognised uv invocation: {line.strip()}"
-            )
+    # Flags these jobs actually use. Anything else is a guess about uv's CLI,
+    # and the last guess here (`--no-project`) was wrong on uv 0.11.7.
+    allowed_flags = {"--python", "--refresh-package"}
+    for line in _logical_lines(_job_shell("verify-published")):
+        tokens = line.split()
+        while tokens and tokens[0] in {"if", "elif", "then", "else", "while", "do"}:
+            tokens = tokens[1:]
+        if tokens[:1] != ["uv"]:
+            continue
+        assert any(tuple(tokens[: len(k)]) == k for k in allowed), (
+            f"unrecognised uv invocation: {line}"
+        )
+        for token in tokens[1:]:
+            if token.startswith("--"):
+                assert token in allowed_flags, (
+                    f"`{token}` is not one of the uv flags these jobs use "
+                    f"({', '.join(sorted(allowed_flags))}): {line}"
+                )
+
+
+def _logical_lines(text: str) -> list[str]:
+    """Shell lines with `\\` continuations joined, so flags survive the wrap."""
+    joined: list[str] = []
+    pending = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        joined.append((pending + stripped).strip())
+        pending = ""
+    if pending:
+        joined.append(pending.strip())
+    return joined
 
 
 def test_every_refusal_reaches_the_operator_not_a_traceback(

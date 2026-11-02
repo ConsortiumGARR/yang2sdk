@@ -202,6 +202,18 @@ shipped the package twice (`3b22730`) with every gate green, because every gate
 ran against the source tree. It deliberately runs no `checkout` step, so an
 editable install from the workspace cannot make it vacuous.
 
+Its install step retries (six attempts, 15 s apart) and passes
+`--refresh-package yang2sdk`, because an accepted upload and an index entry that
+`uv pip install` can resolve are two different states. On `v2026.10.27` (run
+`40508021728`) both artifacts were stored at 12:59:50Z/12:59:52Z and `publish`
+went green at 12:59:55Z, yet the install resolved at 13:00:01Z and was told
+there is no such version — a correct publish reported as a broken release. The
+refresh is the other half: `setup-uv` restores `~/.cache/uv` across runs, so a
+cached simple-index page for this project can predate the upload and every retry
+would otherwise re-read it. The loop is bounded, and its last line points at
+`https://pypi.org/simple/yang2sdk/` so a late index is never confused with a
+failed publish.
+
 Note the distinction from the pre-existing `itnog10` / `tnc26` tags: those are
 conference tags, not releases. They do not match a version and nothing
 publishes from them (`release.yaml` triggers only on `v*`).

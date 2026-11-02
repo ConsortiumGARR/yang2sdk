@@ -140,12 +140,56 @@ jobs:
       # job vacuous. `uv pip install` is the pip-compatible interface and does not
       # discover the project in $GITHUB_WORKSPACE (there is no `--no-project`
       # flag; that was written here, failed on uv 0.11.7, and was removed).
+      #
+      # The install is retried, because a successful upload and a resolvable
+      # release are two different states. `publish` returns once PyPI has stored
+      # the files; the *simple index* that `uv pip install` resolves against is
+      # generated and served separately, so there is a window in which the
+      # version exists but no index page mentions it. Measured on tag
+      # v2026.10.27 (run 40508021728): both artifacts carry upload times
+      # 12:59:50Z and 12:59:52Z, `publish` finished at 12:59:55Z, and this step
+      # resolved at 13:00:01Z and was told "there is no version of
+      # yang2sdk==2026.10.27" -- a correct upload reported as a broken release
+      # nine seconds later. Waiting is not papering over a bad publish; it is the
+      # difference between "PyPI has it" and "PyPI's index admits it has it".
+      #
+      # `--refresh-package yang2sdk` is the other half: setup-uv restores
+      # `~/.cache/uv` between runs ("Cache mode: write", so this job saves one),
+      # and a cached index page for this project can predate the upload. Without
+      # the refresh, every retry re-reads the same stale listing and the wait is
+      # theatre. The loop is bounded, and its last word says where to look rather
+      # than implying the release itself failed.
       - name: Install the published release from PyPI
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          test -n "$VERSION" || {
+            echo "build.outputs.version is empty, so this step could not install anything" >&2
+            exit 1
+          }
           uv venv /tmp/published
-          uv pip install --python /tmp/published/bin/python \
-            "yang2sdk==${{ needs.build.outputs.version }}"
+          attempt=1
+          attempts=6
+          delay=15
+          while :; do
+            if uv pip install --python /tmp/published/bin/python \
+                 --refresh-package yang2sdk "yang2sdk==$VERSION"; then
+              exit 0
+            fi
+            if [ "$attempt" -ge "$attempts" ]; then
+              echo "yang2sdk==$VERSION was still not installable after" \
+                "$attempts attempts (~$(( (attempts - 1) * delay ))s), though" \
+                "the publish job succeeded. Check" \
+                "https://pypi.org/simple/yang2sdk/ before treating the" \
+                "release as broken." >&2
+              exit 1
+            fi
+            echo "attempt $attempt/$attempts: yang2sdk==$VERSION is not in the" \
+              "index yet, retrying in ${delay}s" >&2
+            sleep "$delay"
+            attempt=$((attempt + 1))
+          done
 
       # The expression goes through `env`, never inline in the `run:` body.
       # Written inline it was mistyped as `{{ needs.build.outputs.version }}`
