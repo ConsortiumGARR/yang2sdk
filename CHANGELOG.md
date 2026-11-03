@@ -5,27 +5,6 @@ All notable changes to `yang2sdk` are documented here. Format follows
 on the release date (`YYYY.M.D`), and breaking changes are allowed and
 documented — a date-versioned scheme carries no compatibility promise.
 
-## [Unreleased]
-
-### Fixed
-
-- **The release pipeline no longer fails a good publish while PyPI's index
-  catches up.** `verify-published` ran `uv pip install "yang2sdk==<version>"`
-  once, seconds after `publish` returned, so a tag could go green on build and
-  upload and then red with `no version of yang2sdk==<version>` — measured on
-  `v2026.10.27` (run `40508021728`), where both artifacts were stored by
-  12:59:52Z and the install resolved at 13:00:01Z. The step now retries (six
-  attempts, 15 s apart) and passes `--refresh-package yang2sdk`, because
-  `setup-uv` restores `~/.cache/uv` between runs and a cached simple-index page
-  for this project can predate the upload, which would make an unrefreshed retry
-  fail identically every time. The version now also reaches the shell through
-  `env:` with an empty-output guard, so an unset `build.outputs.version` fails
-  loudly instead of being installed as `yang2sdk==`. Replayed offline with
-  stubbed `uv`/`sleep` (success after two failures, and a bounded six-attempt
-  refusal) and once against real PyPI; pinned by
-  `tests/test_release_script.py::test_the_install_waits_for_the_index_to_list_the_release`
-  and `::test_a_stale_cache_cannot_make_every_attempt_idempotently_fail`.
-
 ## [2026.11.2] - 2026-11-02
 
 ### Added
@@ -156,6 +135,22 @@ documented — a date-versioned scheme carries no compatibility promise.
   existing package attribute (the `element` callable, for a YANG module named
   `element`) instead of the submodule — and the compiler's aggregate-annotation
   guard recognises that assignment as a module binding rather than an object.
+- **The release pipeline no longer fails a good publish while PyPI's index
+  catches up.** `verify-published` ran `uv pip install "yang2sdk==<version>"`
+  once, seconds after `publish` returned, so a tag could go green on build and
+  upload and then red with `no version of yang2sdk==<version>` — measured on
+  `v2026.10.27` (run `40508021728`), where both artifacts were stored by
+  12:59:52Z and the install resolved at 13:00:01Z. The step now retries (six
+  attempts, 15 s apart) and passes `--refresh-package yang2sdk`, because
+  `setup-uv` restores `~/.cache/uv` between runs and a cached simple-index page
+  for this project can predate the upload, which would make an unrefreshed retry
+  fail identically every time. The version now also reaches the shell through
+  `env:` with an empty-output guard, so an unset `build.outputs.version` fails
+  loudly instead of being installed as `yang2sdk==`. Replayed offline with
+  stubbed `uv`/`sleep` (success after two failures, and a bounded six-attempt
+  refusal) and once against real PyPI; pinned by
+  `tests/test_release_script.py::test_the_install_waits_for_the_index_to_list_the_release`
+  and `::test_a_stale_cache_cannot_make_every_attempt_idempotently_fail`.
 
 ## [2026.10.27] - 2026-10-27
 
