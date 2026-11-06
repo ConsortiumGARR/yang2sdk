@@ -4815,6 +4815,61 @@ BUILTIN_COLLISION_YANG = """module tbi {
 }"""
 
 
+SHADOWED_TYPE_YANG = """module tsh {
+  prefix ts;
+  namespace "urn:test:tsh";
+  revision 2026-01-01;
+  container root {
+    container Keys {
+      description "Keys";
+      leaf a { type string; }
+    }
+    container Holder {
+      leaf element { type string; }
+      leaf Field { type string; }
+      leaf after { type string; description "element Field Keys"; }
+      container Ts { leaf n { type uint8; } }
+    }
+  }
+}"""
+
+
+def test_field_named_like_its_type_still_imports(tmp_path):
+    """A field whose name is a type (or callable) a later declaration reads must import.
+
+    Regression (Infinera FlexILS 22.3.2, `keys.py`): a YANG container spelled
+    `Keys` generated
+
+        class RootData(...):
+            Keys: Keys | None = element(...)
+
+    Python binds the target before evaluating the annotation, so `Keys` was the
+    field's `FieldInfo` and the module raised
+    `TypeError: unsupported operand type(s) for |: 'FieldInfo' and 'NoneType'`
+    at import. An earlier field named `element` (NETCONF) or `Field` (RESTCONF)
+    breaks every later default the same way.
+    """
+    for fmt in ("restconf", "netconf"):
+        out, compiled = _gen(tmp_path / fmt, fmt, SHADOWED_TYPE_YANG, "tsh")
+        assert compiled, f"{fmt}: generated code failed to compile"
+        models = _import(out, "data_models.tsh")
+        _import(out, "data_navigators.tsh")
+
+        # The public attribute keeps the YANG spelling and points at the class.
+        root = models.Root.model_fields
+        assert root["Keys"].annotation == models.Keys | None, (fmt, root["Keys"])
+        holder = models.Holder.model_fields
+        assert {"element", "Field", "after", "Ts"} <= set(holder), (fmt, sorted(holder))
+        assert holder["Ts"].annotation == models.Ts | None, (fmt, holder["Ts"])
+        # String literals are untouched by the rewrite.
+        assert holder["after"].description == "element Field Keys", fmt
+        assert models.Keys.__doc__ == "Keys", fmt
+
+        # Round-trip through the real field, not only the class definition.
+        inst = models.Root(Keys=models.Keys(a="x"))
+        assert inst.Keys.a == "x", fmt
+
+
 MODULE_NAME_COLLISION_YANG = """module {name} {{
   prefix m;
   namespace "urn:test:{name}";

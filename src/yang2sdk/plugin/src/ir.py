@@ -1,5 +1,6 @@
 """INTERMEDIATE REPRESENTATION (IR) DATACLASSES AND BUILDER"""
 
+import ast
 import hashlib
 import keyword
 import re
@@ -99,6 +100,37 @@ def _generated_code_builtins() -> frozenset[str]:
 _GENERATED_CODE_BUILTINS = _generated_code_builtins()
 
 
+def _rewrite_shadowed(expr: str, shadowed: set[str], aliases: dict[str, str]) -> str:
+    """Replace every bare `Name` in ``expr`` that is in ``shadowed`` by its alias.
+
+    Uses the expression's AST so string literals (descriptions, patterns) and
+    keyword-argument names are never touched. ``aliases`` maps target name to
+    alias and is extended in place.
+    """
+    if not shadowed:
+        return expr
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:  # pragma: no cover - the emitter validates its output
+        return expr
+    hits = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Name) and n.id in shadowed and n.lineno == n.end_lineno
+    ]
+    if not hits:
+        return expr
+    # AST column offsets are UTF-8 byte offsets; descriptions may be non-ASCII.
+    lines = expr.encode().split(b"\n")
+    for n in sorted(hits, key=lambda n: (n.lineno, n.col_offset), reverse=True):
+        alias = aliases.setdefault(n.id, f"_shadowed_{n.id}")
+        line = lines[n.lineno - 1]
+        lines[n.lineno - 1] = (
+            line[: n.col_offset] + alias.encode() + line[n.end_col_offset :]
+        )
+    return b"\n".join(lines).decode()
+
+
 @dataclass
 class IRField:
     name: str
@@ -130,6 +162,11 @@ class IRModel:
     #: `[ip=...][port=...]`, and RFC 7950 Sec 9.13 requires the predicates in
     #: key-statement order.
     key_order: tuple[str, ...] = ()
+    #: ``(alias, target)`` pairs the template binds at module level right before
+    #: this class, for names a field's annotation or default would otherwise
+    #: read *after* an earlier field (or the field itself) rebound them in the
+    #: class body. Filled by `IRBuilder._alias_shadowed_names`.
+    shadow_aliases: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -493,7 +530,56 @@ class IRBuilder:
         for uri, prefix in self._synth_prefixes.items():
             self.ir.imports_nsmap.setdefault(prefix, uri)
 
+        self._alias_shadowed_names()
+
         return self.ir
+
+    def _alias_shadowed_names(self) -> None:
+        """Stop a field name from shadowing a name a later annotation reads.
+
+        Field names keep the YANG node's spelling, and class names are its
+        PascalCase form, so a node already spelled in PascalCase yields a field
+        whose name *is* its type's class name. The generated models emit no
+        `from __future__ import annotations`, and in an annotated class-body
+        assignment Python evaluates the value, binds the target, and only then
+        evaluates the annotation. So
+
+            class KeysData(...):
+                Keys: Keys | None = element(...)
+
+        reads the annotation's `Keys` *after* it was rebound to the field's
+        `FieldInfo`, and the module fails at import with
+        `TypeError: unsupported operand type(s) for |: 'FieldInfo' and
+        'NoneType'` (measured on Infinera FlexILS 22.3.2: `keys.py` and
+        `snc.py`'s `Ts`, `Srlg`, `Ix`). The same holds for any *earlier* field
+        name a later annotation or default reads -- e.g. a leaf named `element`
+        breaks every following `element(...)` call on NETCONF.
+
+        Renaming the field would change the public attribute (and is
+        already reserved for real conflicts, see `_to_field_name`), so the
+        reference is rewritten instead: each shadowed name gets a module-level
+        alias (`_shadowed_<name> = <name>`), emitted by the templates right
+        before the class. Every name an annotation or default reads is a
+        module-level class, enum or import that must already be defined at that
+        point (annotations are evaluated eagerly), so the alias is always
+        bindable there. `_shadowed_` cannot collide with a generated model,
+        enum or field name: `_to_class_name` never yields a leading underscore
+        and pydantic forbids underscore-prefixed fields.
+        """
+        for model in self.ir.models:
+            bound: set[str] = set()
+            aliases: dict[str, str] = {}
+            for f in model.fields:
+                # The default is evaluated before the target is bound; the
+                # annotation after. Hence the field's own name only counts for
+                # the annotation.
+                if f.assignment:
+                    f.assignment = _rewrite_shadowed(f.assignment, bound, aliases)
+                f.type_str = _rewrite_shadowed(f.type_str, bound | {f.name}, aliases)
+                bound.add(f.name)
+            model.shadow_aliases = tuple(
+                (alias, target) for target, alias in aliases.items()
+            )
 
     def _build_actions(self, stmt) -> None:
         """Build Input/Output models for every nested YANG `action` statement."""

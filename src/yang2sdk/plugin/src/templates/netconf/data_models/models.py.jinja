@@ -52,6 +52,12 @@ class {{ enum.name }}(str, Enum):
 
 {% endfor %}
 {% for model in module.models %}
+{# See IRBuilder._alias_shadowed_names: a field named like a type it (or a
+   later field) references would rebind that name before the annotation reads
+   it. #}
+{% for alias, target in model.shadow_aliases %}
+{{ alias }} = {{ target }}
+{% endfor %}
 class {{ model.name }}({% if model.is_rpc_envelope %}_ModuleRpcBase{% else %}_ModuleBase{% endif %}, tag="{{ model.yang_name }}", ns="{{ model.ns_alias }}"):
     """{{ model.description }}"""
     {% if model.key_order %}
