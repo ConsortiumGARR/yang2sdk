@@ -2363,6 +2363,7 @@ def _plan_client(session, **overrides):
     client.has_validate = True
     client.has_candidate = True
     client.auto_commit = False
+    client._held_locks = set()
     client.events = []
 
     def record(name):

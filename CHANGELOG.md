@@ -25,6 +25,14 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Fixed
 
+- **NETCONF `plan()`/`reconcile()` failed with `lock-denied` inside
+  `with NetconfClient(...)`.** `__enter__` locks the candidate and both methods
+  locked it again; RFC 6241 §7.5 makes the server refuse a lock already held by
+  any session, the requester included, so the client was denied by its own
+  lock. `lock()` is now re-entrant per session (a held datastore is not
+  re-locked), `unlock()` of a datastore the session does not hold is a no-op,
+  and `plan()`/`reconcile()` release only a lock they acquired themselves.
+  Pinned by `tests/test_netconf_locking.py`.
 - The root picker looked for modules in `temp/yang_modules/` instead of
   `temp/yang_modules/$DEVICE_NAME` when `--device` was omitted, although the
   compiler itself already defaulted `--device` to `$DEVICE_NAME`.

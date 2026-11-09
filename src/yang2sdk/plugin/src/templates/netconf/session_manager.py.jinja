@@ -3,7 +3,8 @@ import copy
 import logging
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Self
@@ -886,6 +887,12 @@ class NetconfClient:
                 "password or key_filename, or set DEVICE_USER and DEVICE_PASS / "
                 "DEVICE_SSH_KEY in the environment."
             )
+        # Datastores this session holds a <lock> on. RFC 6241 Sec 7.5 requires
+        # the server to refuse a lock that is already held -- by ANY session,
+        # including the requester -- so locking must be tracked here or a
+        # nested plan()/reconcile() inside `with NetconfClient(...)` would be
+        # denied by its own session's lock.
+        self._held_locks: set[str] = set()
         self.auto_commit = auto_commit
         self.log_bodies = log_bodies
         if kwargs:
@@ -1012,6 +1019,10 @@ class NetconfClient:
         run. `manager.connect()` opens an SSH transport and a NETCONF session
         that the device counts against its session limits; nothing released
         them before this existed except garbage collection.
+
+        The lock taken here is reused by `plan()` and `reconcile()` inside the
+        block: they neither re-lock (which the server would deny) nor release
+        it early. It is released once, on exit.
         """
         try:
             self.lock()
@@ -1046,6 +1057,8 @@ class NetconfClient:
             log.debug("close_session() raised during teardown", exc_info=True)
         finally:
             self._manager = None
+            # Locks die with the session (RFC 6241 Sec 7.5).
+            self._held_locks = set()
 
     def __del__(self) -> None:  # pragma: no cover - GC path
         try:
@@ -1063,14 +1076,52 @@ class NetconfClient:
         return self._manager
 
     def lock(self, target: str | None = None) -> bool:
+        """Lock ``target``; a no-op returning True if this session holds it.
+
+        Re-entrant on purpose: RFC 6241 Sec 7.5 makes the server deny a lock
+        already held by the requesting session itself (`lock-denied`).
+        """
         target = target or self.default_target
+        if target in self._held_locks:
+            log.debug(f"Lock on {target} datastore already held by this session.")
+            return True
         log.debug(f"Acquiring lock on {target} datastore.")
-        return self._handle_rpc(self._mc.lock, target=target).ok
+        ok = self._handle_rpc(self._mc.lock, target=target).ok
+        if ok:
+            self._held_locks.add(target)
+        return ok
 
     def unlock(self, target: str | None = None) -> bool:
+        """Release ``target``; a no-op returning True if this session does not hold it."""
         target = target or self.default_target
+        if target not in self._held_locks:
+            log.debug(f"No lock held on {target} datastore; nothing to release.")
+            return True
         log.debug(f"Releasing lock on {target} datastore.")
-        return self._handle_rpc(self._mc.unlock, target=target).ok
+        try:
+            return self._handle_rpc(self._mc.unlock, target=target).ok
+        finally:
+            self._held_locks.discard(target)
+
+    @contextmanager
+    def _scoped_lock(self, target: str, purpose: str) -> Iterator[None]:
+        """Hold ``target`` locked for the block, releasing only what it took.
+
+        If the session already holds the lock (e.g. `__enter__` took it), the
+        block runs under that lock and leaves it in place for its owner.
+        """
+        if target in self._held_locks:
+            yield
+            return
+        if not self.lock(target):
+            raise RuntimeError(f"Could not lock {target}; refusing to {purpose}.")
+        try:
+            yield
+        finally:
+            try:
+                self.unlock(target)
+            except Exception:  # noqa: BLE001 - never mask the block's outcome
+                log.exception(f"Failed to release the {target} lock after {purpose}.")
 
     def _handle_rpc(self, func, *args, **kwargs) -> Any:
         """Centralized dispatch: error handling plus INFO/DEBUG wire logging.
@@ -1375,36 +1426,29 @@ class NetconfClient:
                 "Device has no :candidate datastore, so a plan cannot be staged "
                 "for validation."
             )
-        if not self.lock("candidate"):
-            raise RuntimeError(
-                "Could not lock candidate; refusing to stage a plan."
-            )
-        staged = False
-        try:
-            if not self._candidate_is_clean():
-                raise RuntimeError(
-                    "candidate already holds uncommitted changes; refusing to "
-                    "stage a plan (discard-changes would destroy them)."
-                )
-            staged = True
-            ok = self.edit(config, target="candidate", commit=False)
-            validated = "edit"
-            if ok and self.has_validate:
-                ok = self.validate(source="candidate")
-                validated = "datastore"
-            return PlanResult(xml=xml, ok=ok, validated=validated)
-        finally:
-            if staged:
-                try:
-                    self.discard_changes()
-                except Exception:
-                    log.exception(
-                        "Failed to discard the staged plan; candidate may still hold it."
-                    )
+        with self._scoped_lock("candidate", "stage a plan"):
+            staged = False
             try:
-                self.unlock("candidate")
-            except Exception:
-                log.exception("Failed to release the candidate lock after plan().")
+                if not self._candidate_is_clean():
+                    raise RuntimeError(
+                        "candidate already holds uncommitted changes; refusing to "
+                        "stage a plan (discard-changes would destroy them)."
+                    )
+                staged = True
+                ok = self.edit(config, target="candidate", commit=False)
+                validated = "edit"
+                if ok and self.has_validate:
+                    ok = self.validate(source="candidate")
+                    validated = "datastore"
+                return PlanResult(xml=xml, ok=ok, validated=validated)
+            finally:
+                if staged:
+                    try:
+                        self.discard_changes()
+                    except Exception:
+                        log.exception(
+                            "Failed to discard the staged plan; candidate may still hold it."
+                        )
 
     def _candidate_is_clean(self) -> bool:
         candidate = self.retrieve(source="candidate", content="config")
@@ -1422,41 +1466,33 @@ class NetconfClient:
         target = target or self.default_target
 
         if target == "candidate" and self.has_candidate:
-            if not self.lock("candidate"):
-                raise RuntimeError(
-                    "Could not lock candidate; refusing to reconcile."
-                )
-            staged = False
-            try:
-                if not self._candidate_is_clean():
-                    raise RuntimeError(
-                        "candidate already holds uncommitted changes; refusing "
-                        "to reconcile (commit would include them)."
-                    )
-                staged = True
-                ok = self.edit(config, target="candidate", commit=False)
-                if ok and self.has_validate:
-                    ok = self.validate(source="candidate")
-                if ok and commit:
-                    ok = self.commit()
-                if not ok:
-                    self.discard_changes()
-                    staged = False
-                return ok
-            except Exception:
-                if staged:
-                    try:
-                        self.discard_changes()
-                    except Exception:
-                        log.exception(
-                            "Failed to discard the failed reconcile; candidate may still hold it."
-                        )
-                raise
-            finally:
+            with self._scoped_lock("candidate", "reconcile"):
+                staged = False
                 try:
-                    self.unlock("candidate")
+                    if not self._candidate_is_clean():
+                        raise RuntimeError(
+                            "candidate already holds uncommitted changes; refusing "
+                            "to reconcile (commit would include them)."
+                        )
+                    staged = True
+                    ok = self.edit(config, target="candidate", commit=False)
+                    if ok and self.has_validate:
+                        ok = self.validate(source="candidate")
+                    if ok and commit:
+                        ok = self.commit()
+                    if not ok:
+                        self.discard_changes()
+                        staged = False
+                    return ok
                 except Exception:
-                    log.exception("Failed to release the candidate lock after reconcile().")
+                    if staged:
+                        try:
+                            self.discard_changes()
+                        except Exception:
+                            log.exception(
+                                "Failed to discard the failed reconcile; candidate may still hold it."
+                            )
+                    raise
 
         return self.edit(config, target=target, commit=False)
 
