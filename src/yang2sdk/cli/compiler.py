@@ -11,6 +11,7 @@ from typing import Literal
 from pyang.scripts.pyang_tool import run
 
 import yang2sdk.plugin as entry_pkg
+from yang2sdk.cli.device_info import read_device_info
 from yang2sdk.cli.features import (
     FEATURES_FILENAME,
     read_features_file,
@@ -201,7 +202,9 @@ class Compiler:
             sys.exit(1)
 
 
-def _resolve_device_version(supplied: str | None, device: str) -> str:
+def _resolve_device_version(
+    supplied: str | None, device: str | None, yang_dir: Path | None = None
+) -> str:
     """Resolve `--device-version`, scoping the ambient fallback to one device.
 
     ``$DEVICE_NAME`` and ``$DEVICE_VERSION`` are one pair describing ONE lab
@@ -219,7 +222,11 @@ def _resolve_device_version(supplied: str | None, device: str) -> str:
     device that is 10.4-4.
 
     Precedence:
-      * ``supplied is not None`` -- an explicit ``--device-version`` always wins.
+      * ``supplied is not None`` -- an explicit ``--release`` /
+        ``--device-version`` always wins.
+      * ``<yang_dir>/device.json`` names this device -- use its release. The
+        downloader records it from the device the modules were pulled from,
+        so it describes exactly these modules (see ``cli/device_info.py``).
       * device == ``$DEVICE_NAME`` -- inherit ``$DEVICE_VERSION`` (the documented
         behaviour, unchanged for the device those variables actually describe).
       * otherwise -- no version. ``core.py`` turns empty into ``0.0.0``, so the
@@ -227,7 +234,11 @@ def _resolve_device_version(supplied: str | None, device: str) -> str:
     """
     if supplied is not None:
         return supplied
-    if os.environ.get("DEVICE_NAME") == device:
+    if yang_dir is not None and device:
+        info = read_device_info(yang_dir)
+        if info.get("device") == device and info.get("release"):
+            return info["release"]
+    if device and os.environ.get("DEVICE_NAME") == device:
         return os.environ.get("DEVICE_VERSION", "")
     return ""
 
@@ -261,13 +272,17 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         help="Configure output schemas to serialize and validate config-only nodes.",
     )
     parser.add_argument(
+        "--release",
         "--device-version",
+        dest="device_version",
         # None = "not supplied on the command line". Resolved after parsing by
         # _resolve_device_version(); see its docstring for why the ambient
         # fallback cannot be a plain default here.
         default=None,
-        help="Device OS version for package provenance (MANIFEST + package name). "
-        "Falls back to $DEVICE_VERSION only when the target device is $DEVICE_NAME.",
+        help="Device OS release for package provenance (MANIFEST + package name "
+        "<device>_<release>). Falls back to <yang-dir>/device.json (written by "
+        "yang-downloader), then to $DEVICE_VERSION only when the target device is "
+        "$DEVICE_NAME; otherwise the package is <device>_0_0_0.",
     )
     parser.add_argument(
         "--package-version",
@@ -348,9 +363,6 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
     )
 
     parsed_args = parser.parse_args(argv)
-    parsed_args.device_version = _resolve_device_version(
-        parsed_args.device_version, parsed_args.device
-    )
 
     if not parsed_args.device:
         print(
@@ -361,6 +373,9 @@ def run_compiler(format_type: Literal["restconf", "netconf"], argv: list[str]) -
         sys.exit(1)
 
     yang_dir = yangs_dir(parsed_args)
+    parsed_args.device_version = _resolve_device_version(
+        parsed_args.device_version, parsed_args.device, yang_dir
+    )
     _require_yang_dir(yang_dir)
     feature_set = resolve_features(
         yang_dir=yang_dir,

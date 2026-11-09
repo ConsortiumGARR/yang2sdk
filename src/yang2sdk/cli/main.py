@@ -18,12 +18,14 @@ on an SR Linux tree, including both roots ci-srl compiles).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from .. import __version__
 from . import rootpicker
-from .compiler import run_compiler
+from .compiler import _resolve_device_version, run_compiler
+from .device_info import ask, interactive
 
 GUIDE = """\
 yang2sdk -- generate a RESTCONF or NETCONF SDK from YANG modules.
@@ -103,16 +105,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _probe(forwarded: list[str]) -> argparse.Namespace:
+    """The identity flags the compiler will see, parsed the way it parses them."""
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--device", default=os.environ.get("DEVICE_NAME"))
+    probe.add_argument("--yang-dir", default=None)
+    probe.add_argument("--release", "--device-version", dest="device_version")
+    known, _ = probe.parse_known_args(forwarded)
+    return known
+
+
+def _ask_device(forwarded: list[str]) -> list[str]:
+    """No `--device` and no `$DEVICE_NAME`: ask, if a human is there to answer."""
+    if _probe(forwarded).device or not interactive():
+        return forwarded
+    device = ask("Device name")
+    return [*forwarded, "--device", device] if device else forwarded
+
+
+def _ask_release(forwarded: list[str]) -> list[str]:
+    """Ask for the OS release when nothing would supply one.
+
+    Without it the package is named `<device>_0_0_0`. Sources tried first, in
+    the compiler's own order: `--release`, `<yang-dir>/device.json`, then
+    `$DEVICE_VERSION` scoped to `$DEVICE_NAME`. An empty answer is passed as an
+    explicit "no release", so the compiler does not fall back again.
+    """
+    known = _probe(forwarded)
+    if known.device_version is not None or not known.device or not interactive():
+        return forwarded
+    if _resolve_device_version(None, known.device, _yang_dir(forwarded)):
+        return forwarded
+    release = ask(f"Release (OS version) of {known.device}, empty for 0.0.0")
+    return [*forwarded, "--release", release]
+
+
 def _yang_dir(forwarded: list[str]) -> Path:
     """Where the modules live, mirroring compiler.yangs_dir exactly.
 
     Kept in step with the compiler's own default (`temp/yang_modules/<device>`)
     rather than duplicated from memory.
     """
-    probe = argparse.ArgumentParser(add_help=False)
-    probe.add_argument("--device", default=None)
-    probe.add_argument("--yang-dir", default=None)
-    known, _ = probe.parse_known_args(forwarded)
+    known = _probe(forwarded)
     if known.yang_dir:
         return Path(known.yang_dir)
     return Path.cwd() / "temp" / "yang_modules" / (known.device or "")
@@ -136,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr if not argv or argv[0] not in ("-h", "--help") else sys.stdout
         )
         return 0 if argv and argv[0] in ("-h", "--help") else 2
+
+    forwarded = _ask_device(forwarded)
 
     # Anything that looks like a YANG file is a root the caller already chose.
     named = [t for t in forwarded if t.endswith((".yang", ".yin"))]
@@ -164,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_roots:
         return 0
 
+    forwarded = _ask_release(forwarded)
     run_compiler(args.protocol, [*roots, *forwarded])
     return 0
 

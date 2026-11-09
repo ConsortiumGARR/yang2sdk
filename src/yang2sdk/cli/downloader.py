@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from yang2sdk.cli.device_info import ask, interactive, write_device_info
 from yang2sdk.cli.features import (
     FEATURES_FILENAME,
     parse_capability_features,
@@ -354,17 +355,71 @@ class YangDownloader:
             return 1
 
 
+# IANA-assigned NETCONF-over-SSH port (RFC 6242 Sec 3).
+DEFAULT_NETCONF_PORT = "830"
+
+
+def _resolve_settings() -> dict[str, str]:
+    """Read the target from the environment, asking for whatever is missing.
+
+    `.env` stays the primary source; a prompt only fills a gap, and only when
+    a human is at a terminal. Without a TTY a missing required value is still
+    the exit-2 configuration error it always was, so CI never blocks on a read.
+    `NETCONF_PORT` defaults to 830 and the release is optional (it names the
+    generated package later, `<device>_0_0_0` when unknown).
+    """
+    tty = interactive()
+    env = os.environ
+    settings: dict[str, str] = {}
+    missing: list[str] = []
+
+    def take(key: str, label: str, default: str | None = None) -> None:
+        value = env.get(key, "")
+        if not value and tty:
+            value = ask(label, default)
+        if not value and default is not None:
+            value = default
+        settings[key] = value
+        if not value and default is None:
+            missing.append(key)
+
+    if tty and not env.get("DEVICE_IP"):
+        print(
+            "yang-downloader is LAB ONLY: never point it at a production device.",
+            file=sys.stderr,
+        )
+    take("DEVICE_IP", "Device IP (lab only)")
+    take("DEVICE_NAME", "Device name")
+    take("DEVICE_VERSION", "Device release (OS version, empty if unknown)", "")
+    take("NETCONF_PORT", "NETCONF port", DEFAULT_NETCONF_PORT)
+    take("DEVICE_USER", "Username")
+    if missing:
+        print(
+            f"Environment configuration missing key(s): {', '.join(missing)}. "
+            "Set them in .env, or run from a terminal to be asked.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        int(settings["NETCONF_PORT"])
+    except ValueError:
+        print(
+            f"NETCONF_PORT must be an integer, got {settings['NETCONF_PORT']!r}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return settings
+
+
 def main():
     _configure_logging()
     load_dotenv()
-    try:
-        ip = os.environ["DEVICE_IP"]
-        port = os.environ["NETCONF_PORT"]
-        username = os.environ["DEVICE_USER"]
-        device_name = os.environ["DEVICE_NAME"]
-    except KeyError as e:
-        print(f"Environment configuration missing key: {e}", file=sys.stderr)
-        sys.exit(2)
+    settings = _resolve_settings()
+    ip = settings["DEVICE_IP"]
+    port = settings["NETCONF_PORT"]
+    username = settings["DEVICE_USER"]
+    device_name = settings["DEVICE_NAME"]
+    release = settings["DEVICE_VERSION"]
 
     # Password and SSH key are alternatives. Both are optional here so the
     # constructor can report the single actionable "credentials missing" error
@@ -372,6 +427,9 @@ def main():
     password = os.environ.get("DEVICE_PASS")
     key_filename = os.environ.get("DEVICE_SSH_KEY")
     passphrase = os.environ.get("DEVICE_SSH_KEY_PASSPHRASE")
+    if not password and not key_filename and interactive():
+        # Never echoed, never logged (getpass).
+        password = ask("Password", secret=True) or None
     if password and key_filename:
         # Same rule as the generated NETCONF client: an environment key wins
         # over an environment password, but never silently. The downloader
@@ -397,6 +455,9 @@ def main():
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(2)
     failed = extractor.download_all()
+    # Record which device/release these modules came from, so `yang2sdk`
+    # names the package `<device>_<release>` without repeating --release.
+    write_device_info(output_path, device=device_name, release=release)
     if failed:
         # download_all() already reported the failure; make the CLI status
         # agree with it. Returning normally here made an authentication error

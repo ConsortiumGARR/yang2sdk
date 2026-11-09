@@ -5,6 +5,30 @@ All notable changes to `yang2sdk` are documented here. Format follows
 on the release date (`YYYY.M.D`), and breaking changes are allowed and
 documented — a date-versioned scheme carries no compatibility promise.
 
+## [Unreleased]
+
+### Added
+
+- **`yang-downloader` asks for what `.env` does not provide.** At a terminal it
+  prompts for the device IP, name, release, NETCONF port (default 830, RFC 6242
+  §3), username and password (`getpass`, never echoed); `.env` values are not
+  asked again. Without a terminal a missing IP/name/user is still an exit-2
+  error, so CI never blocks on a read. `NETCONF_PORT` is no longer required (it
+  defaults to 830) and is rejected if it is not an integer.
+- **`yang2sdk --release`.** The package used to be `<device>_0_0_0` unless you
+  knew to pass `--device-version` (kept as an alias). The downloader now writes
+  `<yang-dir>/device.json` with the device name and release, and the compiler
+  uses it when the device matches (precedence: `--release` > `device.json` >
+  `$DEVICE_VERSION` scoped to `$DEVICE_NAME`). With none of those at a terminal,
+  `yang2sdk` asks for the device name and release; an empty answer means
+  `0.0.0`. Pinned by `tests/test_cli_prompts.py`.
+
+### Fixed
+
+- The root picker looked for modules in `temp/yang_modules/` instead of
+  `temp/yang_modules/$DEVICE_NAME` when `--device` was omitted, although the
+  compiler itself already defaulted `--device` to `$DEVICE_NAME`.
+
 ## [2026.11.2] - 2026-11-02
 
 ### Added

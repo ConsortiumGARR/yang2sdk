@@ -16,11 +16,11 @@ uv run yang2sdk --protocol netconf --device <device> --roots ietf-interfaces,iet
 
 | Flag | Effect |
 | --- | --- |
-| `--device` | target device name; defaults to `$DEVICE_NAME` |
+| `--device` | target device name; defaults to `$DEVICE_NAME`, asked at a terminal when neither is set |
 | `--yang-dir` | YANG search path; defaults to `temp/yang_modules/<device>` |
 | `--output-dir` | defaults to `temp/{restconf,netconf}_clients/<device>` |
 | `--config-only` | drop `config false` (state) nodes from the generated models |
-| `--device-version` | OS version for provenance and the package name; defaults to `$DEVICE_VERSION` |
+| `--release` (alias `--device-version`) | OS release for provenance and the package name `<device>_<release>`; falls back to `<yang-dir>/device.json` (written by `yang-downloader`), then `$DEVICE_VERSION` when `--device` is `$DEVICE_NAME`; asked at a terminal when none applies, otherwise `0.0.0` |
 | `--package-version` | PEP 440 package version; defaults to the device version |
 | `--deviation-module` | apply a pyang deviation (repeatable, recorded in the MANIFEST) |
 | `--feature mod:feat` | enable a feature (repeatable); unions with the device set, never narrows it |
