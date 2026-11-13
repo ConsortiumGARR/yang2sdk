@@ -25,6 +25,15 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Fixed
 
+- **NETCONF instance-identifier values were sent with their prefixes unbound.**
+  `bind_module_prefixes` split each value at its first `:`, so
+  `/ne:ne/shelf[...]` yielded the prefix `/ne` and no `xmlns:ne` was declared;
+  only identityrefs (which start with their prefix) were bound. A Groove G30
+  rejected a `services/CRS` `<src-tp>` with `bad-element`. Every QName of the
+  value (start, after `/`, after `[`) is now bound (RFC 7950 §9.13.2); a `:`
+  inside a quoted key value is left alone. Pinned by
+  `tests/test_matrix.py::test_instance_identifier_prefixes_bind_and_survive_the_rpc_wrapper`,
+  which checks the bytes after ncclient wraps the operation.
 - **NETCONF `plan()`/`reconcile()` failed with `lock-denied` inside
   `with NetconfClient(...)`.** `__enter__` locks the candidate and both methods
   locked it again; RFC 6241 §7.5 makes the server refuse a lock already held by

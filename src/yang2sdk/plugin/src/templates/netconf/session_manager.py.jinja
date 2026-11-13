@@ -2,6 +2,7 @@
 import copy
 import logging
 import os
+import re
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -684,6 +685,11 @@ def _reply_wire(reply: Any) -> tuple[str, int]:
         return "...[unserializable reply, not logged]", 0
 
 
+#: A prefix opening a QName in an identityref / instance-identifier value: at the
+#: start of the value, after a '/' step separator or after a '[' predicate.
+_VALUE_PREFIX = re.compile(r"(?:^\s*|[/\[]\s*)([A-Za-z_][\w.-]*):")
+
+
 def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, str]) -> etree._Element:
     """Declare xmlns for module-name prefixes used in identityref/instance-identifier values.
 
@@ -694,9 +700,13 @@ def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, s
     used: dict[str, str] = {}
     for el in element.iter():
         if el.text and ":" in el.text:
-            prefix = el.text.split(":", 1)[0]
-            if prefix in module_namespaces and prefix not in (el.nsmap or {}):
-                used[prefix] = module_namespaces[prefix]
+            # An identityref is one QName; an instance-identifier carries one per
+            # step/predicate ('/ne:ne/ne:shelf[ne:id=...]', RFC 7950 Sec 9.13.2).
+            # Splitting at the first ':' read '/ne:ne/...' as prefix '/ne', so
+            # instance-identifiers were sent with their prefix unbound.
+            for prefix in _VALUE_PREFIX.findall(el.text):
+                if prefix in module_namespaces and prefix not in (el.nsmap or {}):
+                    used[prefix] = module_namespaces[prefix]
     if used:
         # keep_ns_prefixes: the prefixes only appear in text, which the
         # cleanup pass would otherwise drop as "unused" declarations.

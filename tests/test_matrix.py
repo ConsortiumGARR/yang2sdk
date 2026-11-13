@@ -3202,6 +3202,45 @@ def test_identityref_prefix_binds_without_a_server(tmp_path):
     assert 'xmlns:tidref="urn:test:tidref"' in bound, bound
 
 
+def test_instance_identifier_prefixes_bind_and_survive_the_rpc_wrapper(tmp_path):
+    """Every module prefix of an instance-identifier value is declared on the wire.
+
+    An instance-identifier carries a QName per step and predicate
+    (RFC 7950 Sec 9.13.2). The binder split the value at its first ':', so
+    '/ne:ne/...' yielded the prefix '/ne', nothing was declared, and a Groove
+    G30 refused the cross-connect `<src-tp>` with `bad-element`. The check runs
+    on the bytes ncclient sends: the declaration must survive the move of the
+    operation into ncclient's own `<nc:rpc>`.
+    """
+    out, _ = _gen(tmp_path, "netconf", IDENTITYREF_YANG, "tidref")
+    sm = _import(out, "session_manager")
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+    from ncclient.xml_ import new_ele, to_xml
+
+    nc, ne, other = (
+        "urn:ietf:params:xml:ns:netconf:base:1.0",
+        "urn:test:ne",
+        "urn:test:other",
+    )
+    rpc = etree.Element(f"{{{nc}}}edit-config", nsmap={None: nc})
+    conf = etree.SubElement(rpc, f"{{{nc}}}config")
+    root = etree.SubElement(conf, f"{{{ne}}}ne", nsmap={None: ne})
+    tp = etree.SubElement(root, f"{{{ne}}}src-tp")
+    tp.text = "/ne:ne/ne:shelf[ne:shelf-id='1']/other:port[other:id='a:b']"
+    label = etree.SubElement(root, f"{{{ne}}}label")
+    label.text = "nomodule: free text"
+
+    sm.bind_module_prefixes(rpc, {"ne": ne, "other": other, "a": "urn:test:a"})
+    wrapper = new_ele("rpc", {"message-id": "1"})
+    wrapper.append(rpc)
+    sent = etree.fromstring(to_xml(wrapper).encode())
+
+    scope = sent.find(f".//{{{ne}}}src-tp").nsmap
+    assert scope.get("ne") == ne and scope.get("other") == other, scope
+    # A ':' inside a quoted key value is data, not a QName.
+    assert "a" not in scope, scope
+
+
 def test_restconf_rpc_without_input_sends_no_body(tmp_path):
     """RFC 8040 Sec 3.6.1: with no `input` section the request MUST NOT
     include a message-body. The generated code always POSTed a JSON object.
