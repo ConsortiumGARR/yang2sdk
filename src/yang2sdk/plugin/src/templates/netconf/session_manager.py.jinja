@@ -594,12 +594,6 @@ def build_config(
     return root
 
 
-def _c14n(element: etree._Element | None) -> bytes:
-    if element is None:
-        return b""
-    return etree.tostring(element, method="c14n")
-
-
 # SSH public-key authentication. `DEVICE_SSH_KEY` points at the private key
 # (or at its OpenSSH certificate, which paramiko resolves to the adjacent
 # private key -- see _resolve_key_files); `DEVICE_SSH_KEY_PASSPHRASE` unlocks
@@ -1286,19 +1280,21 @@ class NetconfClient:
             self._held_locks.discard(target)
 
     @contextmanager
-    def _scoped_lock(self, target: str, purpose: str) -> Iterator[None]:
+    def _scoped_lock(self, target: str, purpose: str) -> Iterator[bool]:
         """Hold ``target`` locked for the block, releasing only what it took.
 
         If the session already holds the lock (e.g. `__enter__` took it), the
         block runs under that lock and leaves it in place for its owner.
+        Yields True when the lock was taken here, False when it was already
+        held by this session.
         """
         if target in self._held_locks:
-            yield
+            yield False
             return
         if not self.lock(target):
             raise RuntimeError(f"Could not lock {target}; refusing to {purpose}.")
         try:
-            yield
+            yield True
         finally:
             try:
                 self.unlock(target)
@@ -1574,7 +1570,8 @@ class NetconfClient:
         want to read it. Tier order: ``test-only`` when :validate:1.1 is
         advertised (no write), else candidate staging + ``<validate>`` +
         discard, else message only. A plan never applies to running and never
-        commits.
+        commits. The discard empties the whole candidate: edits this session
+        staged earlier under its own lock are dropped with the plan.
         """
         config = build_config(diff, self.module_namespaces)
         xml = etree.tostring(config, pretty_print=True, encoding="unicode")
@@ -1614,14 +1611,10 @@ class NetconfClient:
                 "Device has no :candidate datastore, so a plan cannot be staged "
                 "for validation."
             )
-        with self._scoped_lock("candidate", "stage a plan"):
+        with self._scoped_lock("candidate", "stage a plan") as fresh_lock:
             staged = False
             try:
-                if not self._candidate_is_clean():
-                    raise RuntimeError(
-                        "candidate already holds uncommitted changes; refusing to "
-                        "stage a plan (discard-changes would destroy them)."
-                    )
+                self._start_clean_candidate(fresh_lock)
                 staged = True
                 ok = self.edit(config, target="candidate", commit=False)
                 validated = "edit"
@@ -1638,10 +1631,26 @@ class NetconfClient:
                             "Failed to discard the staged plan; candidate may still hold it."
                         )
 
-    def _candidate_is_clean(self) -> bool:
-        candidate = self.retrieve(source="candidate", content="config")
-        running = self.retrieve(source="running", content="config")
-        return _c14n(candidate) == _c14n(running)
+    def _start_clean_candidate(self, fresh_lock: bool) -> None:
+        """Start from a clean candidate without reading any datastore.
+
+        A lock just taken already proves the candidate clean: RFC 6241
+        Sec 7.5 makes the server deny a lock on a candidate that holds
+        uncommitted changes, and Sec 8.3.5.2 makes it discard them when the
+        locking session ends. One ``<discard-changes>`` is still sent for
+        servers that grant the lock anyway: free on a clean candidate, and
+        whatever it drops was staged by a session that no longer holds the
+        lock.
+
+        Under a lock this session held before (``with client:``, ``lock()``)
+        nothing is sent: whatever the candidate holds was staged by this
+        session and is the caller's. ``reconcile()`` commits it along with
+        the diff; ``plan()`` discards it with the staged plan.
+        """
+        if fresh_lock and not self.discard_changes():
+            raise RuntimeError(
+                "could not discard the candidate's pending changes; refusing to stage on it."
+            )
 
     def reconcile(self, diff, *, target: str | None = None, commit: bool = True) -> bool:
         """Apply the surgical edit and (by default) commit it.
@@ -1649,19 +1658,18 @@ class NetconfClient:
         ``commit=True`` is the default even when ``auto_commit`` is False:
         ``plan()`` is expected to run first. ``auto_commit`` never applies
         here, so the edit cannot be committed before validation.
+
+        The commit applies the whole candidate: edits this session staged
+        earlier under its own lock are committed with the diff.
         """
         config = build_config(diff, self.module_namespaces)
         target = target or self.default_target
 
         if target == "candidate" and self.has_candidate:
-            with self._scoped_lock("candidate", "reconcile"):
+            with self._scoped_lock("candidate", "reconcile") as fresh_lock:
                 staged = False
                 try:
-                    if not self._candidate_is_clean():
-                        raise RuntimeError(
-                            "candidate already holds uncommitted changes; refusing "
-                            "to reconcile (commit would include them)."
-                        )
+                    self._start_clean_candidate(fresh_lock)
                     staged = True
                     ok = self.edit(config, target="candidate", commit=False)
                     if ok and self.has_validate:

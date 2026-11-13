@@ -147,7 +147,6 @@ def make_client(sm, monkeypatch):
 
             return stub
 
-        client._candidate_is_clean = locked(True)
         client.edit = locked(True)
         client.validate = locked(True)
         client.commit = locked(True)

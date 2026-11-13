@@ -23,6 +23,19 @@ documented — a date-versioned scheme carries no compatibility promise.
   `yang2sdk` asks for the device name and release; an empty answer means
   `0.0.0`. Pinned by `tests/test_cli_prompts.py`.
 
+### Changed
+
+- **NETCONF `plan()` / `reconcile()` no longer read the whole node to check
+  the candidate.** Each call fetched candidate and running in full and
+  compared them. When the call takes the candidate lock itself, the lock is the
+  proof (RFC 6241 §7.5: a candidate holding uncommitted changes cannot be
+  locked), so nothing is read; one `<discard-changes>` is sent after the lock
+  for servers that grant it anyway — pending changes left by another session
+  are then dropped instead of refused. Under a lock the session already held
+  (`with client:`, `lock()`) nothing is checked or discarded: edits the
+  session staged earlier are its own, so `reconcile()` commits them with the
+  diff and `plan()` discards them with the staged plan (both used to refuse).
+
 ### Fixed
 
 - **NETCONF `instance-identifier` leaves are now held in one form and sent in

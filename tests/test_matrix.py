@@ -2375,7 +2375,6 @@ def _plan_client(session, **overrides):
 
     for name in ("edit", "validate", "commit", "lock", "unlock", "discard_changes"):
         setattr(client, name, record(name))
-    client._candidate_is_clean = lambda: True
     for key, value in overrides.items():
         setattr(client, key, value)
     return client
@@ -2403,24 +2402,27 @@ def test_plan_prefers_test_only_and_never_commits(tmp_path, capsys):
 
 
 def test_plan_falls_back_to_candidate_and_refuses_a_dirty_one(tmp_path):
-    """No :validate:1.1 means stage+validate+discard; a dirty candidate must
-    fail loudly and must never be discarded."""
+    """No :validate:1.1 means stage+validate+discard. The candidate is never
+    read: under a lock taken for the call the lock itself proves it clean
+    (RFC 6241 Sec 7.5) and one discard-changes is sent before staging; under a
+    lock the session already held nothing is sent before staging (the
+    candidate's content is the session's own)."""
     out = _gen_netconf(INSTANCE_ID_YANG, "tid", tmp_path)
     session = _import(out, "session_manager")
     diff = session.InstanceDiff({"/tid:system/hostname": "r1"}, {}, {})
 
-    dirty = _plan_client(session)
-    dirty._candidate_is_clean = lambda: False
-    with pytest.raises(RuntimeError, match="candidate already holds"):
-        session.NetconfClient.plan(dirty, diff)
-    assert all(event[0] != "discard_changes" for event in dirty.events)
-    assert any(event[0] == "unlock" for event in dirty.events)
+    def no_read(*args, **kwargs):
+        raise AssertionError("the datastores must not be read")
 
-    clean = _plan_client(session)
+    held = _plan_client(session, _held_locks={"candidate"}, retrieve=no_read)
+    assert session.NetconfClient.reconcile(held, diff) is True
+    assert [event[0] for event in held.events] == ["edit", "validate", "commit"]
+
+    clean = _plan_client(session, retrieve=no_read)
     result = session.NetconfClient.plan(clean, diff)
     assert result.validated == "datastore"
     names = [event[0] for event in clean.events]
-    assert names[:2] == ["lock", "edit"]
+    assert names[:3] == ["lock", "discard_changes", "edit"]
     assert "validate" in names
     assert "discard_changes" in names
     assert "unlock" in names
@@ -2460,8 +2462,8 @@ def test_reconcile_commits_even_when_auto_commit_is_false(tmp_path):
     assert session.NetconfClient.reconcile(client, diff) is True
 
     names = [event[0] for event in client.events]
-    assert names[:2] == ["lock", "edit"]
-    assert client.events[1][2] == {"target": "candidate", "commit": False}
+    assert names[:3] == ["lock", "discard_changes", "edit"]
+    assert client.events[2][2] == {"target": "candidate", "commit": False}
     assert "validate" in names
     assert "commit" in names
     assert names.index("validate") < names.index("commit")
