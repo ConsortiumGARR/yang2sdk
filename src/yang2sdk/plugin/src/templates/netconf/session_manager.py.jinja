@@ -282,6 +282,32 @@ def qualify_instance_identifiers(element: etree._Element) -> etree._Element:
     return element
 
 
+def key_text_matches(element: etree._Element | None, value: Any) -> bool:
+    """Whether a list key leaf read from the device holds the key ``value``.
+
+    The comparison is lexical, except for an instance-identifier key: the device
+    writes it in the XML form with its own prefixes while the navigator holds the
+    RFC 7951 form, so both are compared in the latter.
+    """
+    if element is None or element.text is None:
+        return False
+    expected = str(value)
+    if element.text == expected:
+        return True
+    qname = etree.QName(element)
+    if (qname.namespace or "", qname.localname) not in _INSTANCE_IDENTIFIER_TAGS:
+        return False
+    if _data_path(element) not in INSTANCE_IDENTIFIER_NODES:
+        return False
+    namespace_modules = {ns: name for name, ns in MODULE_NAMESPACES.items()}
+    prefix_modules = {
+        prefix: namespace_modules[uri]
+        for prefix, uri in (element.nsmap or {}).items()
+        if prefix and uri in namespace_modules
+    }
+    return instance_identifier_to_json(element.text.strip(), prefix_modules) == instance_identifier_to_json(expected)
+
+
 def parse_instance_path(
     path: str, module_namespaces: Mapping[str, str]
 ) -> list[tuple[str, str, dict[str, str]]]:

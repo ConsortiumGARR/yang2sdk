@@ -3,7 +3,7 @@ from typing import Any, Generic, TypeVar
 from lxml import etree
 from pydantic import ValidationError
 from ..session_manager import NetconfClient, validate_depth
-from ..session_manager import parse_instance_path_segment, split_instance_path
+from ..session_manager import key_text_matches, parse_instance_path_segment, split_instance_path
 from ..data_models._base import (
     NAMESPACE_MODULES,
     _child_model_and_kind,
@@ -595,7 +595,7 @@ def find_xml_node(
                     key_child = child.find("./{" + ns + "}" + k if ns else f"./{k}")
                     if key_child is None:
                         key_child = child.find(f"./{k}")
-                    if key_child is None or key_child.text != str(v):
+                    if not key_text_matches(key_child, v):
                         match = False
                         break
                 if match:
@@ -634,7 +634,7 @@ def find_xml_nodes(
                 )
                 if key_child is None:
                     key_child = child.find(f"./{k}")
-                if key_child is None or key_child.text != str(v):
+                if not key_text_matches(key_child, v):
                     match = False
                     break
             if match:

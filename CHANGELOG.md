@@ -46,7 +46,11 @@ documented — a date-versioned scheme carries no compatibility promise.
     rpc input/output resolved). Subtree filters now also get their prefixes
     bound, which identityref keys needed too;
   - `bind_module_prefixes` split each value at its first `:`, so
-    `/ne:ne/...` yielded the prefix `/ne`: every QName of the value is now bound.
+    `/ne:ne/...` yielded the prefix `/ne`: every QName of the value is now bound;
+  - **list entries keyed by an instance-identifier** are found in the reply
+    again (`key_text_matches`): the navigator's RFC 7951 key was compared
+    lexically with the device's XML text, so a just-created cross-connect read
+    back as `None` (`test_instance_identifier_keyed_entry_is_found_in_the_reply`).
 
   Behaviour change: a NETCONF read of an instance-identifier returns the
   RFC 7951 form instead of the device's text. A value that is not an absolute

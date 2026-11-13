@@ -3428,6 +3428,49 @@ def test_instance_identifier_edit_rpc_and_filter_send_the_xml_form(tmp_path):
     assert resolved(etree.fromstring(criteria).find(f".//{{{_TIID}}}src")) == want
 
 
+def test_instance_identifier_keyed_entry_is_found_in_the_reply(tmp_path):
+    """A list entry keyed by instance-identifiers is read back by its navigator.
+
+    The device writes the keys in the XML form with its own prefixes, the
+    navigator holds the RFC 7951 form. Compared lexically they never matched,
+    so a Groove G30 cross-connect read as absent right after it was created.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+
+    out, _ = _gen(tmp_path, "netconf", INSTANCE_ID_LEAVES_YANG, "tiid")
+    nav = _import(out, "data_navigators")
+    sm = _import_fresh(out, "session_manager")
+    device_form = "/x:top/x:port[x:id='1/2']"
+
+    class FakeClient:
+        module_namespaces = sm.MODULE_NAMESPACES
+
+        def retrieve(self, **kwargs):
+            return etree.fromstring(
+                '<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                f'<top xmlns="{_TIID}"><conn>'
+                f'<src xmlns:x="{_TIID}">{device_form}</src>'
+                f'<dst xmlns:x="{_TIID}">{device_form}</dst>'
+                "<label>xc</label></conn></top></data>"
+            )
+
+    data = nav.Data(FakeClient(), [])
+    entry = data.tiid_top.conn(_PORT_JSON, _PORT_JSON).retrieve(content="config")
+    assert entry is not None
+    assert (entry.src, entry.label) == (_PORT_JSON, "xc")
+    # The XML form addresses the same entry; another one is still not matched.
+    assert (
+        data.tiid_top.conn(_PORT_XML, _PORT_XML).retrieve(content="config") is not None
+    )
+    other = "/tiid:top/port[id='9']"
+    assert data.tiid_top.conn(_PORT_JSON, other).retrieve(content="config") is None
+    assert len(data.tiid_top.conn.retrieve(content="config")) == 1
+
+    # A string key is compared lexically, as before.
+    key = etree.fromstring(f'<id xmlns="{_TIID}">{_PORT_XML}</id>')
+    assert not sm.key_text_matches(key, _PORT_JSON)
+
+
 def test_restconf_rpc_without_input_sends_no_body(tmp_path):
     """RFC 8040 Sec 3.6.1: with no `input` section the request MUST NOT
     include a message-body. The generated code always POSTed a JSON object.
