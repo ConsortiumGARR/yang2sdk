@@ -10,6 +10,8 @@ from decimal import Decimal
 import re
 
 from ..session_manager import MODULE_NAMESPACES
+from ..session_manager import canonical_instance_identifier
+from ..session_manager import instance_identifier_to_json as _instance_identifier_to_json
 from ..session_manager import parse_instance_path_segment as _parse_segment
 from ..session_manager import split_instance_path as _split_instance_path
 
@@ -887,7 +889,9 @@ def _has_content(value: Any) -> bool:
 
 def normalize_identityrefs(element: etree._Element, model_cls: type | None, module_namespaces: dict[str, str]) -> None:
     """Rewrite identityref values from XML prefix form to RFC 7951 Sec 6.8
-    module-name form ('module:identity') using the in-scope namespaces.
+    module-name form ('module:identity') using the in-scope namespaces, and
+    instance-identifier values from their RFC 7950 Sec 9.13.2 XML form (every
+    node qualified, server-chosen prefixes) to the RFC 7951 Sec 6.11 form.
 
     Keeps models protocol-agnostic: retrieved values match the canonical
     JSON encoding, so they round-trip unchanged through both transports.
@@ -913,6 +917,18 @@ def normalize_identityrefs(element: etree._Element, model_cls: type | None, modu
                 module = namespace_modules.get((child.nsmap or {}).get(prefix, ""))
                 if module:
                     child.text = f"{module}:{name}"
+            continue
+        if extra.get("is_instance_identifier"):
+            for child in element:
+                qname = etree.QName(child)
+                if qname.localname != tag or (ns and qname.namespace != ns) or not child.text:
+                    continue
+                prefix_modules = {
+                    prefix: namespace_modules[uri]
+                    for prefix, uri in (child.nsmap or {}).items()
+                    if prefix and uri in namespace_modules
+                }
+                child.text = _instance_identifier_to_json(child.text.strip(), prefix_modules)
             continue
         child_cls = _extract_child_model(field_info.annotation)
         if child_cls is not None and child_cls is not model_cls:

@@ -140,6 +140,148 @@ def parse_instance_path_segment(
     return prefix, name, predicates
 
 
+# --- instance-identifier VALUES: one form in the models, the XML one on the wire
+#
+# An instance-identifier leaf has two encodings. RFC 7951 Sec 6.11 (JSON)
+# qualifies the leftmost node and every node whose module differs from its
+# parent's, never a predicate key: '/ne:ne/shelf[shelf-id='1']'. RFC 7950
+# Sec 9.13.2 (XML) requires EVERY node name, keys included, to be qualified
+# with a prefix declared in scope: '/ne:ne/ne:shelf[ne:shelf-id='1']'. A
+# device answers the JSON form in an XML leaf with `bad-element` (measured on
+# a Groove G30 `services/CRS` `src-tp`). The models hold the JSON form, as
+# for identityrefs (one value whatever the transport); the client converts it
+# on the way out and the models convert the device's XML form on the way in.
+
+#: Data path ``((namespace, name), ...)`` of every instance-identifier leaf and
+#: leaf-list, from the root of the data tree or of the rpc. ``choice``/``case``
+#: and ``input``/``output`` have no element on the wire, so they are not in it.
+INSTANCE_IDENTIFIER_NODES: frozenset[tuple[tuple[str, str], ...]] = {{ instance_identifier_nodes_literal }}
+_INSTANCE_IDENTIFIER_TAGS = frozenset(path[-1] for path in INSTANCE_IDENTIFIER_NODES)
+
+#: Protocol wrappers around data and operations (RFC 6241 Sec 7, RFC 8526
+#: Sec 3.1, the RFC 7950 Sec 7.15.2 `<action>` element): not part of a data path.
+_PROTOCOL_NAMESPACES = frozenset(
+    {
+        "urn:ietf:params:xml:ns:netconf:base:1.0",
+        "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda",
+        "urn:ietf:params:xml:ns:yang:1",
+    }
+)
+
+
+def _parse_instance_identifier(value: str) -> list[tuple[str | None, str, list[tuple[str, str]]]] | None:
+    """The segments of an absolute instance-identifier, or None if it is not one."""
+    if not value.startswith("/"):
+        return None
+    try:
+        return [parse_instance_path_segment(raw) for raw in split_instance_path(value)] or None
+    except ValueError:
+        return None
+
+
+def _quoted(value: str) -> str:
+    # RFC 7950 Sec 14: a quoted string has no escapes, so pick the other quote.
+    return f'"{value}"' if "'" in value else f"'{value}'"
+
+
+def instance_identifier_to_xml(value: str) -> str:
+    """Return the RFC 7950 Sec 9.13.2 XML form of an instance-identifier value.
+
+    Every node and predicate key is qualified with its module name, which
+    ``bind_module_prefixes`` then declares as the prefix. An unqualified name
+    belongs to the module of the node before it (RFC 7951 Sec 6.11); a key
+    belongs to its list's module (RFC 7950 Sec 7.8.2). Idempotent; anything that
+    is not an absolute instance-identifier with a qualified leftmost node
+    (including positional predicates) is returned unchanged.
+    """
+    segments = _parse_instance_identifier(value)
+    if segments is None:
+        return value
+    rendered: list[str] = []
+    module: str | None = None
+    for prefix, name, predicates in segments:
+        module = prefix or module
+        if module is None:
+            return value
+        keys = "".join(
+            f"[{key if key == '.' or ':' in key else f'{module}:{key}'}={_quoted(text)}]"
+            for key, text in predicates
+        )
+        rendered.append(f"{module}:{name}{keys}")
+    return "/" + "/".join(rendered)
+
+
+def instance_identifier_to_json(value: str, prefix_modules: Mapping[str, str] | None = None) -> str:
+    """Return the canonical RFC 7951 Sec 6.11 form of an instance-identifier value.
+
+    ``prefix_modules`` maps the value's XML prefixes to module names (from the
+    namespaces in scope of the element that held it); ``None`` means the
+    prefixes already are module names. A prefix outside the map, or anything
+    that is not an absolute instance-identifier, leaves the value unchanged.
+    """
+    segments = _parse_instance_identifier(value)
+    if segments is None:
+        return value
+
+    def module_of(prefix: str) -> str | None:
+        return prefix if prefix_modules is None else prefix_modules.get(prefix)
+
+    rendered: list[str] = []
+    previous: str | None = None
+    for prefix, name, predicates in segments:
+        module = previous if prefix is None else module_of(prefix)
+        if module is None:
+            return value
+        keys: list[str] = []
+        for key, text in predicates:
+            if ":" in key:
+                key_prefix, key_name = key.split(":", 1)
+                key_module = module_of(key_prefix)
+                if key_module is None:
+                    return value
+                key = key_name if key_module == module else f"{key_module}:{key_name}"
+            keys.append(f"[{key}={_quoted(text)}]")
+        rendered.append((name if module == previous else f"{module}:{name}") + "".join(keys))
+        previous = module
+    return "/" + "/".join(rendered)
+
+
+def canonical_instance_identifier(value: Any) -> Any:
+    """Model validator: hold an instance-identifier in its RFC 7951 form.
+
+    A value written in the XML form with module-name prefixes (what a caller
+    copying a device's value usually has) compares equal to the one read back.
+    """
+    return instance_identifier_to_json(value) if isinstance(value, str) else value
+
+
+def _data_path(element: etree._Element) -> tuple[tuple[str, str], ...]:
+    path: list[tuple[str, str]] = []
+    node: etree._Element | None = element
+    while node is not None:
+        if isinstance(node.tag, str):
+            qname = etree.QName(node)
+            if qname.namespace not in _PROTOCOL_NAMESPACES:
+                path.append((qname.namespace or "", qname.localname))
+        node = node.getparent()
+    return tuple(reversed(path))
+
+
+def qualify_instance_identifiers(element: etree._Element) -> etree._Element:
+    """Rewrite every instance-identifier value under ``element`` to its XML form."""
+    if not INSTANCE_IDENTIFIER_NODES:
+        return element
+    for el in element.iter():
+        if not isinstance(el.tag, str) or not el.text or len(el):
+            continue
+        qname = etree.QName(el)
+        if (qname.namespace or "", qname.localname) not in _INSTANCE_IDENTIFIER_TAGS:
+            continue
+        if _data_path(el) in INSTANCE_IDENTIFIER_NODES:
+            el.text = instance_identifier_to_xml(el.text.strip())
+    return element
+
+
 def parse_instance_path(
     path: str, module_namespaces: Mapping[str, str]
 ) -> list[tuple[str, str, dict[str, str]]]:
@@ -691,12 +833,16 @@ _VALUE_PREFIX = re.compile(r"(?:^\s*|[/\[]\s*)([A-Za-z_][\w.-]*):")
 
 
 def bind_module_prefixes(element: etree._Element, module_namespaces: dict[str, str]) -> etree._Element:
-    """Declare xmlns for module-name prefixes used in identityref/instance-identifier values.
+    """Write identityref/instance-identifier values in their XML form, prefixes declared.
 
-    RFC 7951 Sec 6.8/6.11 encode those values as 'module-name:identity-name'.
-    XML requires the prefix to be bound (RFC 7950 Sec 9.10.3). Module names
-    are valid XML NCNames, so the module name itself is used as the prefix.
+    RFC 7951 Sec 6.8/6.11 encode those values with module names
+    ('module-name:identity-name'). XML requires the prefix to be bound
+    (RFC 7950 Sec 9.10.3), and an instance-identifier to qualify every node
+    (Sec 9.13.2, see ``qualify_instance_identifiers``). Module names are valid
+    XML NCNames, so the module name itself is used as the prefix. Every
+    outgoing edit, rpc and subtree filter goes through here.
     """
+    qualify_instance_identifiers(element)
     used: dict[str, str] = {}
     for el in element.iter():
         if el.text and ":" in el.text:
@@ -1211,6 +1357,12 @@ class NetconfClient:
 
         if isinstance(filter_xml, str):
             filter_xml = etree.fromstring(filter_xml)
+        # A content-match node holding an identityref or instance-identifier key
+        # (e.g. a cross-connect keyed by its two end points) is compared by value:
+        # it needs the same wire form and declared prefixes as an edit.
+        for selection in filter_xml if isinstance(filter_xml, (list, tuple)) else [filter_xml]:
+            if selection is not None:
+                bind_module_prefixes(selection, self.module_namespaces)
 
         if requested_depth is not None and not self.has_nmda and filter_xml is None:
             # RFC 6241 has no depth parameter. A finite-depth legacy read

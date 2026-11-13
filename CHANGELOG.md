@@ -25,15 +25,39 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Fixed
 
-- **NETCONF instance-identifier values were sent with their prefixes unbound.**
-  `bind_module_prefixes` split each value at its first `:`, so
-  `/ne:ne/shelf[...]` yielded the prefix `/ne` and no `xmlns:ne` was declared;
-  only identityrefs (which start with their prefix) were bound. A Groove G30
-  rejected a `services/CRS` `<src-tp>` with `bad-element`. Every QName of the
-  value (start, after `/`, after `[`) is now bound (RFC 7950 §9.13.2); a `:`
-  inside a quoted key value is left alone. Pinned by
-  `tests/test_matrix.py::test_instance_identifier_prefixes_bind_and_survive_the_rpc_wrapper`,
-  which checks the bytes after ncclient wraps the operation.
+- **NETCONF `instance-identifier` leaves are now held in one form and sent in
+  the XML one.** They were plain strings: written as given and read back with
+  the device's prefixes. The JSON form (RFC 7951 §6.11:
+  `/ne:ne/shelf[shelf-id='1']`, only the leftmost node qualified) went into the
+  XML payload unchanged, where RFC 7950 §9.13.2 requires every node and key
+  qualified (`/ne:ne/ne:shelf[ne:shelf-id='1']`) with declared prefixes; a
+  Groove G30 refused a `services/CRS` `<src-tp>` with `bad-element`. As for
+  identityrefs, the models now hold the RFC 7951 form whatever the transport:
+  - **on read**, the XML form is rewritten using the reply's own prefixes, so a
+    server choosing prefixes other than the module names round-trips;
+  - **on assignment**, an XML-form value with module-name prefixes is
+    canonicalized (`canonical_instance_identifier`), so a value copied from a
+    device compares equal to the one read back;
+  - **on write**, every edit (including the model-free `build_config` plan,
+    where the values are often list keys), rpc input and subtree filter is
+    rewritten to the XML form. The plan builder cannot tell such a value from a
+    string, so the compile-time `INSTANCE_IDENTIFIER_NODES` lists the wire path
+    of every instance-identifier leaf (typedefs, `uses`, `choice`, augments and
+    rpc input/output resolved). Subtree filters now also get their prefixes
+    bound, which identityref keys needed too;
+  - `bind_module_prefixes` split each value at its first `:`, so
+    `/ne:ne/...` yielded the prefix `/ne`: every QName of the value is now bound.
+
+  Behaviour change: a NETCONF read of an instance-identifier returns the
+  RFC 7951 form instead of the device's text. A value that is not an absolute
+  instance-identifier with a qualified leftmost node (positional predicates,
+  an unknown prefix) is left unchanged. Pinned by
+  `tests/test_matrix.py::test_instance_identifier_nodes_are_listed_by_their_wire_path`,
+  `::test_instance_identifier_value_conversions`,
+  `::test_instance_identifier_reads_and_assignments_hold_the_rfc7951_form`,
+  `::test_instance_identifier_edit_rpc_and_filter_send_the_xml_form` (bytes
+  after ncclient wraps the operation) and
+  `::test_instance_identifier_prefixes_bind_and_survive_the_rpc_wrapper`.
 - **NETCONF `plan()`/`reconcile()` failed with `lock-denied` inside
   `with NetconfClient(...)`.** `__enter__` locks the candidate and both methods
   locked it again; RFC 6241 §7.5 makes the server refuse a lock already held by

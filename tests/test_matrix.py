@@ -3241,6 +3241,193 @@ def test_instance_identifier_prefixes_bind_and_survive_the_rpc_wrapper(tmp_path)
     assert "a" not in scope, scope
 
 
+# One module placing instance-identifier leaves everywhere a data path can
+# differ from the statement tree: a typedef, a `uses`, a `choice`, a leaf-list,
+# list keys (a cross-connect keyed by its two end points, as the Groove G30
+# `services/CRS`) and rpc input/output.
+INSTANCE_ID_LEAVES_YANG = """module tiid {
+  yang-version 1.1;
+  namespace "urn:test:tiid";
+  prefix ti;
+  revision 2026-01-01;
+  typedef ref-t { type instance-identifier; }
+  grouping g { leaf giref { type instance-identifier; } }
+  container top {
+    list conn {
+      key "src dst";
+      leaf src { type instance-identifier; }
+      leaf dst { type ref-t; }
+      leaf label { type string; }
+      uses g;
+      choice c { case a { leaf cref { type instance-identifier; } } }
+      leaf-list refs { type instance-identifier; }
+    }
+    list port { key id; leaf id { type string; } }
+  }
+  rpc locate {
+    input { leaf target { type instance-identifier; } }
+    output { leaf found { type instance-identifier; } }
+  }
+}"""
+
+_TIID = "urn:test:tiid"
+_PORT_JSON = "/tiid:top/port[id='1/2']"
+_PORT_XML = "/tiid:top/tiid:port[tiid:id='1/2']"
+
+
+def _tiid_client(tmp_path):
+    from unittest import mock
+
+    out, _ = _gen(tmp_path, "netconf", INSTANCE_ID_LEAVES_YANG, "tiid")
+    sm = _import_fresh(out, "session_manager")
+    mgr = _FakeNcclientManager(["urn:ietf:params:netconf:base:1.1"])
+    with mock.patch.object(sm.manager, "connect", return_value=mgr):
+        client = sm.NetconfClient(
+            management_ip="127.0.0.1", username="u", password="p", verify=False
+        )
+    return out, sm, client, mgr
+
+
+def test_instance_identifier_nodes_are_listed_by_their_wire_path(tmp_path):
+    """The model-free plan builder knows which leaves hold an instance-identifier.
+
+    Paths follow the elements on the wire: `uses` expanded, `choice`/`case`
+    and rpc `input`/`output` absent (RFC 7950 Sec 7.9, 7.14). A plain string
+    leaf is not listed, so its value is never rewritten.
+    """
+    out, _ = _gen(tmp_path, "netconf", INSTANCE_ID_LEAVES_YANG, "tiid")
+    sm = _import_fresh(out, "session_manager")
+
+    def path(*names):
+        return tuple((_TIID, name) for name in names)
+
+    assert sm.INSTANCE_IDENTIFIER_NODES == {
+        path("top", "conn", "src"),
+        path("top", "conn", "dst"),  # through a typedef
+        path("top", "conn", "giref"),  # through a uses
+        path("top", "conn", "cref"),  # inside a choice/case
+        path("top", "conn", "refs"),  # leaf-list
+        path("locate", "target"),
+        path("locate", "found"),
+    }
+
+
+def test_instance_identifier_value_conversions(tmp_path):
+    """RFC 7951 Sec 6.11 (models) <-> RFC 7950 Sec 9.13.2 (XML wire) forms."""
+    out, _ = _gen(tmp_path, "netconf", INSTANCE_ID_LEAVES_YANG, "tiid")
+    sm = _import_fresh(out, "session_manager")
+
+    # JSON -> XML: every node AND every key qualified; a module change is kept.
+    assert sm.instance_identifier_to_xml(_PORT_JSON) == _PORT_XML
+    assert sm.instance_identifier_to_xml("/a:x/y/b:z[k='v']") == "/a:x/a:y/b:z[b:k='v']"
+    assert sm.instance_identifier_to_xml(_PORT_XML) == _PORT_XML  # idempotent
+    # Leaf-list entry predicate and a value holding '/', ':', ']' and a quote.
+    assert sm.instance_identifier_to_xml("/a:x/l[.='p:q/]']") == "/a:x/a:l[.='p:q/]']"
+    assert (
+        sm.instance_identifier_to_xml("""/a:x/y[k="it's"]""")
+        == """/a:x/a:y[a:k="it's"]"""
+    )
+
+    # XML (server prefixes) -> JSON: prefixes mapped to module names, redundant ones dropped.
+    assert (
+        sm.instance_identifier_to_json("/p:top/p:port[p:id='1/2']", {"p": "tiid"})
+        == _PORT_JSON
+    )
+    assert (
+        sm.instance_identifier_to_json("/a:x/a:y/b:z[b:k='v']") == "/a:x/y/b:z[k='v']"
+    )
+    assert sm.instance_identifier_to_json(_PORT_JSON) == _PORT_JSON  # idempotent
+
+    # Not an instance-identifier, or not resolvable: left alone, never guessed.
+    for value in ("plain text", "tiid:identity", "/top/port", "/a:x/y[1]"):
+        assert sm.instance_identifier_to_xml(value) == value
+        assert sm.instance_identifier_to_json(value) == value
+    assert sm.instance_identifier_to_json("/q:top", {"p": "tiid"}) == "/q:top"
+
+
+def test_instance_identifier_reads_and_assignments_hold_the_rfc7951_form(tmp_path):
+    """A device's XML form, whatever its prefixes, reads back as the RFC 7951 form;
+    the XML form assigned by a caller is canonicalized, so the two compare equal."""
+    out, _ = _gen(tmp_path, "netconf", INSTANCE_ID_LEAVES_YANG, "tiid")
+    sm = _import_fresh(out, "session_manager")
+    models = _import(out, "data_models.tiid")
+    # Generated at runtime: the class is looked up by its fields, untyped.
+    conn_cls: Any = next(
+        cls
+        for cls in vars(models).values()
+        if isinstance(cls, type) and "src" in getattr(cls, "model_fields", {})
+    )
+
+    xml = (
+        f'<conn xmlns="{_TIID}" xmlns:x="{_TIID}">'
+        "<src>/x:top/x:port[x:id='1/2']</src><dst>/x:top/x:port[x:id='3']</dst>"
+        "<label>/x:top/x:port</label><refs>/x:top/x:port[x:id='4']</refs></conn>"
+    )
+    conn = conn_cls.from_xml(xml, module_namespaces=sm.MODULE_NAMESPACES)
+    assert conn.src == _PORT_JSON
+    assert conn.dst == "/tiid:top/port[id='3']"
+    assert conn.refs == ["/tiid:top/port[id='4']"]
+    assert conn.label == "/x:top/x:port"  # a string leaf is not an instance-identifier
+
+    assert conn_cls(src=_PORT_XML, dst=_PORT_XML).src == _PORT_JSON
+
+
+def test_instance_identifier_edit_rpc_and_filter_send_the_xml_form(tmp_path):
+    """Edits (plan builder), rpc input and subtree filters put the RFC 7950
+    Sec 9.13.2 form on the wire, prefixes declared, after ncclient wraps the RPC.
+
+    Regression: the JSON form ('/ne:ne/shelf[shelf-id=...]') was sent as is,
+    and a Groove G30 refused the cross-connect `<src-tp>` with `bad-element`.
+    """
+    from lxml import etree  # ty: ignore[unresolved-import] - lxml ships no stubs
+    from ncclient.xml_ import new_ele, to_xml
+
+    _, sm, client, mgr = _tiid_client(tmp_path)
+
+    def on_the_wire(operation):
+        wrapper = new_ele("rpc", {"message-id": "1"})
+        wrapper.append(operation)
+        return etree.fromstring(to_xml(wrapper).encode())
+
+    def resolved(element):
+        """The value with each prefix replaced by its namespace, as a device reads it."""
+        return re.sub(
+            r"([\w.-]+):", lambda m: "{" + element.nsmap[m.group(1)] + "}", element.text
+        )
+
+    want = f"/{{{_TIID}}}top/{{{_TIID}}}port[{{{_TIID}}}id='1/2']"
+
+    # Edit: the instance-identifiers are list keys, as in a cross-connect.
+    entry = f'/tiid:top/conn[src="{_PORT_JSON}"][dst="{_PORT_JSON}"]'
+    diff = {"+": {f"{entry}/label": "/tiid:top/port"}, "~": {}, "-": {}}
+    assert client.edit(
+        sm.build_config(diff, sm.MODULE_NAMESPACES), target="running", commit=False
+    )
+    sent = on_the_wire(mgr.dispatched[-1])
+    for leaf in ("src", "dst"):
+        assert resolved(sent.find(f".//{{{_TIID}}}{leaf}")) == want
+    assert (
+        sent.find(f".//{{{_TIID}}}label").text == "/tiid:top/port"
+    )  # string leaf untouched
+
+    # rpc input.
+    rpc = etree.Element(f"{{{_TIID}}}locate", nsmap={None: _TIID})
+    etree.SubElement(rpc, f"{{{_TIID}}}target").text = _PORT_JSON
+    client.rpc(rpc)
+    assert (
+        resolved(on_the_wire(mgr.dispatched[-1]).find(f".//{{{_TIID}}}target")) == want
+    )
+
+    # Subtree filter selecting one cross-connect by its keys (legacy <get-config>).
+    selection = etree.fromstring(
+        f'<top xmlns="{_TIID}"><conn><src>{_PORT_JSON}</src></conn></top>'
+    )
+    client.has_nmda = False
+    client.retrieve(source="running", content="config", filter_xml=selection)
+    _, criteria = mgr.get_config_kwargs["filter"]
+    assert resolved(etree.fromstring(criteria).find(f".//{{{_TIID}}}src")) == want
+
+
 def test_restconf_rpc_without_input_sends_no_body(tmp_path):
     """RFC 8040 Sec 3.6.1: with no `input` section the request MUST NOT
     include a message-body. The generated code always POSTed a JSON object.

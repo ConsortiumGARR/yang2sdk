@@ -609,8 +609,15 @@ class Yang2Netconf(plugin.PyangPlugin):
         # this to the client makes the write path namespace-complete without
         # depending on the peer advertising the module in its <hello>.
         merged_module_namespaces: dict[str, str] = {}
+        # Data paths of the instance-identifier leaves, merged across the roots:
+        # the model-free plan builder writes their values in the XML form
+        # (RFC 7950 Sec 9.13.2), which it cannot tell from a plain string.
+        instance_identifier_nodes: set[tuple[tuple[str, str], ...]] = set()
         for ir_module in ir_modules:
             merged_module_namespaces.update(getattr(ir_module, "module_namespaces", {}))
+            instance_identifier_nodes.update(
+                getattr(ir_module, "instance_identifier_nodes", ())
+            )
 
         for target_path, template_path in static_files.items():
             full_path = os.path.join(str(package_dir), target_path)
@@ -618,6 +625,9 @@ class Yang2Netconf(plugin.PyangPlugin):
                 f.write(
                     env.get_template(template_path).render(
                         module_namespaces_literal=repr(merged_module_namespaces),
+                        instance_identifier_nodes_literal=(
+                            f"frozenset({sorted(instance_identifier_nodes)!r})"
+                        ),
                     )
                 )
 

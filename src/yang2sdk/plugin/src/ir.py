@@ -247,6 +247,13 @@ class IRModule:
     #: Distinct from ``imports_nsmap``, which is keyed by the module's YANG
     #: *prefix* and drives pydantic-xml's own tag/attribute prefixes.
     module_namespaces: dict[str, str] = field(default_factory=dict)
+    #: Data path ``((namespace, name), ...)`` of every instance-identifier leaf
+    #: and leaf-list of the module's tree (augments of it included). The
+    #: NETCONF client rewrites those values to the RFC 7950 Sec 9.13.2 XML form
+    #: on the way out; the plan builder is model-free, so it needs them listed.
+    instance_identifier_nodes: set[tuple[tuple[str, str], ...]] = field(
+        default_factory=set
+    )
     models: list[IRModel] = field(default_factory=list)
     enums: list[IREnum] = field(default_factory=list)
     nav_nodes: list[IRNavNode] = field(default_factory=list)
@@ -409,9 +416,31 @@ class IRBuilder:
             counter += 1
             candidate_name = f"{base_name}_{counter}"
 
+    def _collect_instance_identifier_nodes(self, stmt, path: tuple = ()) -> None:
+        """Record the data path of every instance-identifier leaf under ``stmt``.
+
+        Walks pyang's expanded tree (``i_children``), where a ``uses`` is
+        already replaced by the grouping's nodes and an augment's nodes hang
+        under their target, so each path is the one the node has on the wire.
+        ``choice``/``case`` and rpc/action ``input``/``output`` have no element
+        there (RFC 7950 Sec 7.9, 7.14), so they add no step.
+        """
+        for child in getattr(stmt, "i_children", None) or []:
+            if child.keyword in ("choice", "case", "input", "output"):
+                self._collect_instance_identifier_nodes(child, path)
+                continue
+            child_path = (*path, (self._get_module_namespace(child), child.arg))
+            if child.keyword in ("leaf", "leaf-list"):
+                if self._get_leaf_type(child)[1].get("_instance_identifier"):
+                    self.ir.instance_identifier_nodes.add(child_path)
+                continue
+            self._collect_instance_identifier_nodes(child, child_path)
+
     def build(self) -> IRModule:
         self._resolve_names(self.module)
         self._collect_groupings(self.module)
+        if self.target_format == "netconf":
+            self._collect_instance_identifier_nodes(self.module)
 
         for grouping in self.groupings.values():
             if self._get_module_name(grouping) == self.module.arg:
@@ -874,6 +903,7 @@ class IRBuilder:
         type_str = "Any"
         is_optional = False
         is_identityref = False
+        is_instance_identifier = False
 
         # pyang's `_keywords_with_no_explicit_config` is ['action','rpc',
         # 'notification']: for nodes inside an rpc/action input or output,
@@ -933,6 +963,9 @@ class IRBuilder:
         elif stmt.keyword == "leaf":
             type_str, constraints = self._get_leaf_type(stmt)
             is_identityref = constraints.pop("_identityref", False)
+            is_instance_identifier = constraints.pop("_instance_identifier", False)
+            if is_instance_identifier and self.target_format == "netconf":
+                type_str = f"Annotated[{type_str}, AfterValidator(canonical_instance_identifier)]"
             if "_patterns" in constraints:
                 validators = self._pattern_validators(
                     constraints.pop("_patterns"), stmt
@@ -949,6 +982,9 @@ class IRBuilder:
         elif stmt.keyword == "leaf-list":
             item_type, constraints = self._get_leaf_type(stmt)
             is_identityref = constraints.pop("_identityref", False)
+            is_instance_identifier = constraints.pop("_instance_identifier", False)
+            if is_instance_identifier and self.target_format == "netconf":
+                item_type = f"Annotated[{item_type}, AfterValidator(canonical_instance_identifier)]"
             inner = [
                 f"{k}={constraints.pop(k)}"
                 for k in ["ge", "le", "gt", "lt", "min_length", "max_length"]
@@ -1010,6 +1046,8 @@ class IRBuilder:
             extra_dict["ns"] = self._get_module_namespace(stmt)
             if is_identityref:
                 extra_dict["is_identityref"] = True
+            if is_instance_identifier:
+                extra_dict["is_instance_identifier"] = True
             field_params.append(f'ns="{self._ns_alias(extra_dict["ns"])}"')
             field_params.append(f"json_schema_extra={extra_dict!r}")
             assign = f"element({', '.join(field_params)})"
@@ -1224,8 +1262,15 @@ class IRBuilder:
             # (RFC 7950 Sec 9.11); each template supplies the right alias for
             # `Empty`. Mapping it to `bool` put `true`/`false` on the wire.
             return "Empty", {}
-        elif yt in ["binary", "bits", "instance-identifier"]:
+        elif yt in ["binary", "bits"]:
             return "str", {}
+        elif yt == "instance-identifier":
+            # Held in the RFC 7951 Sec 6.11 form whatever the transport. The
+            # marker drives the NETCONF conversions to and from the RFC 7950
+            # Sec 9.13.2 XML form (session_manager.qualify_instance_identifiers
+            # on write, normalize_identityrefs on read) and is propagated through
+            # typedefs and leafrefs like `_identityref`.
+            return "str", {"_instance_identifier": True}
         elif yt == "identityref":
             # RFC 7951 Sec 6.8 string form, e.g. "srl_nokia-aaa-types:local", or
             # bare when the identity is defined in the leaf's own module. Both
