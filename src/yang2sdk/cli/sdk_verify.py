@@ -1180,7 +1180,7 @@ def run_protocol(
     if bool(getattr(args, "debug", False)):
         # Light up wire logging on both transports. Older generated clients
         # still gate bodies behind `log_bodies`; current ones log redacted
-        # bodies at DEBUG regardless and treat it as a deprecated alias.
+        # bodies at INFO regardless and treat it as a deprecated alias.
         # Logger levels are set below, which is what reaches both generations.
         kwargs["log_bodies"] = True
         _enable_debug_logging(stub)

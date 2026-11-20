@@ -777,10 +777,9 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
 
 
 # Cap for a single logged RPC request/reply. Raw protocol XML is what makes a
-# DEBUG log worth reading, but an unbounded full-datastore dump can flood the
+# wire log worth reading, but an unbounded full-datastore dump can flood the
 # log pipeline, so over-long bodies are cut with a marker (same style as
-# _redact's own truncation). INFO lines never carry bodies -- only this DEBUG
-# path does.
+# _redact's own truncation).
 _MAX_RPC_LOG_CHARS = 65536
 
 
@@ -815,7 +814,7 @@ def _redact_xml(element: etree._Element) -> str:
 
 
 def _request_wire(func: Any, args: tuple, kwargs: dict) -> str:
-    """Best-effort request text for the DEBUG line. Never raises.
+    """Best-effort request text for the INFO request line. Never raises.
 
     `dispatch(rpc)` calls carry the rpc element in `args[0]`. Every other
     operation's envelope is built inside ncclient, so those log the operation
@@ -836,7 +835,7 @@ def _request_wire(func: Any, args: tuple, kwargs: dict) -> str:
 
 
 def _reply_wire(reply: Any) -> tuple[str, int]:
-    """(redacted reply text, raw wire size in bytes) for the DEBUG line."""
+    """(redacted reply text, raw wire size in bytes) for the INFO reply line."""
     try:
         root = _reply_root(reply)
         if root is None:
@@ -1078,13 +1077,13 @@ class NetconfClient:
             log.warning("NETCONF hostkey_verify=False (verify=False) is an explicit lab-only opt-out; never use in production.")
         if log_bodies:
             # Deprecated no-op alias: redacted request/response XML is logged
-            # whenever the logger is at DEBUG, with or without this flag.
+            # whenever the logger is at INFO, with or without this flag.
             # Kept (and warned once here) so older call sites keep
             # constructing; new code should set the log level instead.
             import warnings
 
             warnings.warn(
-                "log_bodies is deprecated; set the logger to DEBUG instead",
+                "log_bodies is deprecated; set the logger to INFO instead",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -1302,24 +1301,22 @@ class NetconfClient:
                 log.exception(f"Failed to release the {target} lock after {purpose}.")
 
     def _handle_rpc(self, func, *args, **kwargs) -> Any:
-        """Centralized dispatch: error handling plus INFO/DEBUG wire logging.
+        """Centralized dispatch: error handling plus INFO wire logging.
 
-        INFO logs one summary line per request and per response (operation,
-        datastore, outcome, size, duration) -- the production trail, with no
-        bodies ever. DEBUG adds the redacted raw request/reply XML, so every
-        request and every response is visible to an operator who opts in.
-        Serialization is skipped entirely unless DEBUG is enabled, so a
-        production session at the default level pays nothing for logs nobody
-        reads. Every helper on this path is total (never raises, never
-        mutates), so logging can neither alter what is sent nor mask a
-        device error with its own traceback.
+        INFO logs every request and every response with its redacted XML body
+        (secret leaves masked, bodies capped at `_MAX_RPC_LOG_CHARS`), plus the
+        reply's duration and wire size. DEBUG adds nothing here: the raw
+        transport buffers come from ncclient's own loggers at that level.
+        Serialization is skipped entirely unless INFO is enabled, so a session
+        logging at WARNING pays nothing for logs nobody reads. Every helper on
+        this path is total (never raises, never mutates), so logging can
+        neither alter what is sent nor mask a device error with its own
+        traceback.
         """
         name = getattr(func, "__name__", "rpc")
-        where = kwargs.get("source", kwargs.get("target", ""))
-        log.info("NETCONF request: %s%s", name, f" {where}" if where else "")
-        debug = log.isEnabledFor(logging.DEBUG)
-        if debug:
-            log.debug("NETCONF request %s: %s", name, _request_wire(func, args, kwargs))
+        wire = log.isEnabledFor(logging.INFO)
+        if wire:
+            log.info("NETCONF request %s: %s", name, _request_wire(func, args, kwargs))
         start = time.perf_counter()
         try:
             reply = func(*args, **kwargs)
@@ -1359,10 +1356,9 @@ class NetconfClient:
             log.error("NETCONF transport error: %s", e)
             raise
         elapsed = time.perf_counter() - start
-        if debug:
+        if wire:
             text, size = _reply_wire(reply)
-            log.debug("NETCONF reply %s (%.2fs, %d bytes): %s", name, elapsed, size, text)
-        log.info("NETCONF response: %s ok (%.2fs)", name, elapsed)
+            log.info("NETCONF reply %s (%.2fs, %d bytes): %s", name, elapsed, size, text)
         return reply
 
     def retrieve(self, source: str | None = None, filter_xml: str | etree._Element | list[etree._Element] | None = None, content: str = "all", with_defaults: str | None = None, depth: int | str = "unbounded") -> etree._Element | None:

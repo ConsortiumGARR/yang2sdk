@@ -25,6 +25,12 @@ documented — a date-versioned scheme carries no compatibility promise.
 
 ### Changed
 
+- **NETCONF replies are logged at INFO.** The generated client's INFO lines now
+  carry the redacted request and reply XML (`NETCONF request <op>: <xml>`,
+  `NETCONF reply <op> (<T>s, <N> bytes): <xml>`, 64 KB cap) instead of a
+  bodiless summary pair, so an operator at the default level sees what the
+  device answered. DEBUG is left to ncclient's own transport-buffer logs.
+
 - **NETCONF `plan()` / `reconcile()` no longer read the whole node to check
   the candidate.** Each call fetched candidate and running in full and
   compared them. When the call takes the candidate lock itself, the lock is the

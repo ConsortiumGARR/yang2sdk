@@ -25,7 +25,7 @@ visible, not just the verdict:
 | Transport | INFO (always) | DEBUG |
 | --- | --- | --- |
 | RESTCONF | `Request: METHOD url` → `Response: status` | redacted request/response bodies (needs `log_bodies=True`, which `--debug` passes for you) |
-| NETCONF | `NETCONF request: <op> <datastore>` → `NETCONF response: <op> ok, <N> bytes, <T>s` | redacted raw request/reply XML, 64 KB cap with truncation marker |
+| NETCONF | `NETCONF request <op>: <xml>` → `NETCONF reply <op> (<T>s, <N> bytes): <xml>`, redacted, 64 KB cap with truncation marker | ncclient's raw transport buffers |
 
 Secrets (passwords, passphrases, tokens, communities, private keys, ...) are
 redacted by construction on both transports; `message-id` attributes are left

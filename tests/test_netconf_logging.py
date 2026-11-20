@@ -12,6 +12,7 @@ trusted to review eyes:
   a log record in cleartext -- the old per-method ``log_bodies`` lines could
   not promise this, because ``_redact`` truncates XML bytes but redacts only
   dict keys;
+* bodies are logged at INFO (DEBUG is left to ncclient's transport buffers);
 * logging is allocation-free when disabled -- serializing multi-megabyte
   replies for nobody to read would tax every production RPC.
 """
@@ -189,24 +190,18 @@ def test_handle_rpc_logs_one_request_and_one_reply(sm, caplog) -> None:
         b'<get-config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
         b"<source><running/></source></get-config>"
     )
-    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+    with caplog.at_level(logging.INFO, logger=LOGGER):
         reply = sm.NetconfClient._handle_rpc(object(), dispatch, rpc)
     assert reply.ok
-    debug = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == LOGGER and r.levelno == logging.DEBUG
-    ]
-    assert sum(m.startswith("NETCONF request dispatch:") for m in debug) == 1
-    replies = [m for m in debug if m.startswith("NETCONF reply dispatch")]
-    assert len(replies) == 1 and "bytes" in replies[0]
     info = [
         r.getMessage()
         for r in caplog.records
         if r.name == LOGGER and r.levelno == logging.INFO
     ]
-    assert any(m.startswith("NETCONF request:") for m in info)
-    assert any(m.startswith("NETCONF response:") for m in info)
+    assert sum(m.startswith("NETCONF request dispatch:") for m in info) == 1
+    replies = [m for m in info if m.startswith("NETCONF reply dispatch")]
+    assert len(replies) == 1 and "bytes" in replies[0]
+    assert "<admin-password>***redacted***</admin-password>" in replies[0]
     assert "s3cr3t!" not in caplog.text
 
 
@@ -217,12 +212,12 @@ def test_handle_rpc_names_ncclient_built_envelopes(sm, caplog) -> None:
     def lock(target=None):
         return _ok_reply()
 
-    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+    with caplog.at_level(logging.INFO, logger=LOGGER):
         sm.NetconfClient._handle_rpc(object(), lock, target="running")
     debug = [
         r.getMessage()
         for r in caplog.records
-        if r.name == LOGGER and r.levelno == logging.DEBUG
+        if r.name == LOGGER and r.levelno == logging.INFO
     ]
     assert any("lock" in m and "running" in m for m in debug)
 
@@ -238,20 +233,20 @@ def test_handle_rpc_error_keeps_contract_and_request_log(sm, caplog) -> None:
         raise RPCError(err)
 
     with (
-        caplog.at_level(logging.DEBUG, logger=LOGGER),
+        caplog.at_level(logging.INFO, logger=LOGGER),
         pytest.raises(RuntimeError, match="NETCONF RPC Error.*invalid-value"),
     ):
         sm.NetconfClient._handle_rpc(object(), commit)
     debug = [
         r.getMessage()
         for r in caplog.records
-        if r.name == LOGGER and r.levelno == logging.DEBUG
+        if r.name == LOGGER and r.levelno == logging.INFO
     ]
     assert any(m.startswith("NETCONF request commit") for m in debug)
     assert not any(m.startswith("NETCONF reply") for m in debug)
 
 
-def test_handle_rpc_serializes_nothing_when_debug_off(sm, caplog, monkeypatch) -> None:
+def test_handle_rpc_serializes_nothing_when_info_off(sm, caplog, monkeypatch) -> None:
     calls: list[int] = []
     real = etree.tostring
 
@@ -292,12 +287,12 @@ def test_edit_emits_one_pair_not_two(sm, caplog) -> None:
     config = etree.fromstring(
         b'<system xmlns="urn:tlog"><hostname>lab-1</hostname></system>'
     )
-    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+    with caplog.at_level(logging.INFO, logger=LOGGER):
         assert sm.NetconfClient.edit(self_ns, config) is True
     debug = [
         r.getMessage()
         for r in caplog.records
-        if r.name == LOGGER and r.levelno == logging.DEBUG
+        if r.name == LOGGER and r.levelno == logging.INFO
     ]
     assert sum("NETCONF request dispatch:" in m for m in debug) == 1
     assert sum(m.startswith("NETCONF reply dispatch") for m in debug) == 1
